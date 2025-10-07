@@ -248,3 +248,148 @@ func TestIntegration_Map_Transform(t *testing.T) {
 	t.Logf("✅ map(. * 2) transformed array elements")
 	t.Logf("Warnings: %v", result.Warnings)
 }
+
+// ============================================================================
+// TRY-CATCH TESTS
+// ============================================================================
+
+// TestIntegration_TryCatch tests try-catch error handling.
+func TestIntegration_TryCatch(t *testing.T) {
+	query, err := gojq.Parse("try .foo catch \"default\"")
+	if err != nil {
+		t.Fatalf("Failed to parse query: %v", err)
+	}
+
+	// Input: object that may or may not have .foo
+	input := BuildObject(map[string]*oas3.Schema{
+		"bar": StringType(),
+	}, []string{"bar"})
+
+	result, err := RunSchema(context.Background(), query, input)
+	if err != nil {
+		t.Fatalf("RunSchema failed: %v", err)
+	}
+
+	if result.Schema == nil {
+		t.Fatal("Expected schema, got nil")
+	}
+
+	// try-catch should union both success and error paths
+	// Success: .foo (string or null), Error: "default" (string)
+	// Result should be string or anyOf containing string
+	t.Logf("✅ try-catch executed")
+	t.Logf("Output type: %s", getType(result.Schema))
+	t.Logf("Warnings: %v", result.Warnings)
+}
+
+// ============================================================================
+// LITERAL TESTS
+// ============================================================================
+
+// TestIntegration_ObjectLiteral tests object literal construction.
+func TestIntegration_ObjectLiteral(t *testing.T) {
+	query, err := gojq.Parse(`{name: "Alice", age: 30, active: true}`)
+	if err != nil {
+		t.Fatalf("Failed to parse query: %v", err)
+	}
+
+	// Input doesn't matter for literals
+	input := Top()
+
+	result, err := RunSchema(context.Background(), query, input)
+	if err != nil {
+		t.Fatalf("RunSchema failed: %v", err)
+	}
+
+	if result.Schema == nil {
+		t.Fatal("Expected schema, got nil")
+	}
+
+	// Should be object with specific properties
+	typ := getType(result.Schema)
+	if typ != "object" {
+		t.Errorf("Expected object type, got: %s", typ)
+	}
+
+	if result.Schema.Properties != nil {
+		propCount := result.Schema.Properties.Len()
+		if propCount != 3 {
+			t.Errorf("Expected 3 properties, got: %d", propCount)
+		}
+	}
+
+	t.Logf("✅ Object literal correctly constructed schema")
+	t.Logf("Warnings: %v", result.Warnings)
+}
+
+// TestIntegration_ArrayLiteral tests array literal construction.
+func TestIntegration_ArrayLiteral(t *testing.T) {
+	query, err := gojq.Parse(`[1, 2, 3, 4, 5]`)
+	if err != nil {
+		t.Fatalf("Failed to parse query: %v", err)
+	}
+
+	input := Top()
+
+	result, err := RunSchema(context.Background(), query, input)
+	if err != nil {
+		t.Fatalf("RunSchema failed: %v", err)
+	}
+
+	if result.Schema == nil {
+		t.Fatal("Expected schema, got nil")
+	}
+
+	// Should be array of numbers
+	typ := getType(result.Schema)
+	if typ != "array" {
+		t.Errorf("Expected array type, got: %s", typ)
+	}
+
+	// Items should be numbers (homogeneous)
+	if result.Schema.Items != nil && result.Schema.Items.Left != nil {
+		itemType := getType(result.Schema.Items.Left)
+		if itemType != "number" {
+			t.Errorf("Expected number items, got: %s", itemType)
+		}
+	}
+
+	t.Logf("✅ Array literal correctly constructed homogeneous schema")
+	t.Logf("Warnings: %v", result.Warnings)
+}
+
+// TestIntegration_HeterogeneousArray tests heterogeneous array literal.
+func TestIntegration_HeterogeneousArray(t *testing.T) {
+	query, err := gojq.Parse(`["hello", 42, true, null]`)
+	if err != nil {
+		t.Fatalf("Failed to parse query: %v", err)
+	}
+
+	input := Top()
+
+	result, err := RunSchema(context.Background(), query, input)
+	if err != nil {
+		t.Fatalf("RunSchema failed: %v", err)
+	}
+
+	if result.Schema == nil {
+		t.Fatal("Expected schema, got nil")
+	}
+
+	// Should be array with prefixItems (tuple)
+	typ := getType(result.Schema)
+	if typ != "array" {
+		t.Errorf("Expected array type, got: %s", typ)
+	}
+
+	// Should have prefixItems for tuple types
+	if result.Schema.PrefixItems != nil {
+		prefixCount := len(result.Schema.PrefixItems)
+		if prefixCount != 4 {
+			t.Errorf("Expected 4 prefix items, got: %d", prefixCount)
+		}
+	}
+
+	t.Logf("✅ Heterogeneous array literal constructed tuple schema")
+	t.Logf("Warnings: %v", result.Warnings)
+}

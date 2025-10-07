@@ -332,6 +332,40 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		env.addWarning("opCallRec not fully supported, widening result to Top")
 		return []*execState{next}, nil
 
+	case opForkTryBegin:
+		// try-catch begin - fork to handle both success and error cases
+		// For schema execution, we conservatively assume both paths are possible
+		targetPC := c.value.(int)
+
+		// Create two states: one continues (success), one jumps (error handler)
+		continueState := state.clone()
+		continueState.pc++
+
+		errorState := state.clone()
+		errorState.pc = targetPC
+
+		return []*execState{continueState, errorState}, nil
+
+	case opForkTryEnd:
+		// try-catch end - marks end of try block
+		// For schema execution, just continue normally
+		return []*execState{next}, nil
+
+	case opExpBegin, opExpEnd:
+		// Expression boundary markers - used for error messages
+		// For schema execution, these are no-ops
+		return []*execState{next}, nil
+
+	case opPathBegin, opPathEnd:
+		// Path operation markers - used for getpath/setpath
+		// For schema execution, these are no-ops
+		return []*execState{next}, nil
+
+	case opForkLabel:
+		// Label for fork operations - used in some control flow
+		// For schema execution, treat as no-op
+		return []*execState{next}, nil
+
 	// Unsupported opcodes
 	default:
 		if env.opts.StrictMode {
@@ -457,15 +491,11 @@ func (env *schemaEnv) execPush(c *codeOp) error {
 	case nil:
 		schema = ConstNull()
 	case map[string]any:
-		// Object literal - for now, create generic object
-		// TODO Phase 3: Build proper object schema from literal
-		schema = ObjectType()
-		env.addWarning("object literal not fully supported, using generic object type")
+		// Object literal - build schema from the literal values
+		schema = buildObjectFromLiteral(val)
 	case []any:
-		// Array literal - for now, create generic array
-		// TODO Phase 3: Build proper array schema from literal
-		schema = ArrayType(Top())
-		env.addWarning("array literal not fully supported, using generic array type")
+		// Array literal - build schema from the literal values
+		schema = buildArrayFromLiteral(val)
 	default:
 		schema = Top()
 		env.addWarning("unknown constant type: %T", v)
@@ -963,9 +993,9 @@ func (env *schemaEnv) valueToSchema(v any) *oas3.Schema {
 	case nil:
 		return ConstNull()
 	case map[string]any:
-		return ObjectType() // Generic object for now
+		return buildObjectFromLiteral(val)
 	case []any:
-		return ArrayType(Top()) // Generic array for now
+		return buildArrayFromLiteral(val)
 	default:
 		return Top()
 	}
@@ -1066,4 +1096,74 @@ func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 	}
 
 	return Union(schemas, opts)
+}
+
+// buildObjectFromLiteral creates a schema from a map literal.
+func buildObjectFromLiteral(m map[string]any) *oas3.Schema {
+	props := make(map[string]*oas3.Schema)
+	required := make([]string, 0, len(m))
+
+	for k, v := range m {
+		props[k] = valueToSchemaStatic(v)
+		required = append(required, k)
+	}
+
+	return BuildObject(props, required)
+}
+
+// buildArrayFromLiteral creates a schema from an array literal.
+func buildArrayFromLiteral(arr []any) *oas3.Schema {
+	if len(arr) == 0 {
+		return ArrayType(Top()) // Empty array - any items
+	}
+
+	// Build prefixItems for tuple if heterogeneous
+	prefixItems := make([]*oas3.Schema, len(arr))
+	itemsSchema := Top()
+
+	allSameType := true
+	firstType := ""
+
+	for i, v := range arr {
+		schema := valueToSchemaStatic(v)
+		prefixItems[i] = schema
+
+		typ := getType(schema)
+		if i == 0 {
+			firstType = typ
+			itemsSchema = schema
+		} else if typ != firstType {
+			allSameType = false
+		}
+	}
+
+	if allSameType && len(arr) > 0 {
+		// Homogeneous array - use items schema
+		return ArrayType(itemsSchema)
+	}
+
+	// Heterogeneous array - use prefixItems
+	return BuildArray(Top(), prefixItems)
+}
+
+// valueToSchemaStatic converts a constant value to a schema (static version, no env).
+func valueToSchemaStatic(v any) *oas3.Schema {
+	switch val := v.(type) {
+	case string:
+		return ConstString(val)
+	case float64:
+		return ConstNumber(val)
+	case int:
+		return ConstNumber(float64(val))
+	case bool:
+		return ConstBool(val)
+	case nil:
+		return ConstNull()
+	case map[string]any:
+		return buildObjectFromLiteral(val)
+	case []any:
+		return buildArrayFromLiteral(val)
+	default:
+		return Top()
+	}
 }
