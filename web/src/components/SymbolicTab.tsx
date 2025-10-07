@@ -3,54 +3,68 @@ import Editor from '@monaco-editor/react';
 import { symbolicExecuteJQ } from '../bridge';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 
-const DEFAULT_OAS = `openapi: 3.0.0
+const DEFAULT_OAS = `openapi: 3.1.0
 info:
-  title: Sample API
+  title: Symbolic Execution Demo
   version: 1.0.0
-  description: A simple API for testing
-paths:
-  /users:
-    get:
-      summary: Get all users
-      responses:
-        '200':
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    id:
-                      type: integer
-                    name:
-                      type: string
-                    email:
-                      type: string
-  /users/{id}:
-    get:
-      summary: Get user by ID
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
-      responses:
-        '200':
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  id:
-                    type: integer
-                  name:
-                    type: string
-                  email:
-                    type: string
+components:
+  schemas:
+    UserInput:
+      type: object
+      x-speakeasy-transform-from-json: >
+        jq {userId: .id, displayName: .name,
+            tier: (if .score >= 90 then "gold" else "silver" end),
+            location: {city: .address.city, zip: .address.postalCode}}
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        score:
+          type: integer
+        address:
+          type: object
+          properties:
+            city:
+              type: string
+            postalCode:
+              type: string
+    ProductInput:
+      type: object
+      x-speakeasy-transform-from-json: >
+        jq {productId: .id, displayName: .name,
+            total: (.price * .quantity),
+            tags: (.tags | map({value: .}))}
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        price:
+          type: number
+        quantity:
+          type: integer
+        tags:
+          type: array
+          items:
+            type: string
+    CartInput:
+      type: object
+      x-speakeasy-transform-from-json: >
+        jq {grandTotal: (.items | map(.price * .quantity) | add // 0),
+            items: (.items | map({sku, total: (.price * .quantity)}))}
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              sku:
+                type: string
+              price:
+                type: number
+              quantity:
+                type: integer
 `;
 
 export function SymbolicTab() {
@@ -59,7 +73,7 @@ export function SymbolicTab() {
   const [error, setError] = useState<string | null>(null);
   const [isExecuting, setIsExecuting] = useState(false);
 
-  const validateOAS = useCallback(async () => {
+  const transformOAS = useCallback(async () => {
     if (!oasInput.trim()) {
       setOutput('');
       setError(null);
@@ -80,14 +94,14 @@ export function SymbolicTab() {
     }
   }, [oasInput]);
 
-  // Auto-validate when input changes
+  // Auto-transform when input changes
   useEffect(() => {
     const timeoutId = setTimeout(() => {
-      validateOAS();
+      transformOAS();
     }, 500); // Debounce for 500ms
 
     return () => clearTimeout(timeoutId);
-  }, [validateOAS]);
+  }, [transformOAS]);
 
   return (
     <PanelGroup direction="horizontal" className="h-full">
@@ -118,51 +132,43 @@ export function SymbolicTab() {
 
       <PanelResizeHandle className="w-1 bg-border hover:bg-primary transition-colors" />
 
-      {/* Right side - Validation Result */}
+      {/* Right side - Transformed OAS */}
       <Panel defaultSize={50} minSize={30}>
         <div className="flex flex-col h-full">
           <div className="px-4 py-2 border-b bg-muted/40 flex items-center justify-between">
-            <h3 className="text-sm font-medium">Validation Result</h3>
+            <h3 className="text-sm font-medium">New OpenAPI Specification</h3>
             {isExecuting && (
-              <span className="text-xs text-muted-foreground">Validating...</span>
+              <span className="text-xs text-muted-foreground">Transforming...</span>
             )}
           </div>
           <div className="flex-1">
             {error ? (
               <div className="p-4">
                 <div className="bg-red-500/10 border border-red-500/50 rounded-lg p-4">
-                  <h4 className="text-red-500 font-semibold mb-2">Validation Failed</h4>
+                  <h4 className="text-red-500 font-semibold mb-2">Transformation Failed</h4>
                   <pre className="text-red-400 font-mono text-sm whitespace-pre-wrap">
                     {error}
                   </pre>
                 </div>
               </div>
             ) : output ? (
-              <div className="p-4">
-                <div className="bg-green-500/10 border border-green-500/50 rounded-lg p-4">
-                  <h4 className="text-green-500 font-semibold mb-2">✓ Validation Successful</h4>
-                  <Editor
-                    height="300px"
-                    defaultLanguage="json"
-                    value={output}
-                    theme="vs-dark"
-                    options={{
-                      readOnly: true,
-                      minimap: { enabled: false },
-                      fontSize: 14,
-                      lineNumbers: 'off',
-                      scrollBeyondLastLine: false,
-                      automaticLayout: true,
-                      folding: false,
-                      lineDecorationsWidth: 0,
-                      lineNumbersMinChars: 0,
-                    }}
-                  />
-                </div>
-              </div>
+              <Editor
+                height="100%"
+                defaultLanguage="yaml"
+                value={output}
+                theme="vs-dark"
+                options={{
+                  readOnly: true,
+                  minimap: { enabled: false },
+                  fontSize: 14,
+                  lineNumbers: 'on',
+                  scrollBeyondLastLine: false,
+                  automaticLayout: true,
+                }}
+              />
             ) : (
               <div className="flex items-center justify-center h-full text-muted-foreground">
-                <p>Enter an OpenAPI specification to validate</p>
+                <p>Enter an OpenAPI specification with x-speakeasy-transform-from-json extensions to transform</p>
               </div>
             )}
           </div>

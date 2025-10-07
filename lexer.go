@@ -561,10 +561,20 @@ func isWhite(ch byte) bool {
 	}
 }
 
+// IsWhite checks if a byte is whitespace (exported for pkg/jqfmt)
+func IsWhite(ch byte) bool {
+	return isWhite(ch)
+}
+
 func isIdent(ch byte, tail bool) bool {
 	return 'a' <= ch && ch <= 'z' ||
 		'A' <= ch && ch <= 'Z' || ch == '_' ||
 		tail && isNumber(ch)
+}
+
+// IsIdent checks if a byte is a valid identifier character (exported for pkg/jqfmt)
+func IsIdent(ch byte, tail bool) bool {
+	return isIdent(ch, tail)
 }
 
 func isHex(ch byte) bool {
@@ -573,6 +583,16 @@ func isHex(ch byte) bool {
 		isNumber(ch)
 }
 
+// IsHex checks if a byte is a hexadecimal digit (exported for pkg/jqfmt)
+func IsHex(ch byte) bool {
+	return isHex(ch)
+}
+
 func isNumber(ch byte) bool {
 	return '0' <= ch && ch <= '9'
+}
+
+// IsNumber checks if a byte is a numeric digit (exported for pkg/jqfmt)
+func IsNumber(ch byte) bool {
+	return isNumber(ch)
 }

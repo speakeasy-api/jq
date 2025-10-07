@@ -1,8 +1,5 @@
 package jqfmt
 
-// TODO: Clean this up, pull only what's required from each file, and copypaste
-// as much as possible without prepending "gojq." to various things.
-
 import (
 	"bytes"
 	"encoding/json"
@@ -10,13 +7,12 @@ import (
 	"io"
 	"math"
 	"math/big"
-	// "regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
-	"github.com/itchyny/gojq"
+	gojq "github.com/speakeasy-api/jq"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -102,14 +98,8 @@ func prtIdt(s *strings.Builder) {
 }
 
 func brk(s *strings.Builder) {
-
 	s.WriteByte('\n')
-	// idtStr := ""
-	// for i := 0; i < idt; i++ {
-	// 	// idtStr += "    "
-	// }
-	// s.WriteString(idtStr)
-	line += 1
+	line++
 }
 
 func descendsFrom(node string, ancestor string, parents []string) (bool, string) {
@@ -135,24 +125,16 @@ func descendsFrom(node string, ancestor string, parents []string) (bool, string)
 
 func (e *Query) writeTo(s *strings.Builder) {
 	prevNode := node
-	// if e.Term != nil && e.Term.String() == "." {
 	if node == "" {
 		log.Debugln("----------------------------------------")
 	}
 	log.Debugln("---")
-	// log.Debugf("node: %q\n", node)
-	// log.Debugln("nodeIdts:", nodeIdts)
-
-	// PrintJSON(e)
 
 	// Where are we in the syntax tree?
 	arrElem, _ := descendsFrom(node, "Array", []string{"", "Left", "Right"})
-	firstQueryTerm, firstQueryAncestor := descendsFrom(node, "Query", []string{"Left"}) // needs Left/Right?
-	// topQueryTerm, topQueryAncestor := descendsFrom(node, "", []string{"", "Left", "Right"})
+	firstQueryTerm, firstQueryAncestor := descendsFrom(node, "Query", []string{"Left"})
 	topQueryTerm, topQueryAncestor := descendsFrom(node, "", []string{"", "Left", "Query"})
-	// log.Debugln("top:", topQueryTerm, "\tfirst:", firstQueryTerm, "\tnode:", node)
 	log.Debugf("top: %t\tfirst: %t \tnode: %q\n", topQueryTerm, firstQueryTerm, node)
-	// log.Debugln("first:", firstQueryTerm)
 
 	if e.Meta != nil {
 		s.WriteString("module ")
@@ -166,34 +148,10 @@ func (e *Query) writeTo(s *strings.Builder) {
 		im.writeTo(s)
 		node = prevNode
 	}
-	// for i, fd := range e.FuncDefs {
-	// 	if _, ok := funcDefs[fd.Name]; !ok {
-	// 		funcDefs[fd.Name] = fd.String()
-	// 	}
-	// 	if i > 0 {
-	// 		s.WriteByte(' ')
-	// 	}
-	// 	node += ".FuncDefs"
-	// 	fd.writeTo(s)
-	// 	node = prevNode
-	// }
-	// if len(e.FuncDefs) > 0 {
-	// 	s.WriteByte(' ')
-	// }
+
 	if e.Func != "" {
 		s.WriteString(e.Func)
 	} else if e.Term != nil {
-		// if e.Term.Func != nil {
-		// found := false
-		// for _, fn := range funcs {
-		// 	if fn == e.Term.Func.Name {
-		// 		found = true
-		// 	}
-		// }
-		// if !found {
-		// 	funcs = append(funcs, e.Term.Func.Name)
-		// }
-		// }
 		node += fmt.Sprintf(".%s", strings.Replace(e.Term.Type.GoString(), "gojq.TermType", "", 1))
 		prtIdt(s)
 		log.Debugf("term: %q\n", e.Term)
@@ -220,19 +178,11 @@ func (e *Query) writeTo(s *strings.Builder) {
 				brk(s)
 			}
 
-			// if e.Op == gojq.OpComma {
-			// 	log.Debugln("COMMA!")
-			// }
-
 			opStr := e.Op.GoString()
 
 			for _, op := range cfg.Ops {
-
 				if opStr == fmt.Sprintf("gojq.Op%s", strings.Title(op)) {
-
-					// log.Debugln("HERE!")
-
-					// Does this order matter?
+					// Determine ancestor
 					ancestor := ""
 					if topQueryTerm {
 						ancestor = topQueryAncestor
@@ -241,43 +191,14 @@ func (e *Query) writeTo(s *strings.Builder) {
 						ancestor = firstQueryAncestor
 					}
 
-					// log.Debugf("ancestor: \"%s\"\n", ancestor)
-					// if (firstQueryTerm || topQueryTerm) && queries[ancestor] == 0 {
-					// if (firstQueryTerm || topQueryTerm) && queries[ancestor] == 0 {
 					if firstQueryTerm || topQueryTerm {
-						// Don't indent twice for a query at the beginning of
-						// the command string.
-						// match, err := regexp.MatchString("(.Left)+.Query(.Left)+", node)
-						// match, err := regexp.MatchString("Left", node)
-						// if err != nil {
-						// 	panic(err)
-						// }
-						// if match {
-						// 	// log.Debugln("HERE2!!!")
-						// 	// break
-						// }
-						// queries[ancestor] = 1
-						// log.Debugln("here")
-						// nodeIdts[ancestor+".Right"] = "first query term"
-						// nodeIdts[ancestor+".Right"] = append(nodeIdts[ancestor+".Right"], "first query term")
 						nodeIdt(ancestor+".Right", "first query term")
+					}
 
-					} // else {
-
-					// nodeIdts[ancestor+".Left"] = fmt.Sprintf("%s operator", op)
-					// nodeIdts[ancestor+".Left"] = append(nodeIdts[ancestor+".Left"], fmt.Sprintf("%s operator", op))
-					if e.Op != gojq.OpPipe { // Put this check here because arrays were getting indented twice. This seems to fix it.
+					// Pipe operator doesn't indent left side (prevents double indentation in arrays)
+					if e.Op != gojq.OpPipe {
 						nodeIdt(ancestor+".Left", fmt.Sprintf("%s operator", op))
 					}
-					// }
-					// if e.Op == gojq.OpComma {
-					// 	if !arrElem {
-					// 		// nodeIdts[ancestor+".Left.Right"] = 1
-					// 		nodeIdts[ancestor+".Left"] = 1
-					// 	} else {
-					// 		continue
-					// 	}
-					// }
 					brk(s)
 				}
 			}
@@ -775,13 +696,6 @@ func (e *Func) String() string {
 }
 
 func (e *Func) writeTo(s *strings.Builder) {
-	// loadMod(e.Name)
-	// fmt.Println(mods)
-	// for _, f := range cfg.Funcs {
-	// 	if e.Name == f {
-	// 		brk(s)
-	// 	}
-	// }
 	s.WriteString(e.Name)
 	if len(e.Args) > 0 {
 		s.WriteByte('(')
@@ -862,8 +776,6 @@ func (e *Object) writeTo(s *strings.Builder) {
 	}
 	s.WriteString("{ ")
 	if cfg.Obj {
-		// nodeIdts[node] = "object"
-		// nodeIdts[node] = append(nodeIdts[node], "object")
 		nodeIdt(node, "object")
 	}
 	for i, kv := range e.KeyVals {
@@ -977,13 +889,10 @@ func (e *Array) String() string {
 }
 
 func (e *Array) writeTo(s *strings.Builder) {
-
 	prtIdt(s)
 	s.WriteByte('[')
 	if cfg.Arr {
 		brk(s)
-		// nodeIdts[node] = "array"
-		// nodeIdts[node] = append(nodeIdts[node], "array")
 		nodeIdt(node, "array")
 	}
 	if e.Query != nil {

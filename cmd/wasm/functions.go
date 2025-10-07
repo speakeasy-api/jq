@@ -3,15 +3,13 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"syscall/js"
 
 	gojq "github.com/speakeasy-api/jq"
 	"github.com/speakeasy-api/jq/pkg/jqfmt"
-	"github.com/speakeasy-api/openapi/openapi"
-	"strings"
+	"github.com/speakeasy-api/jq/pkg/playground"
 )
 
 // ExecuteJQ runs a JQ query against JSON input and returns the result
@@ -66,39 +64,7 @@ func ExecuteJQ(query, jsonInput string) (string, error) {
 	return string(outBytes), nil
 }
 
-// SymbolicExecuteJQ validates an OpenAPI spec and performs symbolic execution
-func SymbolicExecuteJQ(oasYAML string) (string, error) {
-	// Parse the OpenAPI spec using Unmarshal
-	reader := strings.NewReader(oasYAML)
-	doc, validationErrs, err := openapi.Unmarshal(context.Background(), reader)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse OpenAPI document: %w", err)
-	}
-
-	// Check validation errors
-	if len(validationErrs) > 0 {
-		// Return first validation error
-		return "", fmt.Errorf("OpenAPI validation failed: %v", validationErrs[0])
-	}
-
-	// Return success with document info
-	info := map[string]any{
-		"status":  "success",
-		"title":   doc.Info.Title,
-		"version": doc.Info.Version,
-	}
-
-	if doc.Info.Description != nil {
-		info["description"] = *doc.Info.Description
-	}
-
-	infoBytes, err := json.MarshalIndent(info, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal info: %w", err)
-	}
-
-	return string(infoBytes), nil
-}
+// Note: SymbolicExecuteJQ and transformSchema are now in transform.go (shared between WASM and tests)
 
 // FormatJQ formats a JQ query using jqfmt
 func FormatJQ(query string) (string, error) {
@@ -163,7 +129,7 @@ func main() {
 			return "", fmt.Errorf("SymbolicExecuteJQ: expected 1 arg (oasYAML), got %v", len(args))
 		}
 
-		return SymbolicExecuteJQ(args[0].String())
+		return playground.SymbolicExecuteJQ(args[0].String())
 	}))
 
 	// Register FormatJQ function

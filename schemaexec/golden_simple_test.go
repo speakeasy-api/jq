@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/itchyny/gojq"
+	gojq "github.com/speakeasy-api/jq"
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 )
 
@@ -12,11 +12,12 @@ import (
 // Each test defines input schema, jq query, and expected output using our constructor functions.
 func TestGoldenSuite(t *testing.T) {
 	tests := []struct {
-		name     string
-		jq       string
-		input    *oas3.Schema
-		expected *oas3.Schema
-		checkType string // If set, just check output type matches this
+		name         string
+		jq           string
+		input        *oas3.Schema
+		expected     *oas3.Schema
+		checkType    string                       // If set, just check output type matches this
+		checkSchema  func(*testing.T, *oas3.Schema) // Custom validation function
 	}{
 		// PROPERTY ACCESS
 		{
@@ -60,7 +61,23 @@ func TestGoldenSuite(t *testing.T) {
 				"firstName":    StringType(),
 				"emailAddress": StringType(),
 			}, []string{"firstName", "emailAddress"}),
-			checkType: "object",
+			checkSchema: func(t *testing.T, schema *oas3.Schema) {
+				if typ := schema.Type.GetRight(); typ == nil || *typ != oas3.SchemaTypeObject {
+					t.Errorf("Expected object type, got %v", schema.Type.GetRight())
+				}
+				if schema.Properties == nil {
+					t.Fatal("Expected properties, got nil")
+				}
+				if schema.Properties.Len() != 2 {
+					t.Errorf("Expected 2 properties, got %d", schema.Properties.Len())
+				}
+				if _, ok := schema.Properties.Get("name"); !ok {
+					t.Error("Expected 'name' property")
+				}
+				if _, ok := schema.Properties.Get("email"); !ok {
+					t.Error("Expected 'email' property")
+				}
+			},
 		},
 
 		// SELECT
@@ -250,7 +267,45 @@ func TestGoldenSuite(t *testing.T) {
 				"price": NumberType(),
 				"stock": NumberType(),
 			}, []string{"name", "price", "stock"})),
-			checkType: "object",
+			checkSchema: func(t *testing.T, schema *oas3.Schema) {
+				// Verify it's an object type
+				if typ := schema.Type.GetRight(); typ == nil || *typ != oas3.SchemaTypeObject {
+					t.Errorf("Expected object type, got %v", schema.Type.GetRight())
+				}
+				// Verify it has exactly 2 properties: name and price
+				if schema.Properties == nil {
+					t.Fatal("Expected properties, got nil")
+				}
+				if schema.Properties.Len() != 2 {
+					t.Errorf("Expected 2 properties (name, price), got %d", schema.Properties.Len())
+				}
+				// Verify name property exists and is a string
+				nameSchema, ok := schema.Properties.Get("name")
+				if !ok {
+					t.Error("Expected 'name' property")
+				} else {
+					nameLeft := nameSchema.GetLeft()
+					if nameLeft == nil {
+						t.Error("Expected 'name' schema to be concrete (not a reference)")
+					} else if nameType := nameLeft.Type.GetRight(); nameType != nil && *nameType != oas3.SchemaTypeString {
+						t.Errorf("Expected 'name' to be string, got %v", *nameType)
+					}
+					// Note: nil type is allowed during partial implementation - just check it exists
+				}
+				// Verify price property exists and is a number
+				priceSchema, ok := schema.Properties.Get("price")
+				if !ok {
+					t.Error("Expected 'price' property")
+				} else {
+					priceLeft := priceSchema.GetLeft()
+					if priceLeft == nil {
+						t.Error("Expected 'price' schema to be concrete (not a reference)")
+					} else if priceType := priceLeft.Type.GetRight(); priceType != nil && *priceType != oas3.SchemaTypeNumber {
+						t.Errorf("Expected 'price' to be number, got %v", *priceType)
+					}
+					// Note: nil type is allowed during partial implementation - just check it exists
+				}
+			},
 		},
 
 		// TRY-CATCH
@@ -289,7 +344,9 @@ func TestGoldenSuite(t *testing.T) {
 			}
 
 			// Check result
-			if tt.checkType != "" {
+			if tt.checkSchema != nil {
+				tt.checkSchema(t, result.Schema)
+			} else if tt.checkType != "" {
 				actualType := getType(result.Schema)
 				if actualType != tt.checkType && actualType != "" {
 					// Allow anyOf as valid for many results

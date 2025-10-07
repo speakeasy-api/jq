@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/itchyny/gojq"
+	gojq "github.com/speakeasy-api/jq"
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 )
 
