@@ -66,7 +66,7 @@ func TestDebug_TraceObjectConstruction(t *testing.T) {
 	env.codes = make([]codeOp, len(rawCodes))
 	for i, rc := range rawCodes {
 		env.codes[i] = codeOp{
-			op:    opcodeToString(rc),
+			op:    getCodeOp(rc),
 			value: getCodeValue(rc),
 		}
 	}
@@ -77,7 +77,7 @@ func TestDebug_TraceObjectConstruction(t *testing.T) {
 
 	for env.pc < len(env.codes) {
 		c := env.codes[env.pc]
-		t.Logf("[PC=%d] Executing %s (value: %v), stack depth before: %d",
+		t.Logf("[PC=%d] Executing opcode %d (value: %v), stack depth before: %d",
 			env.pc, c.op, c.value, env.stack.len())
 
 		err := env.executeOp(&c)
