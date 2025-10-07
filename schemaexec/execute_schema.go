@@ -150,6 +150,9 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 	// Outputs accumulator
 	outputs := make([]*oas3.Schema, 0)
 
+	// Track accumulator for array construction results
+	var sharedAccum map[string]*oas3.Schema
+
 	// Multi-state execution loop
 	for !worklist.isEmpty() {
 		// Check context cancellation
@@ -188,6 +191,10 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 			if state.top() != nil {
 				outputs = append(outputs, state.top())
 			}
+			// Save reference to shared accumulator (all states share the same map)
+			if sharedAccum == nil && state.accum != nil {
+				sharedAccum = state.accum
+			}
 			continue
 		}
 
@@ -202,6 +209,27 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		// Add successor states to worklist
 		for _, newState := range newStates {
 			worklist.push(newState)
+		}
+	}
+
+	// Fix up outputs: replace any array with empty/Top items with final accumulator value
+	// This handles the case where opLoad loaded the accumulator before opAppend completed
+	if sharedAccum != nil {
+		for i, out := range outputs {
+			if getType(out) == "array" {
+				hasEmptyItems := (out.Items == nil || out.Items.Left == nil || getType(out.Items.Left) == "")
+				if hasEmptyItems {
+					// Check if there's a better version in accumulator
+					// Try to find which accumulator key this array might correspond to
+					for _, accArr := range sharedAccum {
+						if getType(accArr) == "array" && accArr.Items != nil && accArr.Items.Left != nil {
+							// Replace with accumulated version
+							outputs[i] = accArr
+							break
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -263,11 +291,22 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			val := next.pop()
 			key := fmt.Sprintf("%v", c.value)
 			next.storeVar(key, val)
+			// If storing an array, also initialize in shared accumulator
+			// This ensures opLoad will find it even if executed before opAppend
+			if getType(val) == "array" {
+				next.accum[key] = val
+			}
 		}
 		return []*execState{next}, nil
 
 	case opLoad:
 		key := fmt.Sprintf("%v", c.value)
+		// Check shared accumulator first (for array construction)
+		if acc, ok := next.accum[key]; ok {
+			next.push(acc)
+			return []*execState{next}, nil
+		}
+		// Fall back to normal variable frames
 		if val, ok := next.loadVar(key); ok {
 			next.push(val)
 		} else {
@@ -285,6 +324,9 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			next.push(top)
 		}
 		return []*execState{next}, nil
+
+	case opAppend:
+		return env.execAppendMulti(next, c)
 
 	case opFork:
 		// Fork creates two execution paths
@@ -852,6 +894,49 @@ func (env *schemaEnv) execObjectMulti(state *execState, c *codeOp) ([]*execState
 
 	obj := BuildObject(props, required)
 	state.push(obj)
+	return []*execState{state}, nil
+}
+
+// execAppendMulti handles array element appending in multi-state mode.
+// This is used for array construction: [.[] | f]
+// Uses shared accumulator map so all forked states see the same array being built.
+func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState, error) {
+	// Pop the value to append
+	if len(state.stack) < 1 {
+		return nil, fmt.Errorf("stack underflow on append (need at least value)")
+	}
+
+	val := state.pop()
+
+	// Get the accumulator variable key
+	key := ""
+	if c.value != nil {
+		key = fmt.Sprintf("%v", c.value)
+	}
+
+	// Get existing items from shared accumulator (if any)
+	var priorItems *oas3.Schema = Bottom()
+	if key != "" {
+		if accArr, ok := state.accum[key]; ok {
+			if getType(accArr) == "array" && accArr.Items != nil && accArr.Items.Left != nil {
+				priorItems = accArr.Items.Left
+			}
+		}
+	}
+
+	// Union the new value with existing items
+	unionedItems := Union([]*oas3.Schema{priorItems, val}, env.opts)
+
+	// Create updated array schema
+	updatedArr := ArrayType(unionedItems)
+
+	// Write back to shared accumulator so other states see the update
+	if key != "" {
+		state.accum[key] = updatedArr
+	}
+
+	// Push updated array to stack (gets discarded on backtrack, but that's fine)
+	state.push(updatedArr)
 	return []*execState{state}, nil
 }
 

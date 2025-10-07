@@ -15,10 +15,11 @@ import (
 // execState represents a single execution state in the multi-state VM.
 // jq's backtracking semantics require tracking multiple possible execution paths.
 type execState struct {
-	pc       int              // Program counter
-	stack    []SValue         // Schema stack (copy for this state)
-	scopes   []map[string]*oas3.Schema // Scope frames (copy for this state)
-	depth    int              // Recursion depth (for limiting)
+	pc     int                          // Program counter
+	stack  []SValue                     // Schema stack (copy for this state)
+	scopes []map[string]*oas3.Schema    // Scope frames (copy for this state)
+	depth  int                          // Recursion depth (for limiting)
+	accum  map[string]*oas3.Schema      // Shared accumulator cells for array construction
 }
 
 // clone creates a deep copy of this state for forking.
@@ -42,6 +43,7 @@ func (s *execState) clone() *execState {
 		stack:  stackCopy,
 		scopes: scopesCopy,
 		depth:  s.depth,
+		accum:  s.accum, // Share reference so both branches see the same accumulator cells
 	}
 }
 
@@ -241,6 +243,7 @@ func newExecState(input *oas3.Schema) *execState {
 		stack:  make([]SValue, 0, 16),
 		scopes: make([]map[string]*oas3.Schema, 0, 4),
 		depth:  0,
+		accum:  make(map[string]*oas3.Schema), // Shared accumulator for array construction
 	}
 	state.pushFrame() // Initial global frame
 	state.push(input) // Push input onto stack
@@ -266,13 +269,16 @@ func (w *stateWorklist) push(state *execState) {
 	w.states = append(w.states, state)
 }
 
-// pop removes and returns the next state (FIFO for breadth-first).
+// pop removes and returns the next state (LIFO/stack for depth-first).
+// This ensures iteration paths complete before done paths, which is critical
+// for array construction where the done path loads the accumulated result.
 func (w *stateWorklist) pop() *execState {
 	if len(w.states) == 0 {
 		return nil
 	}
-	state := w.states[0]
-	w.states = w.states[1:]
+	// Pop from end (LIFO) instead of beginning (FIFO)
+	state := w.states[len(w.states)-1]
+	w.states = w.states[:len(w.states)-1]
 	return state
 }
 

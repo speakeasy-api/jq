@@ -9,3 +9,4 @@ Ref/
 web/node_modules/
 web/dist/
 web/pnpm-lock.yaml
+.vercel

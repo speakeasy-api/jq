@@ -7,7 +7,7 @@ import React, {
 } from "react";
 import MonacoEditor, { Monaco, DiffEditor } from "@monaco-editor/react";
 import { editor, Uri } from "monaco-editor";
-import { Progress } from "../../@/components/ui/progress";
+import { Progress } from "@/components/ui/progress";
 import { Icon } from "@speakeasy-api/moonshine";
 import { Button } from "@/components/ui/button";
 import IModelContentChangedEvent = editor.IModelContentChangedEvent;

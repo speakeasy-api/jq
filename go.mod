@@ -11,7 +11,6 @@ require (
 	github.com/itchyny/timefmt-go v0.1.6
 	github.com/mattn/go-isatty v0.0.20
 	github.com/mattn/go-runewidth v0.0.15
-	github.com/sirupsen/logrus v1.9.3
 	github.com/speakeasy-api/openapi v1.7.8
 	gopkg.in/yaml.v3 v3.0.1
 )
