@@ -1,100 +1,69 @@
-# jq - Symbolic Execution Engine for JQ
+# jq — Symbolic Execution for jq
 
-A Go library for symbolic execution of [jq](https://github.com/jqlang/jq) expressions, built on top of [gojq](https://github.com/itchyny/gojq). This library helps you write type-safe transformers from JSON that matches a given JSON Schema to code in multiple languages.
+Run jq on schemas, not just data. Infer the output JSON Schema from an input schema and a jq expression. Built on gojq. Used in production to keep transformations type-safe.
 
-## Purpose
-
-This library extends gojq to provide symbolic execution capabilities, enabling:
-
-- **Type-safe transformations**: Validate JQ expressions against JSON Schemas to ensure type safety before execution
-- **Schema transformation**: Compute output JSON Schema from input JSON Schema and jq expression
-- **Code generation**: Generate type-safe transformer code in multiple target languages
-- **Static analysis**: Analyze JQ expressions to understand input/output type relationships
-- **Schema validation**: Verify that JQ transformations preserve type contracts
-
-### Schema Symbolic Execution (New!)
-
-The `schemaexec` package enables symbolic execution of jq over JSON Schemas:
-
-```go
-import (
-    "github.com/itchyny/gojq"
-    "github.com/itchyny/gojq/schemaexec"
-)
-
-// Define input schema
-inputSchema := schemaexec.BuildObject(map[string]*oas3.Schema{
-    "items": schemaexec.ArrayType(schemaexec.ObjectType()),
-}, []string{"items"})
-
-// Parse jq query
-query, _ := gojq.Parse(".items[] | {name: .product}")
-
-// Run symbolic execution to get output schema
-result, _ := schemaexec.RunSchema(context.Background(), query, inputSchema)
-
-fmt.Printf("Output schema: %+v\n", result.Schema)
-```
-
-See [schemaexec/README.md](schemaexec/README.md) for detailed documentation.
-
-**Status**: ✅ **MVP Complete!** Phases 1-3 implemented. Symbolic execution working for common jq patterns:
-- Property access: `.foo`, `.foo.bar`
-- Arrays: `.[0]`, `.[]`
-- Object construction: `{name: .x}`
-- Type narrowing and constraints
-- 31/31 tests passing
-
-## Installation
+## Install
 
 ```sh
 go get github.com/speakeasy-api/jq
 ```
 
-## Usage as a library
+## Playground
+
+Run `make build-wasm && cd web && npm install && npm run dev`, then visit http://localhost:5174/. Execute: run jq on JSON data. Symbolic: transform OpenAPI schemas with `x-speakeasy-transform-from-json: 'jq {id, total: (.price * .qty)}'`.
+
+## Quick example (symbolic)
+
+```go
+import (
+  "context"
+  "github.com/speakeasy-api/jq"
+  "github.com/speakeasy-api/jq/schemaexec"
+)
+
+input := schemaexec.BuildObject(map[string]*oas3.Schema{
+  "items": schemaexec.ArrayType(schemaexec.ObjectType()),
+}, []string{"items"})
+q, _ := jq.Parse(".items[] | {name: .product}")
+out, _ := schemaexec.RunSchema(context.Background(), q, input)
+// out.Schema is the inferred output schema
+```
+
+## Quick example (data)
 
 ```go
 package main
 
 import (
-	"fmt"
-	"log"
-
-	"github.com/speakeasy-api/jq"
+  "fmt"
+  "log"
+  "github.com/speakeasy-api/jq"
 )
 
 func main() {
-	query, err := jq.Parse(".foo | ..")
-	if err != nil {
-		log.Fatalln(err)
-	}
-	input := map[string]any{"foo": []any{1, 2, 3}}
-	iter := query.Run(input)
-	for {
-		v, ok := iter.Next()
-		if !ok {
-			break
-		}
-		if err, ok := v.(error); ok {
-			log.Fatalln(err)
-		}
-		fmt.Printf("%#v\n", v)
-	}
+  q, err := jq.Parse(`.foo | ..`)
+  if err != nil { log.Fatalln(err) }
+  input := map[string]any{"foo": []any{1, 2, 3}}
+  iter := q.Run(input)
+  for {
+    v, ok := iter.Next(); if !ok { break }
+    if err, ok := v.(error); ok { log.Fatalln(err) }
+    fmt.Printf("%#v\n", v)
+  }
 }
 ```
 
+## Symbolic Execution Capabilities
+
+- Schema inference for common jq constructs: property access (`.foo`, `.foo.bar`), arrays (`.[0]`, `.[]`), object construction (`{name: .x}`), type narrowing and constraints
+- Conditionals: `if .score >= 90 then "gold" else "silver"` → `enum: ["gold", "silver"]`
+- Object merging: reconcile compatible branches into unions
+- OpenAPI aware: designed for `x-speakeasy-transform-from-json` workflows
+
+## Why this exists
+
+Use jq to describe JSON transformations while preserving type information. Infers output schemas to keep downstream codegen and tooling type-safe. Powers Speakeasy's SDK generation.
+
 ## Built on gojq
 
-This library builds on the excellent [gojq](https://github.com/itchyny/gojq) implementation:
-
-- Pure Go implementation of jq
-- Arbitrary-precision integer calculation
-- Better error messages
-- YAML input/output support
-- Fully portable with no C dependencies
-
-See the [gojq documentation](https://github.com/itchyny/gojq) for more details on the underlying jq implementation.
-
-## License
-
-This software is released under the MIT License, see LICENSE.
+Fork of [itchyny/gojq](https://github.com/itchyny/gojq) (pure Go jq). Adds bytecode introspection (`GetCodes`) for symbolic execution. No C dependencies. YAML support.
