@@ -53,10 +53,8 @@ var builtinRegistry = map[string]builtinFunc{
 	"_lesseq":  builtinLessEq, // <=
 	"_greatereq": builtinGreaterEq, // >=
 
-	// Logical operations
-	"and": builtinAnd,
-	"or":  builtinOr,
-	"not": builtinNot,
+	// Logical operations - these are inline-expanded by compiler, not builtins!
+	// "and", "or", "not" expand to fork/jumpifnot patterns
 
 	// Arithmetic operations (binary)
 	"_plus":     builtinPlus,
@@ -65,6 +63,9 @@ var builtinRegistry = map[string]builtinFunc{
 	"_divide":   builtinDivide,
 	"_modulo":   builtinModulo,
 	"_negate":   builtinNegate,
+	// Aliases that jq actually uses
+	"_add":      builtinPlus,
+	"_subtract": builtinMinus,
 }
 
 // ============================================================================
