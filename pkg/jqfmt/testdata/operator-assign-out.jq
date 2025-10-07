@@ -1,2 +1,2 @@
-.foo.bar
-  = .a + .b
+.foo.bar = 
+  .a + .b

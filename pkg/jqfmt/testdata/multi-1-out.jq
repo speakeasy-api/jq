@@ -1,7 +1,7 @@
 [
-  .a,
-  .b,
+  .a, 
+  .b, 
   .c
-]
-  | map(. + 1)
-  | length
+] | 
+  map(. + 1) | 
+  length

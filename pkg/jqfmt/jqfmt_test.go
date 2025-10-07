@@ -84,8 +84,14 @@ func TestArray(t *testing.T) {
 		}
 
 		if !reflect.DeepEqual(want, out) {
-			t.Logf("want: %s", want)
-			t.Logf("have: %s", out)
+			t.Logf("want: %d bytes: %s", len(want), want)
+			t.Logf("have: %d bytes: %s", len(out), out)
+			for i := 0; i < len(want) && i < len(out); i++ {
+				if want[i] != out[i] {
+					t.Logf("First difference at byte %d: want[%d]=%q (%02x) != out[%d]=%q (%02x)", i, i, want[i], want[i], i, out[i], out[i])
+					break
+				}
+			}
 			t.Errorf("%s does not match %s", c.inFile, c.outFile)
 		}
 	}

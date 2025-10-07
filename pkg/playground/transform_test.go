@@ -226,7 +226,7 @@ components:
   schemas:
     User:
       type: object
-      x-speakeasy-transform-from-json: ".invalid syntax here"
+      x-speakeasy-transform-from-json: 'jq .invalid syntax here'
       properties:
         name:
           type: string
@@ -237,8 +237,8 @@ components:
 		t.Fatal("Expected error for invalid JQ syntax, but got none")
 	}
 
-	if !strings.Contains(err.Error(), "JQ execution failed") {
-		t.Errorf("Expected error message to contain 'JQ execution failed', got: %v", err)
+	if !strings.Contains(err.Error(), "invalid jq expression") {
+		t.Errorf("Expected error message to contain 'invalid jq expression', got: %v", err)
 	}
 }
 

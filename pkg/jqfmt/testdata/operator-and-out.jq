@@ -1,2 +1,2 @@
-(.a > 0)
-  and (.b | length > 1)
+(.a > 0) and 
+  (.b | length > 1)

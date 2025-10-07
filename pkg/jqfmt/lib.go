@@ -811,7 +811,7 @@ type ObjectKeyVal struct {
 	Key       string
 	KeyString *String
 	KeyQuery  *Query
-	Val       *ObjectVal
+	Val       *Query
 }
 
 func (e *ObjectKeyVal) String() string {
@@ -830,13 +830,9 @@ func (e *ObjectKeyVal) writeTo(s *strings.Builder) {
 		e.KeyQuery.writeTo(s)
 		s.WriteByte(')')
 	}
-	if cfg.Obj {
-	}
 	if e.Val != nil {
 		s.WriteString(": ")
 		e.Val.writeTo(s)
-	}
-	if cfg.Obj {
 	}
 }
 
@@ -848,32 +844,6 @@ func (e *ObjectKeyVal) minify() {
 	}
 	if e.Val != nil {
 		e.Val.minify()
-	}
-}
-
-// ObjectVal ...
-type ObjectVal struct {
-	Queries []*Query
-}
-
-func (e *ObjectVal) String() string {
-	var s strings.Builder
-	e.writeTo(&s)
-	return s.String()
-}
-
-func (e *ObjectVal) writeTo(s *strings.Builder) {
-	for i, e := range e.Queries {
-		if i > 0 {
-			s.WriteString(" | ")
-		}
-		e.writeTo(s)
-	}
-}
-
-func (e *ObjectVal) minify() {
-	for _, e := range e.Queries {
-		e.minify()
 	}
 }
 

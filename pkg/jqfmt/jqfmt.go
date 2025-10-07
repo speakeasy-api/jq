@@ -105,19 +105,12 @@ func DoThing(jqStr string, cfg_ JqFmtCfg) (string, error) {
 	indented = map[int]int{}
 
 	// Parse and format
-	initQ, err := strToQuery(jqStr)
+	q, err := strToQuery(jqStr)
 	if err != nil {
 		return "", fmt.Errorf("could not convert jq to query: %w", err)
 	}
 
 	// Generate formatted string
-	temp := initQ.String()
-
-	fnlQ, err := strToQuery(temp)
-	if err != nil {
-		return "", fmt.Errorf("could not convert jq to query: %w", err)
-	}
-
-	return fnlQ.String(), nil
+	return q.String(), nil
 }
 

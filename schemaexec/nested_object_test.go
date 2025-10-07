@@ -84,3 +84,22 @@ func TestNestedObjectConstruction_Minimal(t *testing.T) {
 		})
 	}
 }
+
+// TestDebug_FailingCase prints the bytecode for the failing expression
+func TestDebug_FailingCase(t *testing.T) {
+	query, err := gojq.Parse(`{userId: .id, displayName: .name, tier: (if .score >= 90 then "gold" else "silver" end), location: {city: .address.city, zip: .address.postalCode}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	code, err := gojq.Compile(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	codes := code.GetCodes()
+	t.Logf("Total opcodes: %d", len(codes))
+	for i, c := range codes {
+		t.Logf("  [%d] op=%d %s (value: %v)", i, c.GetOp(), c.OpString(), c.GetValue())
+	}
+}

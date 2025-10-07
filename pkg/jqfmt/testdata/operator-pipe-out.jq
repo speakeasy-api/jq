@@ -1,3 +1,3 @@
-.a
-  | .b
-  | length
+.a | 
+  .b | 
+  length

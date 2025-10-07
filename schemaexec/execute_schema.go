@@ -897,7 +897,8 @@ func (env *schemaEnv) execJumpIfNot(state *execState, c *codeOp) ([]*execState, 
 	jumpState.pc = c.value.(int)
 
 	continueState := state.clone()
-	continueState.pc++
+	// NOTE: Do NOT increment pc here - it's already been incremented by the framework
+	// before calling this handler (see executeOpMultiState line 224)
 
 	return []*execState{continueState, jumpState}, nil
 }
