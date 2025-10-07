@@ -5,3 +5,9 @@
 *.exe
 *.test
 *.out
+Ref/
+web/node_modules/
+web/dist/
+web/pnpm-lock.yaml
+web/src/assets/wasm/lib.wasm
+web/src/assets/wasm/wasm_exec.js

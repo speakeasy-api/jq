@@ -81,6 +81,10 @@ $(GOBIN)/staticcheck:
 check-tools:
 	go run _tools/print_builtin.go
 
+.PHONY: build-wasm
+build-wasm:
+	./build.sh
+
 .PHONY: clean
 clean:
 	rm -rf $(BIN) goxz CREDITS
