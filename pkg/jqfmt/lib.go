@@ -13,7 +13,6 @@ import (
 	"unicode/utf8"
 
 	gojq "github.com/speakeasy-api/jq"
-	log "github.com/sirupsen/logrus"
 )
 
 // Misc
@@ -63,7 +62,6 @@ func (e *Query) String() string {
 }
 
 func nodeIdt(nodeToIdt, reason string) {
-	log.Debugf("indenting \"%s\" for \"%s\" because \"%s\"\n", nodeToIdt, node, reason)
 	nodeIdts[nodeToIdt] = append(nodeIdts[nodeToIdt], reason)
 }
 
@@ -74,26 +72,22 @@ func prtIdt(s *strings.Builder) {
 	if strings.HasSuffix(node, ".Query.Left.Func") {
 		return
 	}
-	// idtHist := map[string]int{}
 	if indented[line] == 0 {
 		cIdt := 0
-		for n, reason := range nodeIdts {
+		for n := range nodeIdts {
 			if node == n {
 				continue
 			}
 			if strings.HasPrefix(node, n) {
-				log.Debugf("indt: \"%s\" -- %s\n", n, strings.Join(reason[:], ", "))
-				cIdt += 1
+				cIdt++
 			}
 		}
 		idtStr := ""
-		log.Debugf("indt: %d\tnode: \"%s\"\n", cIdt, node)
 		for i := 0; i < cIdt; i++ {
 			idtStr += "  "
 		}
 		s.WriteString(idtStr)
 		indented[line] = 1
-	} else {
 	}
 }
 
@@ -125,16 +119,11 @@ func descendsFrom(node string, ancestor string, parents []string) (bool, string)
 
 func (e *Query) writeTo(s *strings.Builder) {
 	prevNode := node
-	if node == "" {
-		log.Debugln("----------------------------------------")
-	}
-	log.Debugln("---")
 
 	// Where are we in the syntax tree?
 	arrElem, _ := descendsFrom(node, "Array", []string{"", "Left", "Right"})
 	firstQueryTerm, firstQueryAncestor := descendsFrom(node, "Query", []string{"Left"})
 	topQueryTerm, topQueryAncestor := descendsFrom(node, "", []string{"", "Left", "Query"})
-	log.Debugf("top: %t\tfirst: %t \tnode: %q\n", topQueryTerm, firstQueryTerm, node)
 
 	if e.Meta != nil {
 		s.WriteString("module ")
@@ -154,7 +143,6 @@ func (e *Query) writeTo(s *strings.Builder) {
 	} else if e.Term != nil {
 		node += fmt.Sprintf(".%s", strings.Replace(e.Term.Type.GoString(), "gojq.TermType", "", 1))
 		prtIdt(s)
-		log.Debugf("term: %q\n", e.Term)
 		e.Term.writeTo(s)
 		node = prevNode
 	} else if e.Right != nil {
