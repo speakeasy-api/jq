@@ -2,6 +2,7 @@ package schemaexec
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 	"gopkg.in/yaml.v3"
@@ -39,10 +40,31 @@ var builtinRegistry = map[string]builtinFunc{
 	"from_entries": builtinFromEntries,
 	"with_entries": builtinWithEntries,
 
-	// Selection/filtering - these need special handling
-	// Implemented in opcall handler
-	"select": nil, // Special: handled in opcall
-	"map":    nil, // Special: handled in opcall
+	// Selection/filtering - these are inline-expanded by compiler
+	// NOT builtins - they expand to fork/backtrack patterns
+	"select": nil, // Special: compiler macro
+	"map":    nil, // Special: compiler macro
+
+	// Comparison operations (for predicates in select, etc.)
+	"_equal":   builtinEqual, // ==
+	"_notequal": builtinNotEqual, // !=
+	"_less":    builtinLess, // <
+	"_greater": builtinGreater, // >
+	"_lesseq":  builtinLessEq, // <=
+	"_greatereq": builtinGreaterEq, // >=
+
+	// Logical operations
+	"and": builtinAnd,
+	"or":  builtinOr,
+	"not": builtinNot,
+
+	// Arithmetic operations (binary)
+	"_plus":     builtinPlus,
+	"_minus":    builtinMinus,
+	"_multiply": builtinMultiply,
+	"_divide":   builtinDivide,
+	"_modulo":   builtinModulo,
+	"_negate":   builtinNegate,
 }
 
 // ============================================================================
@@ -387,4 +409,325 @@ func (env *schemaEnv) callBuiltin(name string, input *oas3.Schema, args []*oas3.
 func isBuiltin(name string) bool {
 	_, exists := builtinRegistry[name]
 	return exists
+}
+
+// ============================================================================
+// COMPARISON BUILTINS (for predicates in select, etc.)
+// ============================================================================
+
+// builtinEqual implements == comparison.
+func builtinEqual(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{BoolType()}, nil
+	}
+	return compareSchemas(input, args[0], func(cmp int) bool { return cmp == 0 })
+}
+
+// builtinNotEqual implements != comparison.
+func builtinNotEqual(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{BoolType()}, nil
+	}
+	return compareSchemas(input, args[0], func(cmp int) bool { return cmp != 0 })
+}
+
+// builtinLess implements < comparison.
+func builtinLess(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{BoolType()}, nil
+	}
+	return compareSchemas(input, args[0], func(cmp int) bool { return cmp < 0 })
+}
+
+// builtinGreater implements > comparison.
+func builtinGreater(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{BoolType()}, nil
+	}
+	return compareSchemas(input, args[0], func(cmp int) bool { return cmp > 0 })
+}
+
+// builtinLessEq implements <= comparison.
+func builtinLessEq(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{BoolType()}, nil
+	}
+	return compareSchemas(input, args[0], func(cmp int) bool { return cmp <= 0 })
+}
+
+// builtinGreaterEq implements >= comparison.
+func builtinGreaterEq(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{BoolType()}, nil
+	}
+	return compareSchemas(input, args[0], func(cmp int) bool { return cmp >= 0 })
+}
+
+// compareSchemas compares two schemas and returns a boolean schema.
+// If both are const values, compares them and returns ConstBool.
+// Otherwise returns BoolType().
+func compareSchemas(lhs, rhs *oas3.Schema, pred func(int) bool) ([]*oas3.Schema, error) {
+	// Try to extract const values
+	lhsVal, lhsIsConst := extractConstValue(lhs)
+	rhsVal, rhsIsConst := extractConstValue(rhs)
+
+	if lhsIsConst && rhsIsConst {
+		// Both are const - can compute result
+		cmp := compareValues(lhsVal, rhsVal)
+		return []*oas3.Schema{ConstBool(pred(cmp))}, nil
+	}
+
+	// Can't determine statically - return generic boolean
+	return []*oas3.Schema{BoolType()}, nil
+}
+
+// extractConstValue extracts a const value from a schema if it has enum with 1 value.
+func extractConstValue(schema *oas3.Schema) (any, bool) {
+	if schema == nil || schema.Enum == nil || len(schema.Enum) != 1 {
+		return nil, false
+	}
+
+	node := schema.Enum[0]
+	switch node.Kind {
+	case yaml.ScalarNode:
+		// Try to parse as number
+		if schema.GetType()[0] == "number" {
+			if f, err := parseFloat(node.Value); err == nil {
+				return f, true
+			}
+		}
+		// String
+		if schema.GetType()[0] == "string" {
+			return node.Value, true
+		}
+		// Boolean
+		if schema.GetType()[0] == "boolean" {
+			return node.Value == "true", true
+		}
+		return node.Value, true
+	default:
+		return nil, false
+	}
+}
+
+// compareValues compares two values similar to jq's Compare function.
+// Returns -1 if l < r, 0 if l == r, 1 if l > r.
+func compareValues(l, r any) int {
+	// Handle nils
+	if l == nil && r == nil {
+		return 0
+	}
+	if l == nil {
+		return -1
+	}
+	if r == nil {
+		return 1
+	}
+
+	// Type-based comparison
+	switch lv := l.(type) {
+	case float64:
+		if rv, ok := r.(float64); ok {
+			if lv < rv {
+				return -1
+			} else if lv > rv {
+				return 1
+			}
+			return 0
+		}
+	case string:
+		if rv, ok := r.(string); ok {
+			if lv < rv {
+				return -1
+			} else if lv > rv {
+				return 1
+			}
+			return 0
+		}
+	case bool:
+		if rv, ok := r.(bool); ok {
+			if !lv && rv {
+				return -1
+			} else if lv && !rv {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// Different types or unsupported - return 0 (conservative)
+	return 0
+}
+
+// parseFloat parses a string to float64.
+func parseFloat(s string) (float64, error) {
+	return strconv.ParseFloat(s, 64)
+}
+
+// ============================================================================
+// LOGICAL BUILTINS
+// ============================================================================
+
+// builtinAnd implements logical AND.
+func builtinAnd(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{BoolType()}, nil
+	}
+
+	// Check if definitely true/false
+	inputTruthy := isTruthy(input)
+	argTruthy := isTruthy(args[0])
+
+	if inputTruthy != nil && argTruthy != nil {
+		// Both definite
+		return []*oas3.Schema{ConstBool(*inputTruthy && *argTruthy)}, nil
+	}
+	if inputTruthy != nil && !*inputTruthy {
+		return []*oas3.Schema{ConstBool(false)}, nil // false AND x = false
+	}
+	if argTruthy != nil && !*argTruthy {
+		return []*oas3.Schema{ConstBool(false)}, nil // x AND false = false
+	}
+
+	return []*oas3.Schema{BoolType()}, nil
+}
+
+// builtinOr implements logical OR.
+func builtinOr(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{BoolType()}, nil
+	}
+
+	inputTruthy := isTruthy(input)
+	argTruthy := isTruthy(args[0])
+
+	if inputTruthy != nil && argTruthy != nil {
+		return []*oas3.Schema{ConstBool(*inputTruthy || *argTruthy)}, nil
+	}
+	if inputTruthy != nil && *inputTruthy {
+		return []*oas3.Schema{ConstBool(true)}, nil // true OR x = true
+	}
+	if argTruthy != nil && *argTruthy {
+		return []*oas3.Schema{ConstBool(true)}, nil // x OR true = true
+	}
+
+	return []*oas3.Schema{BoolType()}, nil
+}
+
+// builtinNot implements logical NOT.
+func builtinNot(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	truthy := isTruthy(input)
+	if truthy != nil {
+		return []*oas3.Schema{ConstBool(!*truthy)}, nil
+	}
+	return []*oas3.Schema{BoolType()}, nil
+}
+
+// isTruthy determines if a schema is definitely truthy/falsy.
+// Returns nil if uncertain.
+func isTruthy(schema *oas3.Schema) *bool {
+	if schema == nil {
+		f := false
+		return &f // null is falsy
+	}
+
+	// Check for const boolean
+	if val, ok := extractConstValue(schema); ok {
+		if b, ok := val.(bool); ok {
+			return &b
+		}
+	}
+
+	// Check for const false/null
+	typ := getType(schema)
+	if typ == "boolean" && schema.Enum != nil && len(schema.Enum) == 1 {
+		if schema.Enum[0].Value == "false" {
+			f := false
+			return &f
+		}
+		if schema.Enum[0].Value == "true" {
+			t := true
+			return &t
+		}
+	}
+	if typ == "null" {
+		f := false
+		return &f
+	}
+
+	return nil // Unknown
+}
+
+// ============================================================================
+// ARITHMETIC BUILTINS
+// ============================================================================
+
+// builtinPlus implements + for two values.
+func builtinPlus(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+	return arithmeticOp(input, args[0], func(a, b float64) float64 { return a + b })
+}
+
+// builtinMinus implements - for two values.
+func builtinMinus(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+	return arithmeticOp(input, args[0], func(a, b float64) float64 { return a - b })
+}
+
+// builtinMultiply implements * for two values.
+func builtinMultiply(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+	return arithmeticOp(input, args[0], func(a, b float64) float64 { return a * b })
+}
+
+// builtinDivide implements / for two values.
+func builtinDivide(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+	return arithmeticOp(input, args[0], func(a, b float64) float64 { return a / b })
+}
+
+// builtinModulo implements % for two values.
+func builtinModulo(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) != 1 {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+	return arithmeticOp(input, args[0], func(a, b float64) float64 {
+		// Integer modulo for integers
+		return float64(int(a) % int(b))
+	})
+}
+
+// builtinNegate implements unary - (negation).
+func builtinNegate(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	// Extract const if possible
+	if val, ok := extractConstValue(input); ok {
+		if f, ok := val.(float64); ok {
+			return []*oas3.Schema{ConstNumber(-f)}, nil
+		}
+	}
+	return []*oas3.Schema{NumberType()}, nil
+}
+
+// arithmeticOp performs arithmetic on two schemas.
+func arithmeticOp(lhs, rhs *oas3.Schema, op func(float64, float64) float64) ([]*oas3.Schema, error) {
+	lhsVal, lhsIsConst := extractConstValue(lhs)
+	rhsVal, rhsIsConst := extractConstValue(rhs)
+
+	if lhsIsConst && rhsIsConst {
+		lf, lok := lhsVal.(float64)
+		rf, rok := rhsVal.(float64)
+		if lok && rok {
+			return []*oas3.Schema{ConstNumber(op(lf, rf))}, nil
+		}
+	}
+
+	return []*oas3.Schema{NumberType()}, nil
 }

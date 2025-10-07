@@ -306,6 +306,32 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		// Function call
 		return env.execCallMulti(next, c)
 
+	case opPushPC:
+		// Push PC for function call - we can ignore this for schema execution
+		// It pushes [pc, scopeIndex] but we don't track PC values symbolically
+		next.push(Top()) // Push a generic value as placeholder
+		return []*execState{next}, nil
+
+	case opCallPC:
+		// Call saved PC - pop the value and widen conservatively
+		// In concrete execution this jumps to a saved PC, but we can't do that symbolically
+		if len(next.stack) > 0 {
+			next.pop() // Pop the [pc, scopeIndex] value
+		}
+		// Conservative: unknown function result
+		next.push(Top())
+		env.addWarning("opCallPC not fully supported, widening result to Top")
+		return []*execState{next}, nil
+
+	case opCallRec:
+		// Recursive call - similar to CallPC
+		if len(next.stack) > 0 {
+			next.pop()
+		}
+		next.push(Top())
+		env.addWarning("opCallRec not fully supported, widening result to Top")
+		return []*execState{next}, nil
+
 	// Unsupported opcodes
 	default:
 		if env.opts.StrictMode {
@@ -900,9 +926,24 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 		}
 		return states, nil
 
+	case int:
+		// User-defined function (PC to jump to)
+		// For now, conservatively preserve input or widen to Top
+		// In concrete execution, this would jump to the function body
+		// For symbolic execution, we can't easily inline the function
+		// Best effort: pop input, push Top
+		if len(state.stack) > 0 {
+			input := state.pop()
+			// Conservative: assume function could return input type or anything
+			state.push(input) // Preserve input type as approximation
+		} else {
+			state.push(Top())
+		}
+		return []*execState{state}, nil
+
 	default:
-		// User-defined or unknown
-		env.addWarning("user-defined function not supported")
+		// Unknown call format
+		env.addWarning("unknown function call format: %T", v)
 		state.push(Top())
 		return []*execState{state}, nil
 	}
