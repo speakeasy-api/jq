@@ -489,26 +489,43 @@ func extractConstValue(schema *oas3.Schema) (any, bool) {
 	}
 
 	node := schema.Enum[0]
-	switch node.Kind {
-	case yaml.ScalarNode:
-		// Try to parse as number
-		if schema.GetType()[0] == "number" {
-			if f, err := parseFloat(node.Value); err == nil {
-				return f, true
-			}
-		}
-		// String
-		if schema.GetType()[0] == "string" {
-			return node.Value, true
-		}
-		// Boolean
-		if schema.GetType()[0] == "boolean" {
-			return node.Value == "true", true
-		}
-		return node.Value, true
-	default:
+	if node.Kind != yaml.ScalarNode {
 		return nil, false
 	}
+
+	// Get type safely
+	types := schema.GetType()
+	var t string
+	if len(types) > 0 {
+		t = string(types[0])
+	}
+
+	// Try type-specific parsing
+	switch t {
+	case "number", "integer":
+		if f, err := parseFloat(node.Value); err == nil {
+			return f, true
+		}
+	case "string":
+		return node.Value, true
+	case "boolean":
+		return node.Value == "true", true
+	}
+
+	// Fallback to YAML tag if type is missing or unrecognized
+	switch node.Tag {
+	case "!!bool":
+		return node.Value == "true", true
+	case "!!int", "!!float":
+		if f, err := parseFloat(node.Value); err == nil {
+			return f, true
+		}
+	case "!!str":
+		return node.Value, true
+	}
+
+	// Default: return string value
+	return node.Value, true
 }
 
 // compareValues compares two values similar to jq's Compare function.

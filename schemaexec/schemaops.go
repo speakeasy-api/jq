@@ -1,6 +1,7 @@
 package schemaexec
 
 import (
+	"fmt"
 	"strconv"
 
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
@@ -220,18 +221,45 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 }
 
 // deduplicateSchemas removes duplicate schemas from a list.
-// For now, uses a simple type-based deduplication.
+// Uses enhanced fingerprinting that distinguishes constants and structural shapes.
 func deduplicateSchemas(schemas []*oas3.Schema) []*oas3.Schema {
 	seen := make(map[string]bool)
 	result := make([]*oas3.Schema, 0, len(schemas))
 
 	for _, s := range schemas {
-		// Simple fingerprint: just use type for now
-		// TODO Phase 4: Implement proper schema fingerprinting
+		if s == nil {
+			continue
+		}
+
+		// Build fingerprint key from type and structural features
 		typ := getType(s)
 		key := typ
 		if typ == "" {
 			key = "any"
+		}
+
+		// Distinguish constant values
+		if s.Enum != nil && len(s.Enum) == 1 {
+			key += "|const:" + s.Enum[0].Value
+		}
+
+		// Distinguish arrays by presence of items
+		if s.Items != nil {
+			key += "|arr"
+		}
+
+		// Distinguish objects by property count (coarse but better than nothing)
+		if s.Properties != nil {
+			propCount := 0
+			for range s.Properties.All() {
+				propCount++
+			}
+			key += fmt.Sprintf("|props:%d", propCount)
+		}
+
+		// Distinguish unions by branch count
+		if s.AnyOf != nil {
+			key += fmt.Sprintf("|anyOf:%d", len(s.AnyOf))
 		}
 
 		if !seen[key] {

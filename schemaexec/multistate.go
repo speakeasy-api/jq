@@ -42,24 +42,58 @@ func (s *execState) clone() *execState {
 }
 
 // fingerprint computes a hash of this state for memoization.
-// We hash: pc + stack top type + depth
+// Includes: pc, depth, full stack shape, and scope bindings
 func (s *execState) fingerprint() uint64 {
 	h := sha256.New()
 
 	// Hash PC
 	binary.Write(h, binary.LittleEndian, uint64(s.pc))
 
-	// Hash stack depth
-	binary.Write(h, binary.LittleEndian, uint64(len(s.stack)))
-
-	// Hash top of stack type (if non-empty)
-	if len(s.stack) > 0 && s.stack[len(s.stack)-1].Schema != nil {
-		topType := getType(s.stack[len(s.stack)-1].Schema)
-		h.Write([]byte(topType))
-	}
-
 	// Hash recursion depth
 	binary.Write(h, binary.LittleEndian, uint64(s.depth))
+
+	// Hash entire stack: depth + type and shape of each element
+	binary.Write(h, binary.LittleEndian, uint64(len(s.stack)))
+	for _, sv := range s.stack {
+		schema := sv.Schema
+		if schema == nil {
+			h.Write([]byte("nil"))
+			continue
+		}
+
+		// Hash type
+		h.Write([]byte(getType(schema)))
+
+		// Hash structural markers for better precision
+		if schema.Enum != nil {
+			binary.Write(h, binary.LittleEndian, uint64(len(schema.Enum)))
+		}
+		if schema.Items != nil {
+			h.Write([]byte("arr"))
+		}
+		if schema.Properties != nil {
+			// Count properties
+			propCount := 0
+			for range schema.Properties.All() {
+				propCount++
+			}
+			binary.Write(h, binary.LittleEndian, uint64(propCount))
+		}
+		if schema.AnyOf != nil {
+			binary.Write(h, binary.LittleEndian, uint64(len(schema.AnyOf)))
+		}
+	}
+
+	// Hash scope frames: frame count, variables per frame
+	binary.Write(h, binary.LittleEndian, uint64(len(s.scopes)))
+	for _, frame := range s.scopes {
+		binary.Write(h, binary.LittleEndian, uint64(len(frame)))
+		// Hash each variable name and its type
+		for k, v := range frame {
+			h.Write([]byte(k))
+			h.Write([]byte(getType(v)))
+		}
+	}
 
 	// Return first 8 bytes as uint64
 	sum := h.Sum(nil)

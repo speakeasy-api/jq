@@ -570,7 +570,7 @@ func (env *schemaEnv) execIndex(c *codeOp) error {
 
 	case "array":
 		// Array indexing
-		result = getArrayElement(base, indexKey)
+		result = getArrayElement(base, indexKey, env.opts)
 		if result == nil {
 			result = Top()
 		}
@@ -704,7 +704,7 @@ func getCodeValue(c any) any {
 
 // getArrayElement returns the schema for arr[index].
 // Handles prefixItems, items, and unknown indices.
-func getArrayElement(arr *oas3.Schema, indexKey any) *oas3.Schema {
+func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oas3.Schema {
 	// Try to extract constant integer index
 	if idx, ok := indexKey.(int); ok {
 		// Check prefixItems for tuple access
@@ -744,7 +744,7 @@ func getArrayElement(arr *oas3.Schema, indexKey any) *oas3.Schema {
 		return Top()
 	}
 
-	return Union(schemas, DefaultOptions())
+	return Union(schemas, opts)
 }
 
 // ============================================================================
@@ -785,7 +785,7 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 			result = Top()
 		}
 	case "array":
-		result = getArrayElement(base, indexKey)
+		result = getArrayElement(base, indexKey, env.opts)
 	default:
 		// Unknown type - conservative
 		result = Top()
@@ -958,17 +958,13 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 
 	case int:
 		// User-defined function (PC to jump to)
-		// For now, conservatively preserve input or widen to Top
-		// In concrete execution, this would jump to the function body
-		// For symbolic execution, we can't easily inline the function
-		// Best effort: pop input, push Top
+		// For symbolic execution, we can't easily inline the function body
+		// Be conservative to avoid false negatives: widen to Top
 		if len(state.stack) > 0 {
-			input := state.pop()
-			// Conservative: assume function could return input type or anything
-			state.push(input) // Preserve input type as approximation
-		} else {
-			state.push(Top())
+			_ = state.pop() // Discard input
 		}
+		env.addWarning("user-defined function call approximated; widened to Top")
+		state.push(Top())
 		return []*execState{state}, nil
 
 	default:
