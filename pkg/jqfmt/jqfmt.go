@@ -53,13 +53,14 @@ func ValidateConfig(cfg JqFmtCfg) (JqFmtCfg, error) {
 	for o, op := range ops {
 		valid := false
 		for _, vop := range validOps {
-			if strings.ToLower(op) == strings.ToLower(vop) {
+			if strings.EqualFold(op, vop) {
 				ops[o] = vop
 				valid = true
+				break
 			}
 		}
 		if !valid {
-			return cfg, fmt.Errorf("invalid operator \"%s\"; valid operators: %s\n", op, strings.Join(validOps[:], ", "))
+			return cfg, fmt.Errorf("invalid operator %q; valid operators: %s", op, strings.Join(validOps, ", "))
 		}
 	}
 	cfg.Ops = ops
@@ -74,7 +75,6 @@ func strToQuery(jqStr string) (Query, error) {
 
 	// Parse into AST.
 	jqAst, err := gojq.Parse(jqStr)
-	// TODO: print jq pretty errors
 	if err != nil {
 		return jqAstQ, fmt.Errorf("could not parse jq: %w", err)
 	}

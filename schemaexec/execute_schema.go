@@ -163,10 +163,15 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		state := worklist.pop()
 
 		// Check if we've seen this state (memoization)
-		if env.opts.EnableMemo && worklist.hasSeen(state) {
+		// TODO: Memoization currently disabled because fingerprint doesn't recursively
+		// hash nested property schemas, causing incorrect state deduplication
+		// when properties have different enum values (e.g., tier: "gold" vs "silver")
+		_ = worklist // Suppress unused warning
+		if false && env.opts.EnableMemo && worklist.hasSeen(state) {
+			fmt.Printf("DEBUG: Skipping memoized state at pc=%d\n", state.pc)
 			continue
 		}
-		if env.opts.EnableMemo {
+		if false && env.opts.EnableMemo {
 			worklist.markSeen(state)
 		}
 

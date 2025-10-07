@@ -4,8 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash"
+	"sort"
+	"strings"
 
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
+	"gopkg.in/yaml.v3"
 )
 
 // execState represents a single execution state in the multi-state VM.
@@ -66,7 +70,7 @@ func (s *execState) fingerprint() uint64 {
 
 		// Hash structural markers for better precision
 		if schema.Enum != nil {
-			binary.Write(h, binary.LittleEndian, uint64(len(schema.Enum)))
+			hashEnumValues(h, schema.Enum)
 		}
 		if schema.Items != nil {
 			h.Write([]byte("arr"))
@@ -98,6 +102,76 @@ func (s *execState) fingerprint() uint64 {
 	// Return first 8 bytes as uint64
 	sum := h.Sum(nil)
 	return binary.LittleEndian.Uint64(sum[:8])
+}
+
+// canonicalizeYAMLNode converts a yaml.Node to a canonical string for fingerprinting.
+func canonicalizeYAMLNode(node *yaml.Node) string {
+	if node == nil {
+		return "null"
+	}
+
+	switch node.Kind {
+	case yaml.ScalarNode:
+		return "s:" + node.Value
+	case yaml.SequenceNode:
+		var b strings.Builder
+		b.WriteString("[")
+		for i, n := range node.Content {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(canonicalizeYAMLNode(n))
+		}
+		b.WriteByte(']')
+		return b.String()
+	case yaml.MappingNode:
+		// Sort keys for deterministic encoding
+		pairs := make([]struct{ key, val string }, 0, len(node.Content)/2)
+		for i := 0; i < len(node.Content); i += 2 {
+			if i+1 < len(node.Content) {
+				key := canonicalizeYAMLNode(node.Content[i])
+				val := canonicalizeYAMLNode(node.Content[i+1])
+				pairs = append(pairs, struct{ key, val string }{key, val})
+			}
+		}
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].key < pairs[j].key })
+		var b strings.Builder
+		b.WriteString("{")
+		for i, p := range pairs {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(p.key)
+			b.WriteByte(':')
+			b.WriteString(p.val)
+		}
+		b.WriteByte('}')
+		return b.String()
+	default:
+		return fmt.Sprintf("kind%d", node.Kind)
+	}
+}
+
+// hashEnumValues hashes enum values in a deterministic way.
+func hashEnumValues(h hash.Hash, enum []*yaml.Node) {
+	if len(enum) == 0 {
+		return
+	}
+	// Canonicalize each value, sort so order doesn't affect fingerprint
+	enc := make([]string, 0, len(enum))
+	for _, node := range enum {
+		enc = append(enc, canonicalizeYAMLNode(node))
+	}
+	sort.Strings(enc)
+
+	// Include length
+	binary.Write(h, binary.LittleEndian, uint64(len(enc)))
+
+	// Write all canonicalized values
+	for _, s := range enc {
+		h.Write([]byte(s))
+		h.Write([]byte{0}) // Separator
+	}
 }
 
 // push pushes a schema onto the stack.

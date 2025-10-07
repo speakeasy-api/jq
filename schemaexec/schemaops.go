@@ -1,7 +1,6 @@
 package schemaexec
 
 import (
-	"fmt"
 	"strconv"
 
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
@@ -200,9 +199,13 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		}
 	}
 
-	// Deduplicate by type (simple dedup for now)
-	// TODO: More sophisticated deduplication in normalization phase
+	// Deduplicate
 	deduped := deduplicateSchemas(flattened)
+
+	// Try to merge compatible objects into a single object
+	if merged := tryMergeObjects(deduped, opts); merged != nil {
+		return merged
+	}
 
 	// Check if we exceed the anyOf limit
 	if len(deduped) > opts.AnyOfLimit {
@@ -220,52 +223,200 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	}
 }
 
+// tryMergeObjects attempts to merge multiple object schemas into a single object
+// Returns nil if merging is not safe
+func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	if len(schemas) <= 1 {
+		return nil
+	}
+
+	// All schemas must be objects
+	for _, s := range schemas {
+		if getType(s) != "object" {
+			return nil
+		}
+	}
+
+	// All must have identical required sets (critical for correctness)
+	if !haveSameRequiredSets(schemas) {
+		return nil
+	}
+
+	// Collect all property names across all branches
+	allProps := make(map[string]bool)
+	for _, s := range schemas {
+		if s.Properties != nil {
+			for propName := range s.Properties.All() {
+				allProps[propName] = true
+			}
+		}
+	}
+
+	// Merge each property across branches
+	mergedProps := make(map[string]*oas3.Schema)
+	for propName := range allProps {
+		var propSchemas []*oas3.Schema
+		for _, s := range schemas {
+			if s.Properties != nil {
+				if propSchema, ok := s.Properties.Get(propName); ok {
+					if propSchema.GetLeft() != nil {
+						propSchemas = append(propSchemas, propSchema.GetLeft())
+					}
+				}
+			}
+		}
+
+		if len(propSchemas) > 0 {
+			// Recursively union the property schemas
+			unionSchema := Union(propSchemas, opts)
+			// Unwrap single-branch anyOf
+			if unionSchema.AnyOf != nil && len(unionSchema.AnyOf) == 1 && unionSchema.AnyOf[0].GetLeft() != nil {
+				unionSchema = unionSchema.AnyOf[0].GetLeft()
+			}
+			mergedProps[propName] = unionSchema
+		}
+	}
+
+	// Build merged object
+	required := []string{}
+	if len(schemas) > 0 && schemas[0].Required != nil {
+		required = schemas[0].Required
+	}
+
+	return BuildObject(mergedProps, required)
+}
+
+// haveSameRequiredSets checks if all schemas have identical required sets
+func haveSameRequiredSets(schemas []*oas3.Schema) bool {
+	if len(schemas) <= 1 {
+		return true
+	}
+
+	// Build set from first schema
+	first := schemas[0].Required
+	firstSet := make(map[string]bool)
+	for _, r := range first {
+		firstSet[r] = true
+	}
+
+	// Compare all others
+	for i := 1; i < len(schemas); i++ {
+		req := schemas[i].Required
+		if len(req) != len(first) {
+			return false
+		}
+
+		for _, r := range req {
+			if !firstSet[r] {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
 // deduplicateSchemas removes duplicate schemas from a list.
 // Uses enhanced fingerprinting that distinguishes constants and structural shapes.
 func deduplicateSchemas(schemas []*oas3.Schema) []*oas3.Schema {
-	seen := make(map[string]bool)
-	result := make([]*oas3.Schema, 0, len(schemas))
+	if len(schemas) <= 1 {
+		return schemas
+	}
 
+	// Step 1: Pointer-identity dedup (catches shared schema instances)
+	seenPtr := make(map[*oas3.Schema]struct{})
+	unique := make([]*oas3.Schema, 0, len(schemas))
 	for _, s := range schemas {
 		if s == nil {
 			continue
 		}
-
-		// Build fingerprint key from type and structural features
-		typ := getType(s)
-		key := typ
-		if typ == "" {
-			key = "any"
+		if _, ok := seenPtr[s]; ok {
+			continue
 		}
+		seenPtr[s] = struct{}{}
+		unique = append(unique, s)
+	}
 
-		// Distinguish constant values
-		if s.Enum != nil && len(s.Enum) == 1 {
-			key += "|const:" + s.Enum[0].Value
+	// Step 2: Special case - merge string const/enum schemas
+	// If all schemas are string type with single enum values, combine into one enum
+	if canMergeStringEnums(unique) {
+		return []*oas3.Schema{mergeStringEnums(unique)}
+	}
+
+	// Otherwise, keep all unique schemas (no structural dedup to avoid ordering issues)
+	return unique
+}
+
+// canMergeStringEnums checks if all schemas are string enums that can be merged
+func canMergeStringEnums(schemas []*oas3.Schema) bool {
+	if len(schemas) == 0 {
+		return false
+	}
+
+	for _, s := range schemas {
+		if s == nil {
+			return false
 		}
-
-		// Distinguish arrays by presence of items
-		if s.Items != nil {
-			key += "|arr"
+		// Must be string type
+		if getType(s) != "string" {
+			return false
 		}
-
-		// Distinguish objects by property count (coarse but better than nothing)
-		if s.Properties != nil {
-			propCount := 0
-			for range s.Properties.All() {
-				propCount++
+		// Must have at least one enum value
+		if s.Enum == nil || len(s.Enum) == 0 {
+			return false
+		}
+		// All enum values must be strings
+		for _, node := range s.Enum {
+			if node == nil || node.Kind != yaml.ScalarNode {
+				return false
 			}
-			key += fmt.Sprintf("|props:%d", propCount)
+			// Strings typically have Tag "!!str" or no tag
+			if node.Tag != "" && node.Tag != "!!str" {
+				return false
+			}
+		}
+		// Must not have other validation constraints that would conflict
+		if s.Pattern != nil || s.MinLength != nil || s.MaxLength != nil || s.Format != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeStringEnums merges multiple string enum schemas into a single enum schema
+func mergeStringEnums(schemas []*oas3.Schema) *oas3.Schema {
+	// Collect all enum values, deduplicating by canonical form
+	seenValues := make(map[string]*yaml.Node)
+	var values []*yaml.Node
+	nullable := false
+
+	for _, s := range schemas {
+		// Track nullable across all branches
+		if s.Nullable != nil && *s.Nullable {
+			nullable = true
 		}
 
-		// Distinguish unions by branch count
-		if s.AnyOf != nil {
-			key += fmt.Sprintf("|anyOf:%d", len(s.AnyOf))
+		// Collect all enum values
+		if s.Enum != nil {
+			for _, node := range s.Enum {
+				canonical := canonicalizeYAMLNode(node)
+				if _, ok := seenValues[canonical]; !ok {
+					seenValues[canonical] = node
+					values = append(values, node)
+				}
+			}
 		}
+	}
 
-		if !seen[key] {
-			seen[key] = true
-			result = append(result, s)
-		}
+	// Create a schema with all merged enum values
+	result := &oas3.Schema{
+		Type: oas3.NewTypeFromString(oas3.SchemaTypeString),
+		Enum: values,
+	}
+
+	// Preserve nullable if any branch was nullable
+	if nullable {
+		result.Nullable = &nullable
 	}
 
 	return result

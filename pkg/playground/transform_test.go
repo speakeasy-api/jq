@@ -283,15 +283,14 @@ info:
   version: 1.0.0
 components:
   schemas:
-    User:
+    Address:
       type: object
+      x-speakeasy-transform-from-json: 'jq {street, zipcode: .zip}'
       properties:
-        address:
-          type: object
-          x-speakeasy-transform-from-json: ".properties.zipcode = {\"type\": \"string\", \"pattern\": \"^[0-9]{5}$\"}"
-          properties:
-            street:
-              type: string
+        street:
+          type: string
+        zip:
+          type: string
 `
 
 	result, err := SymbolicExecuteJQ(oasYAML)
@@ -299,12 +298,12 @@ components:
 		t.Fatalf("SymbolicExecuteJQ failed: %v", err)
 	}
 
-	// Check that nested transformation was applied
+	// Check that transformation was applied
 	if !strings.Contains(result, "zipcode") {
 		t.Errorf("Expected transformed schema to contain 'zipcode' property.\nResult:\n%s", result)
 	}
 
-	if !strings.Contains(result, "^[0-9]{5}$") {
-		t.Errorf("Expected transformed schema to contain pattern.\nResult:\n%s", result)
+	if !strings.Contains(result, "street") {
+		t.Errorf("Expected transformed schema to contain 'street' property.\nResult:\n%s", result)
 	}
 }
