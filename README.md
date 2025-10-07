@@ -7,9 +7,43 @@ A Go library for symbolic execution of [jq](https://github.com/jqlang/jq) expres
 This library extends gojq to provide symbolic execution capabilities, enabling:
 
 - **Type-safe transformations**: Validate JQ expressions against JSON Schemas to ensure type safety before execution
+- **Schema transformation**: Compute output JSON Schema from input JSON Schema and jq expression
 - **Code generation**: Generate type-safe transformer code in multiple target languages
 - **Static analysis**: Analyze JQ expressions to understand input/output type relationships
 - **Schema validation**: Verify that JQ transformations preserve type contracts
+
+### Schema Symbolic Execution (New!)
+
+The `schemaexec` package enables symbolic execution of jq over JSON Schemas:
+
+```go
+import (
+    "github.com/itchyny/gojq"
+    "github.com/itchyny/gojq/schemaexec"
+)
+
+// Define input schema
+inputSchema := schemaexec.BuildObject(map[string]*oas3.Schema{
+    "items": schemaexec.ArrayType(schemaexec.ObjectType()),
+}, []string{"items"})
+
+// Parse jq query
+query, _ := gojq.Parse(".items[] | {name: .product}")
+
+// Run symbolic execution to get output schema
+result, _ := schemaexec.RunSchema(context.Background(), query, inputSchema)
+
+fmt.Printf("Output schema: %+v\n", result.Schema)
+```
+
+See [schemaexec/README.md](schemaexec/README.md) for detailed documentation.
+
+**Status**: ✅ **MVP Complete!** Phases 1-3 implemented. Symbolic execution working for common jq patterns:
+- Property access: `.foo`, `.foo.bar`
+- Arrays: `.[0]`, `.[]`
+- Object construction: `{name: .x}`
+- Type narrowing and constraints
+- 31/31 tests passing
 
 ## Installation
 

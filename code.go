@@ -5,6 +5,21 @@ type code struct {
 	op opcode
 }
 
+// GetOp returns the opcode for schema execution.
+func (c *code) GetOp() int {
+	return int(c.op)
+}
+
+// GetValue returns the opcode value for schema execution.
+func (c *code) GetValue() any {
+	return c.v
+}
+
+// OpString returns the string representation of the opcode.
+func (c *code) OpString() string {
+	return c.op.String()
+}
+
 type opcode int
 
 const (

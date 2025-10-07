@@ -221,3 +221,151 @@ func getType(s *oas3.Schema) string {
 	}
 	return string(types[0])
 }
+
+// ============================================================================
+// SET OPERATIONS - ADVANCED
+// ============================================================================
+
+// Intersect creates a schema that matches all input schemas (allOf).
+// This is used for narrowing and constraint combination.
+func Intersect(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	if a == nil || b == nil {
+		return Bottom()
+	}
+
+	// Check for type incompatibility
+	typeA, typeB := getType(a), getType(b)
+	if typeA != "" && typeB != "" && typeA != typeB {
+		// Incompatible types = Bottom (no valid values)
+		return Bottom()
+	}
+
+	// If one is Bottom, result is Bottom
+	if a == Bottom() || b == Bottom() {
+		return Bottom()
+	}
+
+	// For same types, we could try to merge constraints intelligently
+	// For now, create allOf
+	allOf := []*oas3.JSONSchema[oas3.Referenceable]{
+		oas3.NewJSONSchemaFromSchema[oas3.Referenceable](a),
+		oas3.NewJSONSchemaFromSchema[oas3.Referenceable](b),
+	}
+
+	return &oas3.Schema{
+		AllOf: allOf,
+	}
+}
+
+// RequireType narrows a schema to a specific type.
+// Used for type guards like: select(type == "array")
+func RequireType(s *oas3.Schema, typ oas3.SchemaType, opts SchemaExecOptions) *oas3.Schema {
+	if s == nil {
+		return Bottom()
+	}
+
+	// Create a schema that requires the specific type
+	typeSchema := &oas3.Schema{
+		Type: oas3.NewTypeFromString(typ),
+	}
+
+	// Intersect with the original schema
+	return Intersect(s, typeSchema, opts)
+}
+
+// HasProperty refines an object schema to require a property exists.
+// Used for guards like: select(has("foo"))
+func HasProperty(obj *oas3.Schema, key string, opts SchemaExecOptions) *oas3.Schema {
+	if obj == nil {
+		return Bottom()
+	}
+
+	// If not an object type, this can't succeed
+	objType := getType(obj)
+	if objType != "" && objType != "object" {
+		return Bottom()
+	}
+
+	// Create a requirement that the property exists
+	// This means adding it to the required list
+	requirementSchema := &oas3.Schema{
+		Type:     oas3.NewTypeFromString(oas3.SchemaTypeObject),
+		Required: []string{key},
+	}
+
+	return Intersect(obj, requirementSchema, opts)
+}
+
+// MergeObjects combines two object schemas (for the + operator on objects).
+func MergeObjects(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+
+	// Merge properties from both objects
+	// Properties from b override properties from a
+	propMap := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+
+	// Add all from a
+	if a.Properties != nil {
+		for k, v := range a.Properties.All() {
+			propMap.Set(k, v)
+		}
+	}
+
+	// Add/override with b
+	if b.Properties != nil {
+		for k, v := range b.Properties.All() {
+			propMap.Set(k, v)
+		}
+	}
+
+	// Merge required lists
+	requiredMap := make(map[string]bool)
+	for _, r := range a.Required {
+		requiredMap[r] = true
+	}
+	for _, r := range b.Required {
+		requiredMap[r] = true
+	}
+
+	required := make([]string, 0, len(requiredMap))
+	for k := range requiredMap {
+		required = append(required, k)
+	}
+
+	return &oas3.Schema{
+		Type:       oas3.NewTypeFromString(oas3.SchemaTypeObject),
+		Properties: propMap,
+		Required:   required,
+	}
+}
+
+// BuildArray creates an array schema from element schemas.
+func BuildArray(items *oas3.Schema, elements []*oas3.Schema) *oas3.Schema {
+	// If specific elements provided, use prefixItems
+	if len(elements) > 0 {
+		prefixItems := make([]*oas3.JSONSchema[oas3.Referenceable], len(elements))
+		for i, elem := range elements {
+			prefixItems[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](elem)
+		}
+
+		schema := &oas3.Schema{
+			Type:        oas3.NewTypeFromString(oas3.SchemaTypeArray),
+			PrefixItems: prefixItems,
+		}
+
+		// If items schema also provided, use it for additional items
+		if items != nil {
+			schema.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](items)
+		}
+
+		return schema
+	}
+
+	// Otherwise, just use items schema
+	return ArrayType(items)
+}

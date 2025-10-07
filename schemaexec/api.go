@@ -39,30 +39,18 @@ func RunSchema(ctx context.Context, query *gojq.Query, input *oas3.Schema, opts 
 }
 
 // ExecSchema executes compiled jq bytecode symbolically on an input schema.
-// This is the core execution function that will be implemented in Phase 2.
-//
-// For Phase 1, this returns a placeholder implementation that demonstrates
-// the interface but doesn't yet perform full symbolic execution.
+// This is the core execution function - Phase 2 implementation.
 func ExecSchema(ctx context.Context, code *gojq.Code, input *oas3.Schema, opts SchemaExecOptions) (*SchemaExecResult, error) {
-	// TODO: Phase 2 - Implement full schema VM
-	//
-	// The full implementation will:
-	// 1. Create a schema VM environment
-	// 2. Initialize the stack with input schema
-	// 3. Execute bytecode operations on schemas
-	// 4. Collect output schemas and create union
-	// 5. Apply normalization
-	// 6. Return result with warnings
-	//
-	// For now, return a placeholder that shows the structure
+	// Validate input
+	if err := validateSchema(input); err != nil {
+		return nil, fmt.Errorf("invalid input schema: %w", err)
+	}
 
-	return &SchemaExecResult{
-		Schema: input, // Placeholder: return input unchanged
-		Warnings: []string{
-			"Schema VM not yet implemented - returning input schema unchanged",
-			"This is Phase 1: basic operations only",
-		},
-	}, nil
+	// Create schema VM environment
+	env := newSchemaEnv(ctx, opts)
+
+	// Execute bytecode on the input schema
+	return env.execute(code, input)
 }
 
 // Helper methods that will be used by the VM in Phase 2

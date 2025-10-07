@@ -29,6 +29,18 @@ type Code struct {
 	codeinfos []codeinfo
 }
 
+// GetCodes returns the bytecode instructions for schema execution.
+// This is used by the schemaexec package for symbolic execution.
+func (c *Code) GetCodes() []*code {
+	return c.codes
+}
+
+// GetCodeInfos returns the code info metadata.
+// This is used by the schemaexec package for symbolic execution.
+func (c *Code) GetCodeInfos() []codeinfo {
+	return c.codeinfos
+}
+
 // Run runs the code with the variable values (which should be in the
 // same order as the given variables using [WithVariables]) and returns
 // a result iterator.
