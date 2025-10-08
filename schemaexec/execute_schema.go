@@ -154,7 +154,15 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 	var sharedAccum map[string]*oas3.Schema
 
 	// Multi-state execution loop
+	maxIterations := env.opts.MaxDepth * 1000 // Safeguard against infinite loops
+	iterations := 0
 	for !worklist.isEmpty() {
+		// SAFEGUARD: Check iteration limit
+		iterations++
+		if iterations > maxIterations {
+			return nil, fmt.Errorf("exceeded maximum iterations (%d) - possible infinite loop", maxIterations)
+		}
+
 		// Check context cancellation
 		select {
 		case <-env.ctx.Done():
@@ -212,26 +220,9 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		}
 	}
 
-	// Fix up outputs: replace any array with empty/Top items with final accumulator value
-	// This handles the case where opLoad loaded the accumulator before opAppend completed
-	if sharedAccum != nil {
-		for i, out := range outputs {
-			if getType(out) == "array" {
-				hasEmptyItems := (out.Items == nil || out.Items.Left == nil || getType(out.Items.Left) == "")
-				if hasEmptyItems {
-					// Check if there's a better version in accumulator
-					// Try to find which accumulator key this array might correspond to
-					for _, accArr := range sharedAccum {
-						if getType(accArr) == "array" && accArr.Items != nil && accArr.Items.Left != nil {
-							// Replace with accumulated version
-							outputs[i] = accArr
-							break
-						}
-					}
-				}
-			}
-		}
-	}
+	// No fixup needed! With per-state accumulators and PC-based keys,
+	// each array construction site has its own accumulator.
+	// The Union operation (lattice join) handles merging when needed.
 
 	// Union all outputs
 	var result *oas3.Schema
@@ -291,20 +282,25 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			val := next.pop()
 			key := fmt.Sprintf("%v", c.value)
 			next.storeVar(key, val)
-			// If storing an array, also initialize in shared accumulator
-			// This ensures opLoad will find it even if executed before opAppend
+			// If storing an array, initialize accumulator with PC-based key (static allocation site)
+			// PC uniquely identifies each array construction site
 			if getType(val) == "array" {
-				next.accum[key] = val
+				accumKey := fmt.Sprintf("pc%d", next.pc)
+				next.accum[accumKey] = val
+				// Register mapping from variable key to accumulator key
+				next.accumKeys[key] = accumKey
 			}
 		}
 		return []*execState{next}, nil
 
 	case opLoad:
 		key := fmt.Sprintf("%v", c.value)
-		// Check shared accumulator first (for array construction)
-		if acc, ok := next.accum[key]; ok {
-			next.push(acc)
-			return []*execState{next}, nil
+		// Check accumulator first (using PC-based lookup)
+		if accumKey, ok := next.accumKeys[key]; ok {
+			if acc, ok2 := next.accum[accumKey]; ok2 {
+				next.push(acc)
+				return []*execState{next}, nil
+			}
 		}
 		// Fall back to normal variable frames
 		if val, ok := next.loadVar(key); ok {
@@ -316,7 +312,19 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		return []*execState{next}, nil
 
 	case opRet:
+		// Return from closure
 		next.popFrame()
+		if len(next.callstack) > 0 {
+			// Pop return address and jump back
+			retPC := next.callstack[len(next.callstack)-1]
+			next.callstack = next.callstack[:len(next.callstack)-1]
+			next.pc = retPC
+			// NOTE: Accumulator changes are preserved in next.accum
+			// When multiple returns merge, Union will handle the lattice join
+			return []*execState{next}, nil
+		}
+		// No caller - terminate this path
+		next.pc = len(env.codes)
 		return []*execState{next}, nil
 
 	case opDup:
@@ -354,20 +362,31 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		return env.execCallMulti(next, c)
 
 	case opPushPC:
-		// Push PC for function call - we can ignore this for schema execution
-		// It pushes [pc, scopeIndex] but we don't track PC values symbolically
-		next.push(Top()) // Push a generic value as placeholder
+		// Capture closure - create a schema that represents the closure
+		if pc, ok := c.value.(int); ok {
+			closureSchema := newClosureSchema(pc)
+			next.push(closureSchema)
+		} else {
+			next.push(Top())
+		}
 		return []*execState{next}, nil
 
 	case opCallPC:
-		// Call saved PC - pop the value and widen conservatively
-		// In concrete execution this jumps to a saved PC, but we can't do that symbolically
-		if len(next.stack) > 0 {
-			next.pop() // Pop the [pc, scopeIndex] value
+		// Call closure: pop it, jump to its PC, push return address
+		clos := next.pop()
+		if clos == nil {
+			next.push(Top())
+			return []*execState{next}, nil
 		}
-		// Conservative: unknown function result
+		if pc, ok := getClosurePC(clos); ok {
+			// Push return address (next.pc is already incremented by executeOpMultiState)
+			next.callstack = append(next.callstack, next.pc)
+			// Jump to closure PC
+			next.pc = pc
+			return []*execState{next}, nil
+		}
+		// Unknown closure
 		next.push(Top())
-		env.addWarning("opCallPC not fully supported, widening result to Top")
 		return []*execState{next}, nil
 
 	case opCallRec:
@@ -899,7 +918,7 @@ func (env *schemaEnv) execObjectMulti(state *execState, c *codeOp) ([]*execState
 
 // execAppendMulti handles array element appending in multi-state mode.
 // This is used for array construction: [.[] | f]
-// Uses shared accumulator map so all forked states see the same array being built.
+// Each state has its own accumulator map. Merging happens via lattice join when paths converge.
 func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState, error) {
 	// Pop the value to append
 	if len(state.stack) < 1 {
@@ -908,35 +927,52 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 
 	val := state.pop()
 
-	// Get the accumulator variable key
+	// Get the variable key
 	key := ""
 	if c.value != nil {
 		key = fmt.Sprintf("%v", c.value)
 	}
 
-	// Get existing items from shared accumulator (if any)
-	var priorItems *oas3.Schema = Bottom()
+	// Look up the CANONICAL array via PC-based key
+	var accumKey string
 	if key != "" {
-		if accArr, ok := state.accum[key]; ok {
-			if getType(accArr) == "array" && accArr.Items != nil && accArr.Items.Left != nil {
-				priorItems = accArr.Items.Left
-			}
+		if ak, ok := state.accumKeys[key]; ok {
+			accumKey = ak
 		}
 	}
 
-	// Union the new value with existing items
-	unionedItems := Union([]*oas3.Schema{priorItems, val}, env.opts)
-
-	// Create updated array schema
-	updatedArr := ArrayType(unionedItems)
-
-	// Write back to shared accumulator so other states see the update
-	if key != "" {
-		state.accum[key] = updatedArr
+	// Get or create the canonical array object for this allocation site
+	var canonicalArr *oas3.Schema
+	if accumKey != "" {
+		if existing, ok := state.accum[accumKey]; ok {
+			canonicalArr = existing
+		} else {
+			// Initialize canonical array for this PC
+			canonicalArr = ArrayType(Bottom())
+			state.accum[accumKey] = canonicalArr
+		}
+	} else {
+		// No accumulator - create standalone
+		canonicalArr = ArrayType(Bottom())
 	}
 
-	// Push updated array to stack (gets discarded on backtrack, but that's fine)
-	state.push(updatedArr)
+	// Get prior items
+	priorItems := Bottom()
+	if getType(canonicalArr) == "array" && canonicalArr.Items != nil && canonicalArr.Items.Left != nil {
+		priorItems = canonicalArr.Items.Left
+	}
+
+	// Union new value with existing items (lattice join - monotone operation)
+	unionedItems := Union([]*oas3.Schema{priorItems, val}, env.opts)
+
+	// MUTATE canonical array in-place - safe because PC keys prevent collisions!
+	// All states/references to this array will see the update
+	if getType(canonicalArr) == "array" {
+		canonicalArr.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](unionedItems)
+	}
+
+	// Push the SAME canonical array (preserves aliasing)
+	state.push(canonicalArr)
 	return []*execState{state}, nil
 }
 
@@ -1048,14 +1084,13 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 		return states, nil
 
 	case int:
-		// User-defined function (PC to jump to)
-		// For symbolic execution, we can't easily inline the function body
-		// Be conservative to avoid false negatives: widen to Top
-		if len(state.stack) > 0 {
-			_ = state.pop() // Discard input
-		}
-		env.addWarning("user-defined function call approximated; widened to Top")
-		state.push(Top())
+		// User-defined function: push return address and jump
+		targetPC := v
+		// Push return PC (state.pc is already incremented by dispatcher)
+		state.callstack = append(state.callstack, state.pc)
+		// Jump to function
+		state.pc = targetPC
+		state.depth++
 		return []*execState{state}, nil
 
 	default:
@@ -1253,4 +1288,18 @@ func valueToSchemaStatic(v any) *oas3.Schema {
 	default:
 		return Top()
 	}
+}
+
+// Simple closure tracking (maps schema pointer to PC)
+var closureRegistry = make(map[*oas3.Schema]int)
+
+func newClosureSchema(pc int) *oas3.Schema {
+	s := Top()
+	closureRegistry[s] = pc
+	return s
+}
+
+func getClosurePC(s *oas3.Schema) (int, bool) {
+	pc, ok := closureRegistry[s]
+	return pc, ok
 }
