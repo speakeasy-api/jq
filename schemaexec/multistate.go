@@ -19,9 +19,10 @@ type execState struct {
 	stack     []SValue                     // Schema stack (copy for this state)
 	scopes    []map[string]*oas3.Schema    // Scope frames (copy for this state)
 	depth     int                          // Recursion depth (for limiting)
-	accum     map[string]*oas3.Schema      // Per-state accumulator cells for array construction
-	accumKeys map[string]string            // Maps variable key -> accumulator key (PC-based)
-	callstack []int                        // Return address stack for closures
+	accum         map[string]*oas3.Schema // Shared accumulator cells for array construction
+	accumKeys     map[string]string        // Shared: Maps variable key -> accumulator key
+	allocCounter  *int                     // Shared: Monotonic counter for unique allocation IDs
+	callstack     []int                    // Per-state: Return address stack for closures
 }
 
 // clone creates a deep copy of this state for forking.
@@ -40,22 +41,21 @@ func (s *execState) clone() *execState {
 		scopesCopy[i] = frameCopy
 	}
 
-	// Accumulator map is SHARED across states - array construction needs shared state!
-	// PC-based keys ensure different array construction sites don't collide.
-	// accumKeys is also shared.
+	// Accumulator maps are SHARED across states (for array construction)
+	// Call stack is per-state
 
-	// Copy call stack
 	callstackCopy := make([]int, len(s.callstack))
 	copy(callstackCopy, s.callstack)
 
 	return &execState{
-		pc:        s.pc,
-		stack:     stackCopy,
-		scopes:    scopesCopy,
-		depth:     s.depth,
-		accum:     s.accum,     // SHARED - states within same array construction share accumulators
-		accumKeys: s.accumKeys, // SHARED
-		callstack: callstackCopy,
+		pc:         s.pc,
+		stack:      stackCopy,
+		scopes:     scopesCopy,
+		depth:      s.depth,
+		accum:        s.accum,        // SHARED
+		accumKeys:    s.accumKeys,    // SHARED
+		allocCounter: s.allocCounter, // SHARED pointer
+		callstack:    callstackCopy,
 	}
 }
 
@@ -250,14 +250,16 @@ func (s *execState) loadVar(key string) (*oas3.Schema, bool) {
 
 // newExecState creates an initial execution state.
 func newExecState(input *oas3.Schema) *execState {
+	counter := 0
 	state := &execState{
-		pc:        0,
-		stack:     make([]SValue, 0, 16),
-		scopes:    make([]map[string]*oas3.Schema, 0, 4),
-		depth:     0,
-		accum:     make(map[string]*oas3.Schema), // Per-state accumulator
-		accumKeys: make(map[string]string),        // Lookup map
-		callstack: make([]int, 0, 8),              // Call stack for closures
+		pc:           0,
+		stack:        make([]SValue, 0, 16),
+		scopes:       make([]map[string]*oas3.Schema, 0, 4),
+		depth:        0,
+		accum:        make(map[string]*oas3.Schema), // Shared accumulator
+		accumKeys:    make(map[string]string),        // Shared lookup
+		allocCounter: &counter,                       // Shared counter (pointer)
+		callstack:    make([]int, 0, 8),
 	}
 	state.pushFrame() // Initial global frame
 	state.push(input) // Push input onto stack

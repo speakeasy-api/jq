@@ -282,20 +282,28 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			val := next.pop()
 			key := fmt.Sprintf("%v", c.value)
 			next.storeVar(key, val)
-			// If storing an array, initialize accumulator with PC-based key (static allocation site)
-			// PC uniquely identifies each array construction site
+			// If storing an array, assign unique ID via monotonic counter
+			// Final solution: no static context is unique enough (JQ reuses code)
 			if getType(val) == "array" {
-				accumKey := fmt.Sprintf("pc%d", next.pc)
-				next.accum[accumKey] = val
-				// Register mapping from variable key to accumulator key
-				next.accumKeys[key] = accumKey
+				*next.allocCounter++
+				allocID := *next.allocCounter
+				accumKey := fmt.Sprintf("alloc%d", allocID)
+				// Initialize canonical array
+				if _, exists := next.accum[accumKey]; !exists {
+					next.accum[accumKey] = val
+				}
+				// Register mapping ONLY if not already set (first allocation wins)
+				// This prevents later opStores from overwriting earlier allocations
+				if _, exists := next.accumKeys[key]; !exists {
+					next.accumKeys[key] = accumKey
+				}
 			}
 		}
 		return []*execState{next}, nil
 
 	case opLoad:
 		key := fmt.Sprintf("%v", c.value)
-		// Check accumulator first (using PC-based lookup)
+		// Check accumulator first (using context-sensitive lookup)
 		if accumKey, ok := next.accumKeys[key]; ok {
 			if acc, ok2 := next.accum[accumKey]; ok2 {
 				next.push(acc)
@@ -379,6 +387,8 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			return []*execState{next}, nil
 		}
 		if pc, ok := getClosurePC(clos); ok {
+			// Record call site for 1-CFA
+			// removed callSitePC = next.pc
 			// Push return address (next.pc is already incremented by executeOpMultiState)
 			next.callstack = append(next.callstack, next.pc)
 			// Jump to closure PC
@@ -965,10 +975,14 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 	// Union new value with existing items (lattice join - monotone operation)
 	unionedItems := Union([]*oas3.Schema{priorItems, val}, env.opts)
 
-	// MUTATE canonical array in-place - safe because PC keys prevent collisions!
+	// MUTATE canonical array in-place - safe with unique keys!
 	// All states/references to this array will see the update
 	if getType(canonicalArr) == "array" {
 		canonicalArr.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](unionedItems)
+		if env.opts.EnableWarnings {
+			env.addWarning("opAppend[%s]: appending type=%s, prior=%s, union=%s",
+				accumKey, getType(val), getType(priorItems), getType(unionedItems))
+		}
 	}
 
 	// Push the SAME canonical array (preserves aliasing)
@@ -1084,8 +1098,10 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 		return states, nil
 
 	case int:
-		// User-defined function: push return address and jump
+		// User-defined function: record call site for 1-CFA and jump
 		targetPC := v
+		// Record call site PC (for accumulator disambiguation)
+		// removed callSitePC = state.pc
 		// Push return PC (state.pc is already incremented by dispatcher)
 		state.callstack = append(state.callstack, state.pc)
 		// Jump to function
