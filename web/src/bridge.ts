@@ -96,6 +96,33 @@ export type FormatJQMessage = {
       };
 };
 
+export type PipelineResult = {
+  panel1: string;
+  panel2: string;
+  panel3: string;
+  appliedFromJson: boolean;
+  appliedToJson: boolean;
+  warnings: string[];
+};
+
+export type SymbolicExecuteJQPipelineMessage = {
+  Request: {
+    type: "SymbolicExecuteJQPipeline";
+    payload: {
+      oasYAML: string;
+    };
+  };
+  Response:
+    | {
+        type: "SymbolicExecuteJQPipelineResult";
+        payload: string; // JSON-serialized PipelineResult
+      }
+    | {
+        type: "SymbolicExecuteJQPipelineError";
+        error: string;
+      };
+};
+
 export function executeJQ(
   query: string,
   jsonInput: string,
@@ -121,6 +148,19 @@ export function symbolicExecuteJQ(
     } satisfies SymbolicExecuteJQMessage["Request"],
     supercede,
   );
+}
+
+export function symbolicExecuteJQPipeline(
+  oasYAML: string,
+  supercede = false,
+): Promise<PipelineResult> {
+  return sendMessage(
+    {
+      type: "SymbolicExecuteJQPipeline",
+      payload: { oasYAML },
+    } satisfies SymbolicExecuteJQPipelineMessage["Request"],
+    supercede,
+  ).then((result: string) => JSON.parse(result));
 }
 
 export function formatJQ(query: string, supercede = false): Promise<string> {

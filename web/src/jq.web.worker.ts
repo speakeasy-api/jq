@@ -3,12 +3,14 @@ import "./assets/wasm/wasm_exec.js";
 import type {
   ExecuteJQMessage,
   SymbolicExecuteJQMessage,
+  SymbolicExecuteJQPipelineMessage,
   FormatJQMessage,
 } from "./bridge";
 
 const _wasmExecutors = {
   ExecuteJQ: (..._: any): any => false,
   SymbolicExecuteJQ: (..._: any): any => false,
+  SymbolicExecuteJQPipeline: (..._: any): any => false,
   FormatJQ: (..._: any): any => false,
 } as const;
 
@@ -24,6 +26,11 @@ const messageHandlers: MessageHandlers = {
     payload: SymbolicExecuteJQMessage["Request"]["payload"],
   ) => {
     return exec("SymbolicExecuteJQ", payload.oasYAML);
+  },
+  SymbolicExecuteJQPipeline: async (
+    payload: SymbolicExecuteJQPipelineMessage["Request"]["payload"],
+  ) => {
+    return exec("SymbolicExecuteJQPipeline", payload.oasYAML);
   },
   FormatJQ: async (payload: FormatJQMessage["Request"]["payload"]) => {
     return exec("FormatJQ", payload.query);
@@ -77,6 +84,7 @@ self.onmessage = async (
   event: MessageEvent<
     | ExecuteJQMessage["Request"]
     | SymbolicExecuteJQMessage["Request"]
+    | SymbolicExecuteJQPipelineMessage["Request"]
     | FormatJQMessage["Request"]
   >,
 ) => {

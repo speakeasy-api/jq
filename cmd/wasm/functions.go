@@ -141,6 +141,26 @@ func main() {
 		return FormatJQ(args[0].String())
 	}))
 
+	// Register SymbolicExecuteJQPipeline function
+	js.Global().Set("SymbolicExecuteJQPipeline", promisify(func(args []js.Value) (string, error) {
+		if len(args) != 1 {
+			return "", fmt.Errorf("SymbolicExecuteJQPipeline: expected 1 arg (oasYAML), got %v", len(args))
+		}
+
+		result, err := playground.SymbolicExecuteJQPipeline(args[0].String())
+		if err != nil {
+			return "", err
+		}
+
+		// Serialize the result to JSON
+		jsonBytes, err := json.Marshal(result)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal pipeline result: %w", err)
+		}
+
+		return string(jsonBytes), nil
+	}))
+
 	// Keep the program running
 	<-make(chan bool)
 }

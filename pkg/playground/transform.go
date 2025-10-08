@@ -141,6 +141,188 @@ func transformSchema(schema *oas3.JSONSchema[oas3.Referenceable], location strin
 	return nil
 }
 
+// PipelineResult contains the three panels
+type PipelineResult struct {
+	Panel1          string   `json:"panel1"`
+	Panel2          string   `json:"panel2"`
+	Panel3          string   `json:"panel3"`
+	AppliedFromJson bool     `json:"appliedFromJson"`
+	AppliedToJson   bool     `json:"appliedToJson"`
+	Warnings        []string `json:"warnings"`
+}
+
+// SymbolicExecuteJQPipeline performs sequential transformation pipeline
+func SymbolicExecuteJQPipeline(oasYAML string) (*PipelineResult, error) {
+	ctx := context.Background()
+	result := &PipelineResult{
+		Warnings: []string{},
+	}
+
+	// Parse original spec
+	reader := strings.NewReader(oasYAML)
+	doc1, validationErrs, err := openapi.Unmarshal(ctx, reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse OpenAPI document: %w", err)
+	}
+	if len(validationErrs) > 0 {
+		return nil, fmt.Errorf("OpenAPI validation failed: %v", validationErrs[0])
+	}
+
+	// Marshal panel1 (original)
+	var buf1 strings.Builder
+	if err := openapi.Marshal(ctx, doc1, &buf1); err != nil {
+		return nil, fmt.Errorf("failed to marshal panel1: %w", err)
+	}
+	result.Panel1 = buf1.String()
+
+	// Deep clone for panel2
+	doc2, err := cloneDocument(ctx, result.Panel1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to clone for panel2: %w", err)
+	}
+
+	// Apply from-json transformation
+	appliedFrom, warnings := applyTransformationsToDoc(ctx, doc2, "x-speakeasy-transform-from-json")
+	result.AppliedFromJson = appliedFrom
+	result.Warnings = append(result.Warnings, warnings...)
+
+	// Marshal panel2
+	var buf2 strings.Builder
+	if err := openapi.Marshal(ctx, doc2, &buf2); err != nil {
+		return nil, fmt.Errorf("failed to marshal panel2: %w", err)
+	}
+	result.Panel2 = buf2.String()
+
+	// Deep clone for panel3 (from panel2, not panel1)
+	doc3, err := cloneDocument(ctx, result.Panel2)
+	if err != nil {
+		return nil, fmt.Errorf("failed to clone for panel3: %w", err)
+	}
+
+	// Apply to-json transformation
+	appliedTo, warningsTo := applyTransformationsToDoc(ctx, doc3, "x-speakeasy-transform-to-json")
+	result.AppliedToJson = appliedTo
+	result.Warnings = append(result.Warnings, warningsTo...)
+
+	// Marshal panel3
+	var buf3 strings.Builder
+	if err := openapi.Marshal(ctx, doc3, &buf3); err != nil {
+		return nil, fmt.Errorf("failed to marshal panel3: %w", err)
+	}
+	result.Panel3 = buf3.String()
+
+	return result, nil
+}
+
+// cloneDocument deep clones a document by marshaling and unmarshaling
+func cloneDocument(ctx context.Context, yamlStr string) (*openapi.OpenAPI, error) {
+	reader := strings.NewReader(yamlStr)
+	doc, _, err := openapi.Unmarshal(ctx, reader)
+	if err != nil {
+		return nil, err
+	}
+	return doc, nil
+}
+
+// applyTransformationsToDoc applies transformations with the given extension name
+func applyTransformationsToDoc(ctx context.Context, doc *openapi.OpenAPI, extensionName string) (bool, []string) {
+	var transformErrors []string
+	applied := false
+
+	type schemaToTransform struct {
+		schema   *oas3.JSONSchema[oas3.Referenceable]
+		location string
+	}
+	var schemasToTransform []schemaToTransform
+
+	// Collect schemas with the extension
+	for item := range openapi.Walk(ctx, doc) {
+		err := item.Match(openapi.Matcher{
+			Schema: func(schema *oas3.JSONSchema[oas3.Referenceable]) error {
+				if schema.GetExtensions() != nil {
+					if _, ok := schema.GetExtensions().Get(extensionName); ok {
+						locationStr := fmt.Sprintf("%v", item.Location)
+						schemasToTransform = append(schemasToTransform, schemaToTransform{
+							schema:   schema,
+							location: locationStr,
+						})
+						applied = true
+					}
+				}
+				return nil
+			},
+		})
+		if err != nil {
+			transformErrors = append(transformErrors, fmt.Sprintf("walk error: %v", err))
+		}
+	}
+
+	// Process transformations in reverse order
+	for i := len(schemasToTransform) - 1; i >= 0; i-- {
+		st := schemasToTransform[i]
+		if err := transformSchemaWithExtension(st.schema, st.location, extensionName); err != nil {
+			transformErrors = append(transformErrors, fmt.Sprintf("%s: %v", st.location, err))
+		}
+	}
+
+	return applied, transformErrors
+}
+
+// transformSchemaWithExtension applies transformation using the specified extension
+func transformSchemaWithExtension(schema *oas3.JSONSchema[oas3.Referenceable], location string, extensionName string) error {
+	ext := schema.GetExtensions()
+	if ext == nil {
+		return nil
+	}
+
+	transformExpr, ok := ext.Get(extensionName)
+	if !ok {
+		return nil
+	}
+
+	// Parse the extension
+	transformFunc, err := ParseTransformExtension(transformExpr)
+	if err != nil {
+		return err
+	}
+
+	// Get the validated JQ expression
+	exprStr := transformFunc.Config
+
+	// Parse the JQ query
+	query, err := gojq.Parse(exprStr)
+	if err != nil {
+		return fmt.Errorf("failed to parse JQ query: %w", err)
+	}
+
+	// Get the schema value
+	schemaValue := schema.GetLeft()
+	if schemaValue == nil {
+		return fmt.Errorf("schema is a reference or boolean, cannot transform")
+	}
+
+	// Symbolically execute the JQ
+	result, err := schemaexec.RunSchema(context.Background(), query, schemaValue)
+	if err != nil {
+		return fmt.Errorf("symbolic execution failed: %w", err)
+	}
+
+	if result.Schema == nil {
+		return fmt.Errorf("symbolic execution produced no output schema")
+	}
+
+	// Remove the transform extension from the result
+	if result.Schema.Extensions != nil {
+		result.Schema.Extensions.Delete(extensionName)
+	}
+
+	// Replace the schema
+	newJSONSchema := oas3.NewJSONSchemaFromSchema[oas3.Referenceable](result.Schema)
+	*schema = *newJSONSchema
+
+	return nil
+}
+
 // executeJQInternal runs a JQ query against JSON input and returns the result
 func executeJQInternal(query, jsonInput string) (string, error) {
 	// Parse the JQ query
