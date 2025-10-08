@@ -15,7 +15,8 @@ components:
   schemas:
     User:
       type: object
-      x-speakeasy-transform-from-json: 'jq {id, name, status: .id}'
+      x-speakeasy-transform-from-json:
+        jq: '{id, name, status: .id}'
       properties:
         id:
           type: integer
@@ -25,7 +26,8 @@ components:
           type: string
     Product:
       type: object
-      x-speakeasy-transform-from-json: 'jq {name, total: (.price * .quantity)}'
+      x-speakeasy-transform-from-json:
+        jq: '{name, total: (.price * .quantity)}'
       properties:
         name:
           type: string
@@ -49,7 +51,8 @@ components:
   schemas:
     User:
       type: object
-      x-speakeasy-transform-from-json: 'jq {id, name, status: .id}'
+      x-speakeasy-transform-from-json:
+        jq: '{id, name, status: .id}'
       properties:
         id:
           type: integer
@@ -63,7 +66,8 @@ components:
         - id
     Product:
       type: object
-      x-speakeasy-transform-from-json: 'jq {name, total: (.price * .quantity)}'
+      x-speakeasy-transform-from-json:
+        jq: '{name, total: (.price * .quantity)}'
       properties:
         name:
           type: string
@@ -88,10 +92,11 @@ components:
   schemas:
     UserInput:
       type: object
-      x-speakeasy-transform-from-json: >
-        jq {userId: .id, displayName: .name,
-            tier: (if .score >= 90 then "gold" else "silver" end),
-            location: {city: .address.city, zip: .address.postalCode}}
+      x-speakeasy-transform-from-json:
+        jq: >
+          {userId: .id, displayName: .name,
+              tier: (if .score >= 90 then "gold" else "silver" end),
+              location: {city: .address.city, zip: .address.postalCode}}
       properties:
         id:
           type: integer
@@ -138,10 +143,11 @@ components:
   schemas:
     ProductInput:
       type: object
-      x-speakeasy-transform-from-json: >
-        jq {productId: .id, displayName: .name,
-            total: (.price * .quantity),
-            tags: (.tags | map({value: .}))}
+      x-speakeasy-transform-from-json:
+        jq: >
+          {productId: .id, displayName: .name,
+              total: (.price * .quantity),
+              tags: (.tags | map({value: .}))}
       properties:
         id:
           type: string
@@ -183,9 +189,10 @@ components:
   schemas:
     CartInput:
       type: object
-      x-speakeasy-transform-from-json: >
-        jq {grandTotal: (.items | map(.price * .quantity) | add // 0),
-            items: (.items | map({sku, total: (.price * .quantity)}))}
+      x-speakeasy-transform-from-json:
+        jq: >
+          {grandTotal: (.items | map(.price * .quantity) | add // 0),
+              items: (.items | map({sku, total: (.price * .quantity)}))}
       properties:
         items:
           type: array
@@ -226,7 +233,8 @@ components:
   schemas:
     User:
       type: object
-      x-speakeasy-transform-from-json: 'jq .invalid syntax here'
+      x-speakeasy-transform-from-json:
+        jq: '.invalid syntax here'
       properties:
         name:
           type: string
@@ -285,7 +293,8 @@ components:
   schemas:
     Address:
       type: object
-      x-speakeasy-transform-from-json: 'jq {street, zipcode: .zip}'
+      x-speakeasy-transform-from-json:
+        jq: '{street, zipcode: .zip}'
       properties:
         street:
           type: string
@@ -325,8 +334,10 @@ components:
           type: string
         name:
           type: string
-      x-speakeasy-transform-from-json: 'jq .'
-      x-speakeasy-transform-to-json: 'jq .'
+      x-speakeasy-transform-from-json:
+        jq: '.'
+      x-speakeasy-transform-to-json:
+        jq: '.'
 `
 
 	result, err := SymbolicExecuteJQPipeline(oasYAML)
@@ -358,8 +369,10 @@ components:
       properties:
         id:
           type: string
-      x-speakeasy-transform-from-json: 'jq {id: .id, serverTime: "2024-01-01"}'
-      x-speakeasy-transform-to-json: 'jq {id: .id}'
+      x-speakeasy-transform-from-json:
+        jq: '{id: .id, serverTime: "2024-01-01"}'
+      x-speakeasy-transform-to-json:
+        jq: '{id: .id}'
 `
 
 	result, err := SymbolicExecuteJQPipeline(oasYAML)
@@ -391,8 +404,10 @@ components:
       properties:
         id:
           type: string
-      x-speakeasy-transform-from-json: 'jq {id: .id}'
-      x-speakeasy-transform-to-json: 'jq {id: .id, clientNonce: "abc123"}'
+      x-speakeasy-transform-from-json:
+        jq: '{id: .id}'
+      x-speakeasy-transform-to-json:
+        jq: '{id: .id, clientNonce: "abc123"}'
 `
 
 	result, err := SymbolicExecuteJQPipeline(oasYAML)
@@ -467,7 +482,8 @@ components:
       properties:
         a:
           type: string
-      x-speakeasy-transform-from-json: 'jq {b: .a}'
+      x-speakeasy-transform-from-json:
+        jq: '{b: .a}'
 `
 
 	result, err := SymbolicExecuteJQPipeline(oasYAML)
@@ -500,7 +516,8 @@ components:
       properties:
         a:
           type: string
-      x-speakeasy-transform-to-json: 'jq {c: .a}'
+      x-speakeasy-transform-to-json:
+        jq: '{c: .a}'
 `
 
 	result, err := SymbolicExecuteJQPipeline(oasYAML)
@@ -535,8 +552,10 @@ components:
           type: string
         email:
           type: string
-      x-speakeasy-transform-from-json: 'jq {id: .id, email: .email, serverTime: "2024-01-01"}'
-      x-speakeasy-transform-to-json: 'jq {id: .id, email: .email}'
+      x-speakeasy-transform-from-json:
+        jq: '{id: .id, email: .email, serverTime: "2024-01-01"}'
+      x-speakeasy-transform-to-json:
+        jq: '{id: .id, email: .email}'
     Order:
       type: object
       properties:
@@ -544,8 +563,10 @@ components:
           type: string
         amount:
           type: number
-      x-speakeasy-transform-from-json: 'jq {id: .id, amount: .amount}'
-      x-speakeasy-transform-to-json: 'jq {id: .id, amount: .amount, clientNonce: "abc"}'
+      x-speakeasy-transform-from-json:
+        jq: '{id: .id, amount: .amount}'
+      x-speakeasy-transform-to-json:
+        jq: '{id: .id, amount: .amount, clientNonce: "abc"}'
 `
 
 	result, err := SymbolicExecuteJQPipeline(oasYAML)
@@ -577,8 +598,10 @@ components:
       properties:
         a:
           type: string
-      x-speakeasy-transform-from-json: 'jq {b: .a}'
-      x-speakeasy-transform-to-json: 'jq {c: .b}'
+      x-speakeasy-transform-from-json:
+        jq: '{b: .a}'
+      x-speakeasy-transform-to-json:
+        jq: '{c: .b}'
 `
 
 	result, err := SymbolicExecuteJQPipeline(oasYAML)
@@ -612,8 +635,10 @@ components:
           type: string
         debug:
           type: string
-      x-speakeasy-transform-from-json: 'jq {id: .id}'
-      x-speakeasy-transform-to-json: 'jq {id: .id}'
+      x-speakeasy-transform-from-json:
+        jq: '{id: .id}'
+      x-speakeasy-transform-to-json:
+        jq: '{id: .id}'
 `
 
 	result, err := SymbolicExecuteJQPipeline(oasYAML)
@@ -638,8 +663,10 @@ components:
     EntityResponse:
       type: object
       description: Extract nested ID to top-level with minimal references.
-      x-speakeasy-transform-from-json: 'jq . + {id: .data.result[0].id}'
-      x-speakeasy-transform-to-json: 'jq {data}'
+      x-speakeasy-transform-from-json:
+        jq: '. + {id: .data.result[0].id}'
+      x-speakeasy-transform-to-json:
+        jq: '{data}'
       properties:
         data:
           type: object
@@ -696,31 +723,33 @@ components:
   schemas:
     PaginatedItemsResponse:
       type: object
-      x-speakeasy-transform-from-json: >
-        jq {
-          items: (.data.items // []) | map({
-            id: .id,
-            title: .title,
-            status: (if (.active // false) then "active" else "inactive" end)
-          }),
-          hasMore: (.data.pagination.nextCursor != null),
-          total: (.data.pagination.total // 0),
-          nextCursor: (.data.pagination.nextCursor // null)
-        }
-      x-speakeasy-transform-to-json: >
-        jq {
-          data: {
-            items: (.items // []) | map({
+      x-speakeasy-transform-from-json:
+        jq: >
+          {
+            items: (.data.items // []) | map({
               id: .id,
               title: .title,
-              active: (.status == "active")
+              status: (if (.active // false) then "active" else "inactive" end)
             }),
-            pagination: {
-              nextCursor: .nextCursor,
-              total: (.total // 0)
+            hasMore: (.data.pagination.nextCursor != null),
+            total: (.data.pagination.total // 0),
+            nextCursor: (.data.pagination.nextCursor // null)
+          }
+      x-speakeasy-transform-to-json:
+        jq: >
+          {
+            data: {
+              items: (.items // []) | map({
+                id: .id,
+                title: .title,
+                active: (.status == "active")
+              }),
+              pagination: {
+                nextCursor: .nextCursor,
+                total: (.total // 0)
+              }
             }
           }
-        }
       properties:
         data:
           type: object
@@ -772,27 +801,29 @@ components:
   schemas:
     UserPreferences:
       type: object
-      x-speakeasy-transform-from-json: >
-        jq {
-          userId: .data.user.id,
-          email: .data.user.profile.contact.email,
-          fullName: (.data.user.profile.name.first + " " + .data.user.profile.name.last)
-        }
-      x-speakeasy-transform-to-json: >
-        jq {
-          data: {
-            user: {
-              id: .userId,
-              profile: {
-                name: {
-                  first: (.fullName | split(" ") | .[0]),
-                  last:  (.fullName | split(" ") | .[1:] | join(" "))
-                },
-                contact: { email: .email }
+      x-speakeasy-transform-from-json:
+        jq: >
+          {
+            userId: .data.user.id,
+            email: .data.user.profile.contact.email,
+            fullName: (.data.user.profile.name.first + " " + .data.user.profile.name.last)
+          }
+      x-speakeasy-transform-to-json:
+        jq: >
+          {
+            data: {
+              user: {
+                id: .userId,
+                profile: {
+                  name: {
+                    first: (.fullName | split(" ") | .[0]),
+                    last:  (.fullName | split(" ") | .[1:] | join(" "))
+                  },
+                  contact: { email: .email }
+                }
               }
             }
           }
-        }
       properties:
         data:
           type: object
@@ -842,18 +873,20 @@ components:
   schemas:
     TagList:
       type: object
-      x-speakeasy-transform-from-json: >
-        jq {
-          tags: (.tags // []) | map({
-            value: .,
-            slug: (. | ascii_downcase),
-            length: (. | length)
-          })
-        }
-      x-speakeasy-transform-to-json: >
-        jq {
-          tags: (.tags // []) | map(.value)
-        }
+      x-speakeasy-transform-from-json:
+        jq: >
+          {
+            tags: (.tags // []) | map({
+              value: .,
+              slug: (. | ascii_downcase),
+              length: (. | length)
+            })
+          }
+      x-speakeasy-transform-to-json:
+        jq: >
+          {
+            tags: (.tags // []) | map(.value)
+          }
       properties:
         tags:
           type: array

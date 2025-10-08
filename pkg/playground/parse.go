@@ -3,7 +3,6 @@ package playground
 import (
 	"fmt"
 	"strings"
-	"unicode"
 
 	gojq "github.com/speakeasy-api/jq"
 	"gopkg.in/yaml.v3"
@@ -24,49 +23,47 @@ type TransformerFunc struct {
 
 // ParseTransformExtension parses the x-speakeasy-transform-from-json extension
 func ParseTransformExtension(yamlNode *yaml.Node) (*TransformerFunc, error) {
-	// Check YAML node is a string
-	if yamlNode.Kind != yaml.ScalarNode {
-		return nil, fmt.Errorf("x-speakeasy-transform-from-json must be a string")
-	}
-	
-	rawValue := strings.TrimSpace(yamlNode.Value)
-	if rawValue == "" {
-		return nil, fmt.Errorf("x-speakeasy-transform-from-json is required")
+	// Check YAML node is a mapping (object)
+	if yamlNode.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("x-speakeasy-transform-from-json must be an object")
 	}
 
-	const jqPrefix = "jq"
-	if !strings.HasPrefix(rawValue, jqPrefix) {
-		return nil, fmt.Errorf("x-speakeasy-transform-from-json currently only supports 'jq'")
-	}
+	// Parse mapping to find "jq" key
+	var jqValue string
+	found := false
 
-	configValue := rawValue[len(jqPrefix):]
-	if configValue != "" {
-		trimmed := strings.TrimLeftFunc(configValue, unicode.IsSpace)
-		if len(trimmed) == len(configValue) {
-			return nil, fmt.Errorf("x-speakeasy-transform-from-json currently only supports 'jq' (missing space after 'jq')")
+	// YAML MappingNode stores content as alternating key/value pairs
+	for i := 0; i < len(yamlNode.Content); i += 2 {
+		if i+1 >= len(yamlNode.Content) {
+			break
 		}
-		configValue = trimmed
+
+		keyNode := yamlNode.Content[i]
+		valueNode := yamlNode.Content[i+1]
+
+		if keyNode.Value == "jq" {
+			// Validate the value is a string
+			if valueNode.Kind != yaml.ScalarNode {
+				return nil, fmt.Errorf("x-speakeasy-transform-from-json: 'jq' value must be a string")
+			}
+			jqValue = strings.TrimSpace(valueNode.Value)
+			found = true
+			break
+		}
 	}
 
-	if configValue == "" {
-		return nil, fmt.Errorf("x-speakeasy-transform-from-json requires a jq expression")
+	if !found {
+		return nil, fmt.Errorf("x-speakeasy-transform-from-json requires 'jq' key")
 	}
 
-	// Handle single-quoted expressions
-	if configValue[0] == '\'' {
-		if len(configValue) < 2 || configValue[len(configValue)-1] != '\'' {
-			return nil, fmt.Errorf("x-speakeasy-transform-from-json has unmatched single quotes")
-		}
-		configValue = configValue[1 : len(configValue)-1]
-		if configValue == "" {
-			return nil, fmt.Errorf("x-speakeasy-transform-from-json requires a jq expression")
-		}
+	if jqValue == "" {
+		return nil, fmt.Errorf("x-speakeasy-transform-from-json: 'jq' requires a jq expression")
 	}
 
 	// Validate the JQ expression can be parsed
-	q, err := gojq.Parse(configValue)
+	q, err := gojq.Parse(jqValue)
 	if err != nil {
-		return nil, fmt.Errorf("x-speakeasy-transform-from-json: '%s' is an invalid jq expression: %w", configValue, err)
+		return nil, fmt.Errorf("x-speakeasy-transform-from-json: '%s' is an invalid jq expression: %w", jqValue, err)
 	}
 
 	// Use the parsed query's string representation
