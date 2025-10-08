@@ -639,7 +639,7 @@ components:
       type: object
       description: Extract nested ID to top-level with minimal references.
       x-speakeasy-transform-from-json: 'jq . + {id: .data.result[0].id}'
-      x-speakeasy-transform-to-json: 'jq {data: (.data | .result[0].id = .id)}'
+      x-speakeasy-transform-to-json: 'jq {data}'
       properties:
         data:
           type: object
