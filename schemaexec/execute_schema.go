@@ -902,13 +902,25 @@ func (env *schemaEnv) execObjectMulti(state *execState, c *codeOp) ([]*execState
 	props := make(map[string]*oas3.Schema)
 	required := make([]string, 0, n)
 
+	if env.opts.EnableWarnings {
+		env.addWarning("opObject: constructing with %d pairs, stack size=%d", n, len(state.stack))
+	}
+
 	for i := 0; i < n; i++ {
 		if len(state.stack) < 2 {
-			return nil, fmt.Errorf("stack underflow on object construction")
+			return nil, fmt.Errorf("stack underflow on object construction (pair %d, need 2, have %d)", i, len(state.stack))
 		}
 
 		val := state.pop()
 		key := state.pop()
+
+		if env.opts.EnableWarnings {
+			keyStr := "<?>"
+			if getType(key) == "string" && key.Enum != nil && len(key.Enum) > 0 && key.Enum[0].Kind == yaml.ScalarNode {
+				keyStr = key.Enum[0].Value
+			}
+			env.addWarning("opObject: pair %d: key=%s, valType=%s", i, keyStr, getType(val))
+		}
 
 		if getType(key) == "string" && key.Enum != nil && len(key.Enum) > 0 {
 			keyNode := key.Enum[0]
@@ -917,6 +929,10 @@ func (env *schemaEnv) execObjectMulti(state *execState, c *codeOp) ([]*execState
 				required = append(required, keyNode.Value)
 			}
 		}
+	}
+
+	if env.opts.EnableWarnings {
+		env.addWarning("opObject: built object with %d properties", len(props))
 	}
 
 	obj := BuildObject(props, required)
@@ -1353,7 +1369,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 			}
 		}
 
-		// Fallback: if this array has empty items, check if ANY canonical array has it
+		// Fallback: if this array has empty items, check if it IS a canonical array
 		// (handles arrays created by Union that aren't tagged)
 		hasEmptyItems := (schema.Items == nil || schema.Items.Left == nil || getType(schema.Items.Left) == "")
 		if hasEmptyItems {
@@ -1366,15 +1382,8 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 					return canonical
 				}
 			}
-			// Not canonical - try to find one with populated items
-			for allocID, canonical := range accum {
-				if getType(canonical) == "array" && canonical.Items != nil && canonical.Items.Left != nil {
-					if env.opts.EnableWarnings {
-						env.addWarning("materialize: using canonical %s (items=%s) for empty array", allocID, getType(canonical.Items.Left))
-					}
-					return canonical
-				}
-			}
+			// Empty array with no tag and not in accumulator - leave as-is
+			// Don't guess which accumulator to use (that would be heuristic)
 		}
 	}
 

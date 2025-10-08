@@ -230,7 +230,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	}
 
 	if opts.EnableWarnings {
-		// Union creating anyOf
+		println(fmt.Sprintf("Union: creating anyOf with %d branches (deduped from %d inputs)", len(deduped), len(schemas)))
 	}
 
 	return &oas3.Schema{
