@@ -335,11 +335,11 @@ func TestIntegration_ArrayLiteral(t *testing.T) {
 		t.Errorf("Expected array type, got: %s", typ)
 	}
 
-	// Items should be numbers (homogeneous)
+	// Items should be integers (homogeneous whole numbers)
 	if result.Schema.Items != nil && result.Schema.Items.Left != nil {
 		itemType := getType(result.Schema.Items.Left)
-		if itemType != "number" {
-			t.Errorf("Expected number items, got: %s", itemType)
+		if itemType != "integer" {
+			t.Errorf("Expected integer items, got: %s", itemType)
 		}
 	}
 

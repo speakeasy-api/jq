@@ -626,3 +626,253 @@ components:
 		t.Error("Panel3 should not contain 'debug' property")
 	}
 }
+
+func TestSymbolicExecuteJQPipeline_MinimalExtraction(t *testing.T) {
+	oasYAML := `openapi: 3.1.0
+info:
+  title: MinimalExtraction
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    EntityResponse:
+      type: object
+      description: Extract nested ID to top-level with minimal references.
+      x-speakeasy-transform-from-json: 'jq . + {id: .data.result[0].id}'
+      x-speakeasy-transform-to-json: 'jq {data: (.data | .result[0].id = .id)}'
+      properties:
+        data:
+          type: object
+          properties:
+            result:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  name:
+                    type: string
+                  active:
+                    type: boolean
+            meta:
+              type: object
+              properties:
+                timestamp:
+                  type: string
+                  format: date-time
+                version:
+                  type: integer
+`
+
+	result, err := SymbolicExecuteJQPipeline(oasYAML)
+	if err != nil {
+		t.Fatalf("Pipeline failed: %v", err)
+	}
+
+	// Panel2 should have id at top-level plus original data
+	if !strings.Contains(result.Panel2, "id:") {
+		t.Error("Panel2 should contain extracted 'id' field")
+	}
+	if !strings.Contains(result.Panel2, "data:") {
+		t.Error("Panel2 should still contain 'data' object")
+	}
+
+	// Panel3 should have data with id nested back
+	if !strings.Contains(result.Panel3, "data:") {
+		t.Error("Panel3 should contain 'data' object")
+	}
+
+	t.Logf("Minimal extraction transformation successful")
+}
+
+func TestSymbolicExecuteJQPipeline_PaginationFlattening(t *testing.T) {
+	oasYAML := `openapi: 3.1.0
+info:
+  title: PaginationExample
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    PaginatedItemsResponse:
+      type: object
+      x-speakeasy-transform-from-json: >
+        jq {
+          items: (.data.items // []) | map({
+            id: .id,
+            title: .title,
+            status: (if (.active // false) then "active" else "inactive" end)
+          }),
+          hasMore: (.data.pagination.nextCursor != null),
+          total: (.data.pagination.total // 0),
+          nextCursor: (.data.pagination.nextCursor // null)
+        }
+      x-speakeasy-transform-to-json: >
+        jq {
+          data: {
+            items: (.items // []) | map({
+              id: .id,
+              title: .title,
+              active: (.status == "active")
+            }),
+            pagination: {
+              nextCursor: .nextCursor,
+              total: (.total // 0)
+            }
+          }
+        }
+      properties:
+        data:
+          type: object
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  title:
+                    type: string
+                  active:
+                    type: boolean
+            pagination:
+              type: object
+              properties:
+                nextCursor:
+                  type: string
+                  nullable: true
+                total:
+                  type: integer
+`
+
+	result, err := SymbolicExecuteJQPipeline(oasYAML)
+	if err != nil {
+		t.Fatalf("Pipeline failed: %v", err)
+	}
+
+	// Panel2 should have flattened pagination
+	if !strings.Contains(result.Panel2, "hasMore:") {
+		t.Error("Panel2 should contain 'hasMore' field")
+	}
+	if !strings.Contains(result.Panel2, "total:") {
+		t.Error("Panel2 should contain 'total' field")
+	}
+
+	t.Logf("Pagination flattening successful")
+}
+
+func TestSymbolicExecuteJQPipeline_ComputedFullName(t *testing.T) {
+	oasYAML := `openapi: 3.1.0
+info:
+  title: ComputedFields
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    UserPreferences:
+      type: object
+      x-speakeasy-transform-from-json: >
+        jq {
+          userId: .data.user.id,
+          email: .data.user.profile.contact.email,
+          fullName: (.data.user.profile.name.first + " " + .data.user.profile.name.last)
+        }
+      x-speakeasy-transform-to-json: >
+        jq {
+          data: {
+            user: {
+              id: .userId,
+              profile: {
+                name: {
+                  first: (.fullName | split(" ") | .[0]),
+                  last:  (.fullName | split(" ") | .[1:] | join(" "))
+                },
+                contact: { email: .email }
+              }
+            }
+          }
+        }
+      properties:
+        data:
+          type: object
+          properties:
+            user:
+              type: object
+              properties:
+                id:
+                  type: string
+                profile:
+                  type: object
+                  properties:
+                    name:
+                      type: object
+                      properties:
+                        first:
+                          type: string
+                        last:
+                          type: string
+                    contact:
+                      type: object
+                      properties:
+                        email:
+                          type: string
+`
+
+	result, err := SymbolicExecuteJQPipeline(oasYAML)
+	if err != nil {
+		t.Fatalf("Pipeline failed: %v", err)
+	}
+
+	// Panel2 should have computed fullName
+	if !strings.Contains(result.Panel2, "fullName:") {
+		t.Error("Panel2 should contain computed 'fullName' field")
+	}
+
+	t.Logf("Computed fullName transformation successful")
+}
+
+func TestSymbolicExecuteJQPipeline_TagEnrichment(t *testing.T) {
+	oasYAML := `openapi: 3.1.0
+info:
+  title: TagEnrichment
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    TagList:
+      type: object
+      x-speakeasy-transform-from-json: >
+        jq {
+          tags: (.tags // []) | map({
+            value: .,
+            slug: (. | ascii_downcase),
+            length: (. | length)
+          })
+        }
+      x-speakeasy-transform-to-json: >
+        jq {
+          tags: (.tags // []) | map(.value)
+        }
+      properties:
+        tags:
+          type: array
+          items:
+            type: string
+`
+
+	result, err := SymbolicExecuteJQPipeline(oasYAML)
+	if err != nil {
+		t.Fatalf("Pipeline failed: %v", err)
+	}
+
+	// Panel2 should have enriched tags with slug and length
+	if !strings.Contains(result.Panel2, "slug:") {
+		t.Error("Panel2 should contain 'slug' field in tag objects")
+	}
+	if !strings.Contains(result.Panel2, "length:") {
+		t.Error("Panel2 should contain 'length' field in tag objects")
+	}
+
+	t.Logf("Tag enrichment transformation successful")
+}

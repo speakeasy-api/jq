@@ -52,6 +52,20 @@ func ConstNumber(n float64) *oas3.Schema {
 	return schema
 }
 
+// ConstInteger creates a schema for a specific integer.
+func ConstInteger(n int64) *oas3.Schema {
+	node := &yaml.Node{
+		Kind:  yaml.ScalarNode,
+		Value: strconv.FormatInt(n, 10),
+		Tag:   "!!int",
+	}
+	schema := &oas3.Schema{
+		Type: oas3.NewTypeFromString(oas3.SchemaTypeInteger),
+		Enum: []*yaml.Node{node},
+	}
+	return schema
+}
+
 // ConstBool creates a schema for true or false.
 func ConstBool(b bool) *oas3.Schema {
 	val := "false"
@@ -84,6 +98,13 @@ func StringType() *oas3.Schema {
 func NumberType() *oas3.Schema {
 	return &oas3.Schema{
 		Type: oas3.NewTypeFromString(oas3.SchemaTypeNumber),
+	}
+}
+
+// IntegerType creates a basic integer schema (unconstrained).
+func IntegerType() *oas3.Schema {
+	return &oas3.Schema{
+		Type: oas3.NewTypeFromString(oas3.SchemaTypeInteger),
 	}
 }
 
@@ -420,6 +441,11 @@ func deduplicateSchemas(schemas []*oas3.Schema) []*oas3.Schema {
 		return []*oas3.Schema{mergeStringEnums(unique)}
 	}
 
+	// Step 2b: Special case - merge integer const/enum schemas
+	if canMergeIntegerEnums(unique) {
+		return []*oas3.Schema{mergeIntegerEnums(unique)}
+	}
+
 	// Step 3: Structural deduplication using fingerprinting
 	unique = deduplicateByFingerprint(unique)
 
@@ -562,6 +588,81 @@ func mergeStringEnums(schemas []*oas3.Schema) *oas3.Schema {
 	// Create a schema with all merged enum values
 	result := &oas3.Schema{
 		Type: oas3.NewTypeFromString(oas3.SchemaTypeString),
+		Enum: values,
+	}
+
+	// Preserve nullable if any branch was nullable
+	if nullable {
+		result.Nullable = &nullable
+	}
+
+	return result
+}
+
+// canMergeIntegerEnums checks if all schemas are integer enums that can be merged
+func canMergeIntegerEnums(schemas []*oas3.Schema) bool {
+	if len(schemas) == 0 {
+		return false
+	}
+
+	for _, s := range schemas {
+		if s == nil {
+			return false
+		}
+		// Must be integer type
+		if getType(s) != "integer" {
+			return false
+		}
+		// Must have at least one enum value
+		if s.Enum == nil || len(s.Enum) == 0 {
+			return false
+		}
+		// All enum values must be integers
+		for _, node := range s.Enum {
+			if node == nil || node.Kind != yaml.ScalarNode {
+				return false
+			}
+			// Integers should have Tag "!!int" or no tag with numeric value
+			if node.Tag != "" && node.Tag != "!!int" {
+				return false
+			}
+		}
+		// Must not have other validation constraints that would conflict
+		if s.Minimum != nil || s.Maximum != nil || s.MultipleOf != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeIntegerEnums merges multiple integer enum schemas into a single enum schema
+func mergeIntegerEnums(schemas []*oas3.Schema) *oas3.Schema {
+	// Collect all enum values, deduplicating by canonical form
+	seenValues := make(map[string]*yaml.Node)
+	var values []*yaml.Node
+	nullable := false
+
+	for _, s := range schemas {
+		// Track nullable across all branches
+		if s.Nullable != nil && *s.Nullable {
+			nullable = true
+		}
+
+		// Collect all enum values
+		if s.Enum != nil {
+			for _, node := range s.Enum {
+				canonical := canonicalizeYAMLNode(node)
+				if _, ok := seenValues[canonical]; !ok {
+					seenValues[canonical] = node
+					values = append(values, node)
+				}
+			}
+		}
+	}
+
+	// Create a schema with all merged enum values
+	result := &oas3.Schema{
+		Type: oas3.NewTypeFromString(oas3.SchemaTypeInteger),
 		Enum: values,
 	}
 
@@ -840,6 +941,7 @@ func HasProperty(obj *oas3.Schema, key string, opts SchemaExecOptions) *oas3.Sch
 
 // MergeObjects combines two object schemas (for the + operator on objects).
 func MergeObjects(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+
 	if a == nil {
 		return b
 	}
@@ -865,18 +967,30 @@ func MergeObjects(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		}
 	}
 
-	// Merge required lists
-	requiredMap := make(map[string]bool)
-	for _, r := range a.Required {
-		requiredMap[r] = true
-	}
-	for _, r := range b.Required {
-		requiredMap[r] = true
+	// Merge required lists, but only for properties that actually exist in the merged map
+	propNames := make(map[string]struct{})
+	for k := range propMap.All() {
+		propNames[k] = struct{}{}
 	}
 
-	required := make([]string, 0, len(requiredMap))
-	for k := range requiredMap {
-		required = append(required, k)
+	reqA := make(map[string]struct{}, len(a.Required))
+	for _, r := range a.Required {
+		reqA[r] = struct{}{}
+	}
+	reqB := make(map[string]struct{}, len(b.Required))
+	for _, r := range b.Required {
+		reqB[r] = struct{}{}
+	}
+
+	required := make([]string, 0, len(propNames))
+	for k := range propNames {
+		if _, ok := reqA[k]; ok {
+			required = append(required, k)
+			continue
+		}
+		if _, ok := reqB[k]; ok {
+			required = append(required, k)
+		}
 	}
 
 	return &oas3.Schema{

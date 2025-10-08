@@ -9,30 +9,193 @@ info:
   version: 1.0.0
 components:
   schemas:
-    UserInput:
+    EntityResponse:
       type: object
-      x-speakeasy-transform-from-json: >
-        jq {userId: .id, displayName: .name,
-            tier: (if .score >= 90 then "gold" else "silver" end),
-            location: {city: .address.city, zip: .address.postalCode}}
-      x-speakeasy-transform-to-json: >
-        jq {id: .userId, name: .displayName,
-            score: (if .tier == "gold" then 95 else 50 end),
-            address: {city: .location.city, postalCode: .location.zip}}
+      description: Extract nested ID to top-level with minimal references.
+      x-speakeasy-transform-from-json: 'jq . + {id: .data.result[0].id}'
+      x-speakeasy-transform-to-json: 'jq {data: (.data | .result[0].id = .id)}'
       properties:
-        id:
-          type: integer
-        name:
-          type: string
-        score:
-          type: integer
-        address:
+        data:
           type: object
           properties:
-            city:
-              type: string
-            postalCode:
-              type: string
+            result:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  name:
+                    type: string
+                  active:
+                    type: boolean
+            meta:
+              type: object
+              properties:
+                timestamp:
+                  type: string
+                  format: date-time
+                version:
+                  type: integer
+    PaginatedItemsResponse:
+      type: object
+      description: Flattened pagination with normalized item status.
+      x-speakeasy-transform-from-json: >
+        jq {
+          items: (.data.items // []) | map({
+            id: .id,
+            title: .title,
+            status: (if (.active // false) then "active" else "inactive" end)
+          }),
+          hasMore: (.data.pagination.nextCursor != null),
+          total: (.data.pagination.total // 0),
+          nextCursor: (.data.pagination.nextCursor // null)
+        }
+      x-speakeasy-transform-to-json: >
+        jq {
+          data: {
+            items: (.items // []) | map({
+              id: .id,
+              title: .title,
+              active: (.status == "active")
+            }),
+            pagination: {
+              nextCursor: .nextCursor,
+              total: (.total // 0)
+            }
+          }
+        }
+      properties:
+        data:
+          type: object
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  title:
+                    type: string
+                  active:
+                    type: boolean
+            pagination:
+              type: object
+              properties:
+                nextCursor:
+                  type: string
+                  nullable: true
+                total:
+                  type: integer
+    UserPreferences:
+      type: object
+      description: Flattened user profile with computed fullName.
+      x-speakeasy-transform-from-json: >
+        jq {
+          userId: .data.user.id,
+          email: .data.user.profile.contact.email,
+          fullName: (.data.user.profile.name.first + " " + .data.user.profile.name.last),
+          preferences: {
+            theme: .data.user.profile.preferences.settings.theme,
+            locale: .data.user.profile.preferences.locale,
+            notifyEmail: .data.user.profile.preferences.settings.notifications.email,
+            notifySms: .data.user.profile.preferences.settings.notifications.sms
+          }
+        }
+      x-speakeasy-transform-to-json: >
+        jq {
+          data: {
+            user: {
+              id: .userId,
+              profile: {
+                name: {
+                  first: (.fullName | split(" ") | .[0]),
+                  last:  (.fullName | split(" ") | .[1:] | join(" "))
+                },
+                contact: { email: .email },
+                preferences: {
+                  locale: .preferences.locale,
+                  settings: {
+                    theme: .preferences.theme,
+                    notifications: {
+                      email: .preferences.notifyEmail,
+                      sms: .preferences.notifySms
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      properties:
+        data:
+          type: object
+          properties:
+            user:
+              type: object
+              properties:
+                id:
+                  type: string
+                profile:
+                  type: object
+                  properties:
+                    name:
+                      type: object
+                      properties:
+                        first:
+                          type: string
+                        last:
+                          type: string
+                    contact:
+                      type: object
+                      properties:
+                        email:
+                          type: string
+                          format: email
+                    preferences:
+                      type: object
+                      properties:
+                        locale:
+                          type: string
+                        settings:
+                          type: object
+                          properties:
+                            theme:
+                              type: string
+                            notifications:
+                              type: object
+                              properties:
+                                email:
+                                  type: boolean
+                                sms:
+                                  type: boolean
+    TagList:
+      type: object
+      description: Enriched tag list with computed slug and length.
+      x-speakeasy-transform-from-json: >
+        jq {
+          tags: (.tags // []) | map({
+            value: .,
+            slug: (. | ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("(^-|-$)"; "")),
+            length: (. | length)
+          }),
+          primarySlug: (
+            (.tags[0] // null)
+            | if . == null then null
+              else (. | ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("(^-|-$)"; ""))
+              end
+          )
+        }
+      x-speakeasy-transform-to-json: >
+        jq {
+          tags: (.tags // []) | map(.value)
+        }
+      properties:
+        tags:
+          type: array
+          items:
+            type: string
 `;
 
 export function SymbolicTab() {

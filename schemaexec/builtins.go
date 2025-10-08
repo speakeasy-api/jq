@@ -688,10 +688,63 @@ func isTruthy(schema *oas3.Schema) *bool {
 
 // builtinPlus implements + for two values.
 func builtinPlus(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
+	if len(args) < 1 {
 		return []*oas3.Schema{NumberType()}, nil
 	}
-	return arithmeticOp(input, args[0], func(a, b float64) float64 { return a + b })
+
+	var lhs, rhs *oas3.Schema
+	if len(args) == 2 {
+		// Some jq plans encode + as arity-2; normalize against possible outer input object bleed-through.
+		lhs, rhs = pickBinaryOperands(input, args[0], args[1])
+	} else {
+		// Arity-1: jq uses lhs as input, rhs as arg[0]
+		lhs = input
+		rhs = args[0]
+	}
+
+	// Null identity
+	if isNullSchema(lhs) {
+		return []*oas3.Schema{rhs}, nil
+	}
+	if isNullSchema(rhs) {
+		return []*oas3.Schema{lhs}, nil
+	}
+
+	// Safety check
+	if lhs == nil || rhs == nil {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+
+	lType := getType(lhs)
+	rType := getType(rhs)
+
+	// Numbers
+	if (lType == "number" || lType == "integer") && (rType == "number" || rType == "integer") {
+		return []*oas3.Schema{addNumericSchemas(lhs, rhs)}, nil
+	}
+
+	// Arrays
+	if lType == "array" && rType == "array" {
+		return []*oas3.Schema{concatArraySchemas(lhs, rhs, env.opts)}, nil
+	}
+
+	// Strings
+	if lType == "string" && rType == "string" {
+		return []*oas3.Schema{concatStringSchemas(lhs, rhs)}, nil
+	}
+
+	// Objects
+	if lType == "object" && rType == "object" {
+		return []*oas3.Schema{MergeObjects(lhs, rhs, env.opts)}, nil
+	}
+
+	// Mixed/unknown or empty types: fallback to number (conservative for arithmetic)
+	if lType == "" || rType == "" {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+
+	// Mixed types: return Top
+	return []*oas3.Schema{Top()}, nil
 }
 
 // builtinMinus implements - for two values.
@@ -740,6 +793,59 @@ func builtinNegate(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*
 	return []*oas3.Schema{NumberType()}, nil
 }
 
+// pickBinaryOperands chooses (lhs, rhs) robustly across jq calling conventions.
+// Object-first: preserve explicit args order for object+object cases.
+func pickBinaryOperands(input, a0, a1 *oas3.Schema) (*oas3.Schema, *oas3.Schema) {
+	// Count how many are objects
+	numObjects := 0
+	if getType(input) == "object" {
+		numObjects++
+	}
+	if getType(a0) == "object" {
+		numObjects++
+	}
+	if getType(a1) == "object" {
+		numObjects++
+	}
+
+	// If we have 3 objects, the outer input is likely a1
+	// Prefer a0 (first operand) + input (second operand)
+	if numObjects == 3 {
+		return a0, input
+	}
+
+	// If a0 and input are both objects (common for object literals where a1 is null)
+	if getType(a0) == "object" && getType(input) == "object" {
+		return a0, input
+	}
+
+	// If both args are objects (and input is not), use args as-is
+	if getType(a0) == "object" && getType(a1) == "object" {
+		return a0, a1
+	}
+
+	cands := []*oas3.Schema{a0, a1, input}
+
+	// Prefer two non-object operands (avoid outer input object bleed-through)
+	nonObjIdx := make([]int, 0, 3)
+	for i, s := range cands {
+		if s == nil {
+			continue
+		}
+		if getType(s) != "object" {
+			nonObjIdx = append(nonObjIdx, i)
+		}
+	}
+	if len(nonObjIdx) >= 2 {
+		i := nonObjIdx[len(nonObjIdx)-2]
+		j := nonObjIdx[len(nonObjIdx)-1]
+		return cands[i], cands[j]
+	}
+
+	// Fallback: use args as-is
+	return a0, a1
+}
+
 // arithmeticOp performs arithmetic on two schemas.
 func arithmeticOp(lhs, rhs *oas3.Schema, op func(float64, float64) float64) ([]*oas3.Schema, error) {
 	lhsVal, lhsIsConst := extractConstValue(lhs)
@@ -754,4 +860,84 @@ func arithmeticOp(lhs, rhs *oas3.Schema, op func(float64, float64) float64) ([]*
 	}
 
 	return []*oas3.Schema{NumberType()}, nil
+}
+
+// isNullSchema returns true if schema is explicitly null type.
+func isNullSchema(s *oas3.Schema) bool {
+	return getType(s) == "null"
+}
+
+// addNumericSchemas handles integer/number addition with const folding and result type.
+func addNumericSchemas(lhs, rhs *oas3.Schema) *oas3.Schema {
+	// Const-fold when possible
+	if lv, lok := extractConstValue(lhs); lok {
+		if rv, rok := extractConstValue(rhs); rok {
+			if lf, okL := lv.(float64); okL {
+				if rf, okR := rv.(float64); okR {
+					// If both are integer-typed, preserve integer when sum is integral
+					if getType(lhs) == "integer" && getType(rhs) == "integer" {
+						sum := lf + rf
+						if sum == float64(int64(sum)) {
+							return ConstInteger(int64(sum))
+						}
+					}
+					return ConstNumber(lf + rf)
+				}
+			}
+		}
+	}
+
+	// Type-only result
+	if getType(lhs) == "integer" && getType(rhs) == "integer" {
+		return IntegerType()
+	}
+	return NumberType()
+}
+
+// concatArraySchemas concatenates arrays by unioning all possible element schemas.
+func concatArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	items := make([]*oas3.Schema, 0, 8)
+	collectArrayItemCandidates := func(arr *oas3.Schema) {
+		if arr == nil {
+			return
+		}
+		if arr.PrefixItems != nil {
+			for _, pi := range arr.PrefixItems {
+				if pi.Left != nil {
+					items = append(items, pi.Left)
+				}
+			}
+		}
+		if arr.Items != nil && arr.Items.Left != nil {
+			items = append(items, arr.Items.Left)
+		}
+	}
+	collectArrayItemCandidates(a)
+	collectArrayItemCandidates(b)
+
+	var mergedItems *oas3.Schema
+	if len(items) == 0 {
+		mergedItems = Top()
+	} else {
+		mergedItems = Union(items, opts)
+		if mergedItems == nil {
+			mergedItems = Top()
+		}
+	}
+	// Widen to homogeneous array of merged items (drop tuple info for safe concat)
+	return ArrayType(mergedItems)
+}
+
+// concatStringSchemas concatenates strings with const folding.
+func concatStringSchemas(a, b *oas3.Schema) *oas3.Schema {
+	if av, okA := extractConstValue(a); okA {
+		if bv, okB := extractConstValue(b); okB {
+			as, okAs := av.(string)
+			bs, okBs := bv.(string)
+			if okAs && okBs {
+				return ConstString(as + bs)
+			}
+		}
+	}
+	return StringType()
 }

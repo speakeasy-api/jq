@@ -3,6 +3,7 @@ package schemaexec
 import (
 	"context"
 	"fmt"
+	"math"
 
 	gojq "github.com/speakeasy-api/jq"
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
@@ -557,9 +558,13 @@ func (env *schemaEnv) execPush(c *codeOp) error {
 	case string:
 		schema = ConstString(val)
 	case float64:
-		schema = ConstNumber(val)
+		if val == math.Trunc(val) {
+			schema = ConstInteger(int64(val))
+		} else {
+			schema = ConstNumber(val)
+		}
 	case int:
-		schema = ConstNumber(float64(val))
+		schema = ConstInteger(int64(val))
 	case bool:
 		schema = ConstBool(val)
 	case nil:
@@ -603,9 +608,13 @@ func (env *schemaEnv) execConst(c *codeOp) error {
 	case string:
 		schema = ConstString(val)
 	case float64:
-		schema = ConstNumber(val)
+		if val == math.Trunc(val) {
+			schema = ConstInteger(int64(val))
+		} else {
+			schema = ConstNumber(val)
+		}
 	case int:
-		schema = ConstNumber(float64(val))
+		schema = ConstInteger(int64(val))
 	case bool:
 		schema = ConstBool(val)
 	case nil:
@@ -1149,9 +1158,12 @@ func (env *schemaEnv) valueToSchema(v any) *oas3.Schema {
 	case string:
 		return ConstString(val)
 	case float64:
+		if val == math.Trunc(val) {
+			return ConstInteger(int64(val))
+		}
 		return ConstNumber(val)
 	case int:
-		return ConstNumber(float64(val))
+		return ConstInteger(int64(val))
 	case bool:
 		return ConstBool(val)
 	case nil:
@@ -1318,9 +1330,12 @@ func valueToSchemaStatic(v any) *oas3.Schema {
 	case string:
 		return ConstString(val)
 	case float64:
+		if val == math.Trunc(val) {
+			return ConstInteger(int64(val))
+		}
 		return ConstNumber(val)
 	case int:
-		return ConstNumber(float64(val))
+		return ConstInteger(int64(val))
 	case bool:
 		return ConstBool(val)
 	case nil:
