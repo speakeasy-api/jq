@@ -19,8 +19,8 @@ type execState struct {
 	stack     []SValue                     // Schema stack (copy for this state)
 	scopes    []map[string]*oas3.Schema    // Scope frames (copy for this state)
 	depth     int                          // Recursion depth (for limiting)
-	accum         map[string]*oas3.Schema // Shared accumulator cells for array construction
-	accumKeys     map[string]string        // Shared: Maps variable key -> accumulator key
+	accum         map[string]*oas3.Schema // Shared: allocID → canonical array
+	schemaToAlloc map[*oas3.Schema]string // Shared: schema pointer → allocID (for opAppend)
 	allocCounter  *int                     // Shared: Monotonic counter for unique allocation IDs
 	callstack     []int                    // Per-state: Return address stack for closures
 }
@@ -52,10 +52,10 @@ func (s *execState) clone() *execState {
 		stack:      stackCopy,
 		scopes:     scopesCopy,
 		depth:      s.depth,
-		accum:        s.accum,        // SHARED
-		accumKeys:    s.accumKeys,    // SHARED
-		allocCounter: s.allocCounter, // SHARED pointer
-		callstack:    callstackCopy,
+		accum:         s.accum,         // SHARED
+		schemaToAlloc: s.schemaToAlloc, // SHARED
+		allocCounter:  s.allocCounter,  // SHARED pointer
+		callstack:     callstackCopy,
 	}
 }
 
@@ -256,10 +256,10 @@ func newExecState(input *oas3.Schema) *execState {
 		stack:        make([]SValue, 0, 16),
 		scopes:       make([]map[string]*oas3.Schema, 0, 4),
 		depth:        0,
-		accum:        make(map[string]*oas3.Schema), // Shared accumulator
-		accumKeys:    make(map[string]string),        // Shared lookup
-		allocCounter: &counter,                       // Shared counter (pointer)
-		callstack:    make([]int, 0, 8),
+		accum:         make(map[string]*oas3.Schema), // Shared accumulator
+		schemaToAlloc: make(map[*oas3.Schema]string), // Schema → allocID mapping
+		allocCounter:  &counter,                       // Shared counter (pointer)
+		callstack:     make([]int, 0, 8),
 	}
 	state.pushFrame() // Initial global frame
 	state.push(input) // Push input onto stack

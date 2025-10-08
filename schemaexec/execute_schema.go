@@ -6,6 +6,7 @@ import (
 
 	gojq "github.com/speakeasy-api/jq"
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
+	"github.com/speakeasy-api/openapi/sequencedmap"
 	"gopkg.in/yaml.v3"
 )
 
@@ -220,9 +221,13 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		}
 	}
 
-	// No fixup needed! With per-state accumulators and PC-based keys,
-	// each array construction site has its own accumulator.
-	// The Union operation (lattice join) handles merging when needed.
+	// Materialize arrays from accumulators
+	// Replace any array schemas with their final accumulated versions
+	if sharedAccum != nil {
+		for i, out := range outputs {
+			outputs[i] = env.materializeArrays(out, sharedAccum)
+		}
+	}
 
 	// Union all outputs
 	var result *oas3.Schema
@@ -282,8 +287,8 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			val := next.pop()
 			key := fmt.Sprintf("%v", c.value)
 			next.storeVar(key, val)
-			// If storing an array, assign unique ID via monotonic counter
-			// Final solution: no static context is unique enough (JQ reuses code)
+			// If storing an array, assign unique allocID and tag the schema
+			// KLEE-style: arrays carry their identity via schema pointer → allocID mapping
 			if getType(val) == "array" {
 				*next.allocCounter++
 				allocID := *next.allocCounter
@@ -292,25 +297,15 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 				if _, exists := next.accum[accumKey]; !exists {
 					next.accum[accumKey] = val
 				}
-				// Register mapping ONLY if not already set (first allocation wins)
-				// This prevents later opStores from overwriting earlier allocations
-				if _, exists := next.accumKeys[key]; !exists {
-					next.accumKeys[key] = accumKey
-				}
+				// Tag this schema with its allocID
+				next.schemaToAlloc[val] = accumKey
 			}
 		}
 		return []*execState{next}, nil
 
 	case opLoad:
 		key := fmt.Sprintf("%v", c.value)
-		// Check accumulator first (using context-sensitive lookup)
-		if accumKey, ok := next.accumKeys[key]; ok {
-			if acc, ok2 := next.accum[accumKey]; ok2 {
-				next.push(acc)
-				return []*execState{next}, nil
-			}
-		}
-		// Fall back to normal variable frames
+		// Load from normal variable frames (arrays are tagged with allocID)
 		if val, ok := next.loadVar(key); ok {
 			next.push(val)
 		} else {
@@ -937,32 +932,44 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 
 	val := state.pop()
 
-	// Get the variable key
+	// opAppend operates on an array that's on the stack (from opLoad/opStore)
+	// We need to find which accumulator this array belongs to
+	// The array schema was tagged with its allocID when created in opStore
+
+	// The variable key tells us which variable to look up
 	key := ""
 	if c.value != nil {
 		key = fmt.Sprintf("%v", c.value)
 	}
 
-	// Look up the CANONICAL array via PC-based key
-	var accumKey string
+	// Get the array from the variable
+	var targetArray *oas3.Schema
 	if key != "" {
-		if ak, ok := state.accumKeys[key]; ok {
+		if arr, ok := state.loadVar(key); ok {
+			targetArray = arr
+		}
+	}
+
+	// Look up the allocID for this array via schema pointer
+	var accumKey string
+	if targetArray != nil {
+		if ak, ok := state.schemaToAlloc[targetArray]; ok {
 			accumKey = ak
 		}
 	}
 
-	// Get or create the canonical array object for this allocation site
+	// Get or create the canonical array in the accumulator
 	var canonicalArr *oas3.Schema
 	if accumKey != "" {
 		if existing, ok := state.accum[accumKey]; ok {
 			canonicalArr = existing
 		} else {
-			// Initialize canonical array for this PC
+			// Shouldn't happen if opStore ran, but handle gracefully
 			canonicalArr = ArrayType(Bottom())
 			state.accum[accumKey] = canonicalArr
 		}
 	} else {
-		// No accumulator - create standalone
+		// No allocID found - create standalone
 		canonicalArr = ArrayType(Bottom())
 	}
 
@@ -1318,4 +1325,50 @@ func newClosureSchema(pc int) *oas3.Schema {
 func getClosurePC(s *oas3.Schema) (int, bool) {
 	pc, ok := closureRegistry[s]
 	return pc, ok
+}
+
+// materializeArrays recursively walks a schema and replaces arrays with
+// their final accumulated versions by checking if accumulator has a populated version
+func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*oas3.Schema) *oas3.Schema {
+	if schema == nil {
+		return nil
+	}
+
+	// If this is an array with empty items, try to find the accumulated version
+	if getType(schema) == "array" {
+		hasEmptyItems := (schema.Items == nil || schema.Items.Left == nil || getType(schema.Items.Left) == "")
+		if hasEmptyItems {
+			// Check all accumulators for one with matching pointer
+			for _, accArr := range accum {
+				if accArr == schema && getType(accArr) == "array" {
+					// This is the canonical version with accumulated items
+					return accArr
+				}
+			}
+		}
+	}
+
+	// Recursively materialize object properties
+	if getType(schema) == "object" && schema.Properties != nil {
+		modified := false
+		newProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+		for k, propSchema := range schema.Properties.All() {
+			if propSchema.Left != nil {
+				materialized := env.materializeArrays(propSchema.Left, accum)
+				if materialized != propSchema.Left {
+					modified = true
+				}
+				newProps.Set(k, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](materialized))
+			} else {
+				newProps.Set(k, propSchema)
+			}
+		}
+		if modified {
+			result := *schema
+			result.Properties = newProps
+			return &result
+		}
+	}
+
+	return schema
 }
