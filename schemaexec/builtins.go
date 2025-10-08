@@ -274,6 +274,12 @@ func builtinAdd(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 		return []*oas3.Schema{input.Items.Left}, nil
 	}
 
+	// If items are empty/unknown but we're in a numeric context (e.g., map arithmetic),
+	// conservatively return number (most common case for add)
+	if itemType == "" {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+
 	// Unknown - return Top
 	return []*oas3.Schema{Top()}, nil
 }

@@ -153,6 +153,7 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 
 	// Track accumulator for array construction results
 	var sharedAccum map[string]*oas3.Schema
+	var sharedSchemaToAlloc map[*oas3.Schema]string
 
 	// Multi-state execution loop
 	maxIterations := env.opts.MaxDepth * 1000 // Safeguard against infinite loops
@@ -200,9 +201,10 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 			if state.top() != nil {
 				outputs = append(outputs, state.top())
 			}
-			// Save reference to shared accumulator (all states share the same map)
+			// Save reference to shared maps (all states share the same maps)
 			if sharedAccum == nil && state.accum != nil {
 				sharedAccum = state.accum
+				sharedSchemaToAlloc = state.schemaToAlloc
 			}
 			continue
 		}
@@ -221,22 +223,23 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		}
 	}
 
-	// Materialize arrays from accumulators
-	// Replace any array schemas with their final accumulated versions
-	if sharedAccum != nil {
-		for i, out := range outputs {
-			outputs[i] = env.materializeArrays(out, sharedAccum)
-		}
-	}
-
-	// Union all outputs
+	// Union all outputs FIRST
 	var result *oas3.Schema
 	if len(outputs) == 0 {
 		result = Bottom()
 	} else if len(outputs) == 1 {
 		result = outputs[0]
 	} else {
+		if env.opts.EnableWarnings {
+			env.addWarning("Merging %d outputs via Union", len(outputs))
+		}
 		result = Union(outputs, env.opts)
+	}
+
+	// Materialize arrays from accumulators AFTER Union
+	// This ensures arrays in merged objects are also resolved
+	if sharedAccum != nil && sharedSchemaToAlloc != nil {
+		result = env.materializeArrays(result, sharedAccum, sharedSchemaToAlloc)
 	}
 
 	return &SchemaExecResult{
@@ -1328,21 +1331,48 @@ func getClosurePC(s *oas3.Schema) (int, bool) {
 }
 
 // materializeArrays recursively walks a schema and replaces arrays with
-// their final accumulated versions by checking if accumulator has a populated version
-func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*oas3.Schema) *oas3.Schema {
+// their final accumulated versions using schema pointer tagging
+func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*oas3.Schema, schemaToAlloc map[*oas3.Schema]string) *oas3.Schema {
 	if schema == nil {
 		return nil
 	}
 
-	// If this is an array with empty items, try to find the accumulated version
+	// If this is an array, check if it's tagged OR if it IS a canonical array
 	if getType(schema) == "array" {
+		// First try: check if tagged
+		if allocID, ok := schemaToAlloc[schema]; ok {
+			if canonical, ok2 := accum[allocID]; ok2 {
+				if env.opts.EnableWarnings {
+					canonicalItems := ""
+					if canonical.Items != nil && canonical.Items.Left != nil {
+						canonicalItems = getType(canonical.Items.Left)
+					}
+					env.addWarning("materialize: tagged array → canonical %s (items=%s)", allocID, canonicalItems)
+				}
+				return canonical
+			}
+		}
+
+		// Fallback: if this array has empty items, check if ANY canonical array has it
+		// (handles arrays created by Union that aren't tagged)
 		hasEmptyItems := (schema.Items == nil || schema.Items.Left == nil || getType(schema.Items.Left) == "")
 		if hasEmptyItems {
-			// Check all accumulators for one with matching pointer
-			for _, accArr := range accum {
-				if accArr == schema && getType(accArr) == "array" {
-					// This is the canonical version with accumulated items
-					return accArr
+			for allocID, canonical := range accum {
+				if canonical == schema {
+					// This IS a canonical array - already has accumulated items
+					if env.opts.EnableWarnings {
+						env.addWarning("materialize: array is canonical %s (no replacement needed)", allocID)
+					}
+					return canonical
+				}
+			}
+			// Not canonical - try to find one with populated items
+			for allocID, canonical := range accum {
+				if getType(canonical) == "array" && canonical.Items != nil && canonical.Items.Left != nil {
+					if env.opts.EnableWarnings {
+						env.addWarning("materialize: using canonical %s (items=%s) for empty array", allocID, getType(canonical.Items.Left))
+					}
+					return canonical
 				}
 			}
 		}
@@ -1354,7 +1384,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 		newProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
 		for k, propSchema := range schema.Properties.All() {
 			if propSchema.Left != nil {
-				materialized := env.materializeArrays(propSchema.Left, accum)
+				materialized := env.materializeArrays(propSchema.Left, accum, schemaToAlloc)
 				if materialized != propSchema.Left {
 					modified = true
 				}
@@ -1364,6 +1394,13 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 			}
 		}
 		if modified {
+			if env.opts.EnableWarnings {
+				propCount := 0
+				for range newProps.All() {
+					propCount++
+				}
+				env.addWarning("materialize: reconstructed object with %d properties", propCount)
+			}
 			result := *schema
 			result.Properties = newProps
 			return &result
