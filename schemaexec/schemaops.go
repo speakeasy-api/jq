@@ -223,14 +223,28 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		return widenUnion(deduped, opts)
 	}
 
-	// Create anyOf
-	anyOf := make([]*oas3.JSONSchema[oas3.Referenceable], len(deduped))
-	for i, s := range deduped {
-		anyOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](s)
+	// Filter out empty/corrupt schemas before creating anyOf
+	validSchemas := make([]*oas3.Schema, 0, len(deduped))
+	for _, s := range deduped {
+		// Skip schemas with no type (corrupt/empty)
+		if getType(s) != "" {
+			validSchemas = append(validSchemas, s)
+		}
 	}
 
-	if opts.EnableWarnings {
-		// Union creating anyOf
+	// If only one valid schema remains, return it directly
+	if len(validSchemas) == 1 {
+		return validSchemas[0]
+	}
+
+	if len(validSchemas) == 0 {
+		return Top() // All were corrupt
+	}
+
+	// Create anyOf
+	anyOf := make([]*oas3.JSONSchema[oas3.Referenceable], len(validSchemas))
+	for i, s := range validSchemas {
+		anyOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](s)
 	}
 
 	return &oas3.Schema{
