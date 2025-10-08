@@ -41,18 +41,24 @@ build_wasm() {
     (cd "$SCRIPT_DIR" && go mod tidy) > /dev/null 2>&1
     printf "Done\n"
 
+    # Create temporary directory for intermediate build artifacts
+    TEMP_DIR=$(mktemp -d)
+    trap "rm -rf '$TEMP_DIR'" EXIT
+
     printf "Building WASM binary..."
-	  GOOS=js GOARCH=wasm go build -o ./web/src/assets/wasm/lib.wasm cmd/wasm/functions.go
-    SIZE="$(get_file_size "./web/src/assets/wasm/lib.wasm")"
+	  GOOS=js GOARCH=wasm go build -o "$TEMP_DIR/lib.wasm" cmd/wasm/functions.go
+    SIZE="$(get_file_size "$TEMP_DIR/lib.wasm")"
     printf " Done (%s)\n" "$SIZE"
 
     printf "Compressing WASM with brotli..."
-    brotli -f -q 11 -o ./web/src/assets/wasm/engine.latest.wasm.br ./web/src/assets/wasm/lib.wasm
+    brotli -f -q 11 -o ./web/src/assets/wasm/engine.latest.wasm.br "$TEMP_DIR/lib.wasm"
     COMPRESSED_SIZE="$(get_file_size "./web/src/assets/wasm/engine.latest.wasm.br")"
     printf " Done (%s)\n" "$COMPRESSED_SIZE"
 
     cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" "./web/src/assets/wasm/wasm_exec.js"
 
+    # Clean up temporary directory
+    rm -rf "$TEMP_DIR"
 }
 
 # Initial build
