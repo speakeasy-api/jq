@@ -202,30 +202,33 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	// Deduplicate
 	deduped := deduplicateSchemas(flattened)
 
-	// If only one unique schema after dedup, return it directly
-	if len(deduped) == 1 {
-		return deduped[0]
+	// Remove subsumed schemas (e.g., {type: number, enum: [0]} ⊆ {type: number})
+	collapsed := removeSubsumedSchemas(deduped)
+
+	// If only one unique schema after dedup and collapse, return it directly
+	if len(collapsed) == 1 {
+		return collapsed[0]
 	}
 
 	// Try to merge compatible arrays into a single array
-	if merged := tryMergeArrays(deduped, opts); merged != nil {
+	if merged := tryMergeArrays(collapsed, opts); merged != nil {
 		return merged
 	}
 
 	// Try to merge compatible objects into a single object
-	if merged := tryMergeObjects(deduped, opts); merged != nil {
+	if merged := tryMergeObjects(collapsed, opts); merged != nil {
 		// Successfully merged - return directly without anyOf wrapper
 		return merged
 	}
 
 	// Check if we exceed the anyOf limit
-	if len(deduped) > opts.AnyOfLimit {
-		return widenUnion(deduped, opts)
+	if len(collapsed) > opts.AnyOfLimit {
+		return widenUnion(collapsed, opts)
 	}
 
 	// Filter out empty/corrupt schemas before creating anyOf
-	validSchemas := make([]*oas3.Schema, 0, len(deduped))
-	for _, s := range deduped {
+	validSchemas := make([]*oas3.Schema, 0, len(collapsed))
+	for _, s := range collapsed {
 		// Skip schemas with no type (corrupt/empty)
 		if getType(s) != "" {
 			validSchemas = append(validSchemas, s)
@@ -283,12 +286,17 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 	}
 
 	if len(itemSchemas) == 0 {
-		// All arrays have empty items
-		return ArrayType(Top())
+		// All arrays have empty items - return array with no item constraint
+		return ArrayType(nil)
 	}
 
 	// Union the item schemas
 	mergedItems := Union(itemSchemas, opts)
+
+	// If Union returned Bottom/nil, use Top instead
+	if mergedItems == nil {
+		mergedItems = Top()
+	}
 
 	return ArrayType(mergedItems)
 }
@@ -412,8 +420,82 @@ func deduplicateSchemas(schemas []*oas3.Schema) []*oas3.Schema {
 		return []*oas3.Schema{mergeStringEnums(unique)}
 	}
 
-	// Otherwise, keep all unique schemas (no structural dedup to avoid ordering issues)
+	// Step 3: Structural deduplication using fingerprinting
+	unique = deduplicateByFingerprint(unique)
+
 	return unique
+}
+
+// deduplicateByFingerprint removes structurally identical schemas using canonical fingerprinting
+func deduplicateByFingerprint(schemas []*oas3.Schema) []*oas3.Schema {
+	if len(schemas) <= 1 {
+		return schemas
+	}
+
+	seen := make(map[string]*oas3.Schema)
+	result := make([]*oas3.Schema, 0, len(schemas))
+
+	for _, s := range schemas {
+		fp := schemaFingerprint(s)
+		if _, exists := seen[fp]; !exists {
+			seen[fp] = s
+			result = append(result, s)
+		}
+	}
+
+	return result
+}
+
+// removeSubsumedSchemas removes schemas that are subsumed by (subsets of) other schemas
+// Iterates to fixpoint to handle transitive subsumption
+func removeSubsumedSchemas(schemas []*oas3.Schema) []*oas3.Schema {
+	if len(schemas) <= 1 {
+		return schemas
+	}
+
+	changed := true
+	for changed {
+		changed = false
+		n := len(schemas)
+		removed := make([]bool, n)
+
+		for i := 0; i < n; i++ {
+			if removed[i] {
+				continue
+			}
+			for j := i + 1; j < n; j++ {
+				if removed[j] {
+					continue
+				}
+				a, b := schemas[i], schemas[j]
+
+				// Check if a ⊆ b (a is subsumed by b)
+				if isSubschemaOf(a, b) {
+					removed[i] = true
+					changed = true
+					break
+				}
+
+				// Check if b ⊆ a (b is subsumed by a)
+				if isSubschemaOf(b, a) {
+					removed[j] = true
+					changed = true
+				}
+			}
+		}
+
+		if changed {
+			tmp := make([]*oas3.Schema, 0, n)
+			for i := range schemas {
+				if !removed[i] {
+					tmp = append(tmp, schemas[i])
+				}
+			}
+			schemas = tmp
+		}
+	}
+
+	return schemas
 }
 
 // canMergeStringEnums checks if all schemas are string enums that can be merged
@@ -828,4 +910,430 @@ func BuildArray(items *oas3.Schema, elements []*oas3.Schema) *oas3.Schema {
 
 	// Otherwise, just use items schema
 	return ArrayType(items)
+}
+
+// ============================================================================
+// SCHEMA SUBSUMPTION & FINGERPRINTING
+// ============================================================================
+
+// schemaFingerprint creates a canonical hash of validation-relevant schema fields
+// Used for structural deduplication - ignores annotations like title, description
+func schemaFingerprint(s *oas3.Schema) string {
+	if s == nil {
+		return "null"
+	}
+
+	// Build canonical string representation
+	var parts []string
+
+	// Type
+	types := s.GetType()
+	if len(types) > 0 {
+		typeStrs := make([]string, len(types))
+		for i, t := range types {
+			typeStrs[i] = string(t)
+		}
+		parts = append(parts, "type:"+canonicalizeStringSlice(typeStrs))
+	}
+
+	// Enum
+	if s.Enum != nil && len(s.Enum) > 0 {
+		parts = append(parts, "enum:"+canonicalizeYAMLNodes(s.Enum))
+	}
+
+	// Const (represented via Enum in OAS3)
+	// Already handled above
+
+	// Number constraints
+	if s.Minimum != nil {
+		parts = append(parts, "min:"+strconv.FormatFloat(*s.Minimum, 'g', -1, 64))
+	}
+	if s.Maximum != nil {
+		parts = append(parts, "max:"+strconv.FormatFloat(*s.Maximum, 'g', -1, 64))
+	}
+	// Note: ExclusiveMinimum/Maximum are complex EitherValue types
+	// For simplicity in fingerprinting, we skip them as they're rarely used
+	if s.MultipleOf != nil {
+		parts = append(parts, "mult:"+strconv.FormatFloat(*s.MultipleOf, 'g', -1, 64))
+	}
+
+	// String constraints
+	if s.MinLength != nil {
+		parts = append(parts, "minLen:"+strconv.FormatInt(int64(*s.MinLength), 10))
+	}
+	if s.MaxLength != nil {
+		parts = append(parts, "maxLen:"+strconv.FormatInt(int64(*s.MaxLength), 10))
+	}
+	if s.Pattern != nil {
+		parts = append(parts, "pattern:"+*s.Pattern)
+	}
+
+	// Array constraints
+	if s.Items != nil && s.Items.Left != nil {
+		parts = append(parts, "items:"+schemaFingerprint(s.Items.Left))
+	}
+	if s.MinItems != nil {
+		parts = append(parts, "minItems:"+strconv.FormatInt(int64(*s.MinItems), 10))
+	}
+	if s.MaxItems != nil {
+		parts = append(parts, "maxItems:"+strconv.FormatInt(int64(*s.MaxItems), 10))
+	}
+	if s.UniqueItems != nil && *s.UniqueItems {
+		parts = append(parts, "unique:true")
+	}
+
+	// Object constraints
+	if s.Properties != nil {
+		var propParts []string
+		for k, v := range s.Properties.All() {
+			if v.Left != nil {
+				propParts = append(propParts, k+":"+schemaFingerprint(v.Left))
+			}
+		}
+		if len(propParts) > 0 {
+			parts = append(parts, "props:{"+canonicalizeStringSlice(propParts)+"}")
+		}
+	}
+	if len(s.Required) > 0 {
+		parts = append(parts, "req:"+canonicalizeStringSlice(s.Required))
+	}
+	if s.AdditionalProperties != nil {
+		if s.AdditionalProperties.Left != nil {
+			parts = append(parts, "addProps:"+schemaFingerprint(s.AdditionalProperties.Left))
+		} else if s.AdditionalProperties.Right != nil {
+			parts = append(parts, "addProps:"+strconv.FormatBool(*s.AdditionalProperties.Right))
+		}
+	}
+
+	// AnyOf (for nested unions)
+	if s.AnyOf != nil && len(s.AnyOf) > 0 {
+		var anyOfParts []string
+		for _, branch := range s.AnyOf {
+			if branch.Left != nil {
+				anyOfParts = append(anyOfParts, schemaFingerprint(branch.Left))
+			}
+		}
+		parts = append(parts, "anyOf:["+canonicalizeStringSlice(anyOfParts)+"]")
+	}
+
+	return "{" + canonicalizeStringSlice(parts) + "}"
+}
+
+// isSubschemaOf checks if schema A is a subschema of (subsumed by) schema B
+// Returns true if every instance that validates against A also validates against B
+func isSubschemaOf(a, b *oas3.Schema) bool {
+	if a == nil || b == nil {
+		return false
+	}
+
+	// Handle enum/const cases first (most common in our use case)
+	aHasEnum := a.Enum != nil && len(a.Enum) > 0
+	bHasEnum := b.Enum != nil && len(b.Enum) > 0
+
+	if aHasEnum {
+		if bHasEnum {
+			// Both have enums: A ⊆ B if all of A's values are in B
+			return enumSubset(a.Enum, b.Enum)
+		}
+		// A has enum, B doesn't: check if all A's enum values satisfy B's constraints
+		// For now, simplified: if B is just a type without constraints, A ⊆ B
+		bType := getType(b)
+		if bType != "" && b.Minimum == nil && b.Maximum == nil && b.Pattern == nil {
+			// B is unconstrained type, A's enum values must match that type
+			return enumMatchesType(a.Enum, bType)
+		}
+		return false
+	}
+
+	// A has no enum but B has enum: A cannot be subset of B (A is less constrained)
+	if bHasEnum {
+		return false
+	}
+
+	// Check type compatibility
+	aType := getType(a)
+	bType := getType(b)
+
+	if aType != "" && bType != "" {
+		// integer ⊆ number
+		if aType == "integer" && bType == "number" {
+			// Check numeric constraints
+			return numericConstraintsSubsumed(a, b)
+		}
+
+		// Types must match (or B has no type = any)
+		if aType != bType {
+			return false
+		}
+
+		// Same type: check type-specific constraints
+		switch oas3.SchemaType(aType) {
+		case oas3.SchemaTypeNumber, oas3.SchemaTypeInteger:
+			return numericConstraintsSubsumed(a, b)
+		case oas3.SchemaTypeString:
+			return stringConstraintsSubsumed(a, b)
+		case oas3.SchemaTypeArray:
+			return arrayConstraintsSubsumed(a, b)
+		case oas3.SchemaTypeObject:
+			return objectConstraintsSubsumed(a, b)
+		}
+	} else if aType != "" && bType == "" {
+		// B has no type constraint = accepts anything
+		return true
+	} else if aType == "" && bType != "" {
+		// A has no type but B requires specific type
+		return false
+	}
+
+	// Both have no explicit type - compare constraints generically
+	return true
+}
+
+// numericConstraintsSubsumed checks if A's numeric constraints are stricter than or equal to B's
+func numericConstraintsSubsumed(a, b *oas3.Schema) bool {
+	// Check minimum
+	if b.Minimum != nil {
+		if a.Minimum == nil {
+			return false
+		}
+		if *a.Minimum < *b.Minimum {
+			return false
+		}
+		// Exclusive flags: skip for simplicity (rarely used)
+	}
+
+	// Check maximum
+	if b.Maximum != nil {
+		if a.Maximum == nil {
+			return false
+		}
+		if *a.Maximum > *b.Maximum {
+			return false
+		}
+		// Exclusive flags: skip for simplicity (rarely used)
+	}
+
+	// Check multipleOf (simplified: only if both present and A is multiple of B)
+	if b.MultipleOf != nil {
+		if a.MultipleOf == nil {
+			return false
+		}
+		// A's multipleOf must be a multiple of B's multipleOf
+		// For safety with floats, only check if A == B
+		if *a.MultipleOf != *b.MultipleOf {
+			return false
+		}
+	}
+
+	return true
+}
+
+// stringConstraintsSubsumed checks if A's string constraints are stricter than or equal to B's
+func stringConstraintsSubsumed(a, b *oas3.Schema) bool {
+	// Check minLength: A.min >= B.min
+	if b.MinLength != nil {
+		if a.MinLength == nil || *a.MinLength < *b.MinLength {
+			return false
+		}
+	}
+
+	// Check maxLength: A.max <= B.max
+	if b.MaxLength != nil {
+		if a.MaxLength == nil || *a.MaxLength > *b.MaxLength {
+			return false
+		}
+	}
+
+	// Check pattern: only claim subsumption if patterns are equal
+	if b.Pattern != nil {
+		if a.Pattern == nil || *a.Pattern != *b.Pattern {
+			return false
+		}
+	}
+
+	return true
+}
+
+// arrayConstraintsSubsumed checks if A's array constraints are stricter than or equal to B's
+func arrayConstraintsSubsumed(a, b *oas3.Schema) bool {
+	// Check minItems: A.min >= B.min
+	if b.MinItems != nil {
+		if a.MinItems == nil || *a.MinItems < *b.MinItems {
+			return false
+		}
+	}
+
+	// Check maxItems: A.max <= B.max
+	if b.MaxItems != nil {
+		if a.MaxItems == nil || *a.MaxItems > *b.MaxItems {
+			return false
+		}
+	}
+
+	// Check items: A.items must be subschema of B.items
+	if a.Items != nil && a.Items.Left != nil {
+		if b.Items == nil || b.Items.Left == nil {
+			// B has no item constraint, so A ⊆ B is true for items
+			return true
+		}
+		// Recursively check items
+		if !isSubschemaOf(a.Items.Left, b.Items.Left) {
+			return false
+		}
+	}
+
+	// Check uniqueItems
+	if b.UniqueItems != nil && *b.UniqueItems {
+		// B requires unique items
+		if a.UniqueItems == nil || !*a.UniqueItems {
+			return false
+		}
+	}
+
+	return true
+}
+
+// objectConstraintsSubsumed checks if A's object constraints are stricter than or equal to B's
+func objectConstraintsSubsumed(a, b *oas3.Schema) bool {
+	// Check required: B.required ⊆ A.required (B cannot require more than A)
+	for _, req := range b.Required {
+		found := false
+		for _, aReq := range a.Required {
+			if aReq == req {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	// Check properties: for each property in A, if also in B, A[prop] ⊆ B[prop]
+	if a.Properties != nil {
+		for propName, aProp := range a.Properties.All() {
+			if aProp.Left != nil {
+				if b.Properties != nil {
+					if bProp, ok := b.Properties.Get(propName); ok && bProp.Left != nil {
+						// Both have this property: check subsumption
+						if !isSubschemaOf(aProp.Left, bProp.Left) {
+							return false
+						}
+					}
+				}
+				// If B doesn't have this property, check additionalProperties
+				// For simplicity, assume B allows it if not explicitly forbidden
+			}
+		}
+	}
+
+	// AdditionalProperties: simplified check
+	// If A forbids additional but B allows, A ⊆ B is true
+	// If A allows but B forbids, A ⊆ B is false
+	if a.AdditionalProperties != nil && a.AdditionalProperties.Right != nil {
+		aAllows := *a.AdditionalProperties.Right
+		if b.AdditionalProperties != nil && b.AdditionalProperties.Right != nil {
+			bAllows := *b.AdditionalProperties.Right
+			if aAllows && !bAllows {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+// enumSubset checks if all values in enumA are present in enumB
+func enumSubset(enumA, enumB []*yaml.Node) bool {
+	if len(enumA) == 0 {
+		return true
+	}
+	if len(enumB) == 0 {
+		return false
+	}
+
+	// Build set of B's values
+	bValues := make(map[string]struct{})
+	for _, node := range enumB {
+		bValues[canonicalizeYAMLNode(node)] = struct{}{}
+	}
+
+	// Check all A's values are in B
+	for _, node := range enumA {
+		if _, ok := bValues[canonicalizeYAMLNode(node)]; !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
+// enumMatchesType checks if all enum values match the given type
+func enumMatchesType(enum []*yaml.Node, typ string) bool {
+	for _, node := range enum {
+		if !nodeMatchesType(node, typ) {
+			return false
+		}
+	}
+	return true
+}
+
+// nodeMatchesType checks if a YAML node value matches the given JSON Schema type
+func nodeMatchesType(node *yaml.Node, typ string) bool {
+	if node == nil {
+		return typ == "null"
+	}
+
+	switch typ {
+	case "string":
+		return node.Tag == "!!str" || node.Tag == ""
+	case "number", "integer":
+		return node.Tag == "!!int" || node.Tag == "!!float"
+	case "boolean":
+		return node.Tag == "!!bool"
+	case "null":
+		return node.Tag == "!!null" || node.Value == "null"
+	default:
+		return false
+	}
+}
+
+// canonicalizeStringSlice sorts and deduplicates a string slice for canonical comparison
+func canonicalizeStringSlice(strs []string) string {
+	if len(strs) == 0 {
+		return ""
+	}
+	// Make a copy and sort
+	sorted := make([]string, len(strs))
+	copy(sorted, strs)
+	// Simple insertion sort for small slices
+	for i := 1; i < len(sorted); i++ {
+		key := sorted[i]
+		j := i - 1
+		for j >= 0 && sorted[j] > key {
+			sorted[j+1] = sorted[j]
+			j--
+		}
+		sorted[j+1] = key
+	}
+	result := ""
+	for i, s := range sorted {
+		if i > 0 {
+			result += ","
+		}
+		result += s
+	}
+	return result
+}
+
+// canonicalizeYAMLNodes creates a canonical string representation of YAML nodes
+func canonicalizeYAMLNodes(nodes []*yaml.Node) string {
+	if len(nodes) == 0 {
+		return ""
+	}
+	strs := make([]string, len(nodes))
+	for i, node := range nodes {
+		strs[i] = canonicalizeYAMLNode(node)
+	}
+	return canonicalizeStringSlice(strs)
 }

@@ -1278,7 +1278,9 @@ func buildObjectFromLiteral(m map[string]any) *oas3.Schema {
 // buildArrayFromLiteral creates a schema from an array literal.
 func buildArrayFromLiteral(arr []any) *oas3.Schema {
 	if len(arr) == 0 {
-		return ArrayType(Top()) // Empty array - any items
+		// Empty array - items will be determined on first append
+		// Use nil (Bottom) so Union(nil, itemType) = itemType rather than Top
+		return ArrayType(nil)
 	}
 
 	// Build prefixItems for tuple if heterogeneous
