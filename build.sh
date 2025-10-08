@@ -45,6 +45,12 @@ build_wasm() {
 	  GOOS=js GOARCH=wasm go build -o ./web/src/assets/wasm/lib.wasm cmd/wasm/functions.go
     SIZE="$(get_file_size "./web/src/assets/wasm/lib.wasm")"
     printf " Done (%s)\n" "$SIZE"
+
+    printf "Compressing WASM with brotli..."
+    brotli -f -q 11 -o ./web/src/assets/wasm/engine.latest.wasm.br ./web/src/assets/wasm/lib.wasm
+    COMPRESSED_SIZE="$(get_file_size "./web/src/assets/wasm/engine.latest.wasm.br")"
+    printf " Done (%s)\n" "$COMPRESSED_SIZE"
+
     cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" "./web/src/assets/wasm/wasm_exec.js"
 
 }

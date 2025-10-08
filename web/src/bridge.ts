@@ -1,70 +1,134 @@
-// Bridge for loading and interacting with WASM module
-import wasmExec from './assets/wasm/wasm_exec.js?url';
+// Bridge for loading and interacting with WASM module via web worker
+import JQWorker from "./jq.web.worker.ts?worker";
 
-let wasmInstance: WebAssembly.Instance | null = null;
-let wasmReady = false;
+const wasmWorker = new JQWorker();
+let messageQueue: {
+  resolve: Function;
+  reject: Function;
+  message: any;
+  supercede: boolean;
+}[] = [];
+let isProcessing = false;
 
-// Declare the global functions that will be set by WASM
-declare global {
-  interface Window {
-    ExecuteJQ: (query: string, jsonInput: string) => Promise<string>;
-    SymbolicExecuteJQ: (oasYAML: string) => Promise<string>;
-    FormatJQ: (query: string) => Promise<string>;
-  }
+function processQueue() {
+  if (isProcessing || messageQueue.length === 0) return;
+
+  isProcessing = true;
+  const { resolve, reject, message } = messageQueue.shift()!;
+
+  wasmWorker.postMessage(message);
+  wasmWorker.onmessage = (event: MessageEvent<any>) => {
+    if (event.data.type.endsWith("Result")) {
+      // Reject all superceded messages before resolving the current message
+      const supercedeMessages = messageQueue.filter((_, index) => {
+        return messageQueue.slice(index + 1).some((later) => later.supercede);
+      });
+      supercedeMessages.forEach((m) => m.reject(new Error("supercedeerror")));
+      messageQueue = messageQueue.filter((m) => !supercedeMessages.includes(m));
+      resolve(event.data.payload);
+    } else if (event.data.type.endsWith("Error")) {
+      reject(new Error(event.data.error));
+    }
+    isProcessing = false;
+    processQueue();
+  };
 }
 
-async function loadWasm(): Promise<void> {
-  if (wasmReady) {
-    return;
-  }
-
-  // Load wasm_exec.js
-  const script = document.createElement('script');
-  script.src = wasmExec;
-  await new Promise((resolve, reject) => {
-    script.onload = resolve;
-    script.onerror = reject;
-    document.head.appendChild(script);
+function sendMessage(message: any, supercede = false): Promise<any> {
+  return new Promise((resolve, reject) => {
+    messageQueue.push({ resolve, reject, message, supercede });
+    processQueue();
   });
-
-  // @ts-expect-error Go is defined by wasm_exec.js
-  const go = new window.Go();
-
-  // Fetch and instantiate the WASM module
-  const response = await fetch('/src/assets/wasm/lib.wasm');
-  const buffer = await response.arrayBuffer();
-  const result = await WebAssembly.instantiate(buffer, go.importObject);
-
-  wasmInstance = result.instance;
-
-  // Run the Go program
-  go.run(wasmInstance);
-
-  wasmReady = true;
 }
 
-// Ensure WASM is loaded before calling functions
-async function ensureWasmLoaded(): Promise<void> {
-  if (!wasmReady) {
-    await loadWasm();
-  }
+export type ExecuteJQMessage = {
+  Request: {
+    type: "ExecuteJQ";
+    payload: {
+      query: string;
+      jsonInput: string;
+    };
+  };
+  Response:
+    | {
+        type: "ExecuteJQResult";
+        payload: string;
+      }
+    | {
+        type: "ExecuteJQError";
+        error: string;
+      };
+};
+
+export type SymbolicExecuteJQMessage = {
+  Request: {
+    type: "SymbolicExecuteJQ";
+    payload: {
+      oasYAML: string;
+    };
+  };
+  Response:
+    | {
+        type: "SymbolicExecuteJQResult";
+        payload: string;
+      }
+    | {
+        type: "SymbolicExecuteJQError";
+        error: string;
+      };
+};
+
+export type FormatJQMessage = {
+  Request: {
+    type: "FormatJQ";
+    payload: {
+      query: string;
+    };
+  };
+  Response:
+    | {
+        type: "FormatJQResult";
+        payload: string;
+      }
+    | {
+        type: "FormatJQError";
+        error: string;
+      };
+};
+
+export function executeJQ(
+  query: string,
+  jsonInput: string,
+  supercede = false,
+): Promise<string> {
+  return sendMessage(
+    {
+      type: "ExecuteJQ",
+      payload: { query, jsonInput },
+    } satisfies ExecuteJQMessage["Request"],
+    supercede,
+  );
 }
 
-// Export wrapped functions
-export async function executeJQ(query: string, jsonInput: string): Promise<string> {
-  await ensureWasmLoaded();
-  return window.ExecuteJQ(query, jsonInput);
+export function symbolicExecuteJQ(
+  oasYAML: string,
+  supercede = false,
+): Promise<string> {
+  return sendMessage(
+    {
+      type: "SymbolicExecuteJQ",
+      payload: { oasYAML },
+    } satisfies SymbolicExecuteJQMessage["Request"],
+    supercede,
+  );
 }
 
-export async function symbolicExecuteJQ(oasYAML: string): Promise<string> {
-  await ensureWasmLoaded();
-  return window.SymbolicExecuteJQ(oasYAML);
+export function formatJQ(query: string, supercede = false): Promise<string> {
+  return sendMessage(
+    {
+      type: "FormatJQ",
+      payload: { query },
+    } satisfies FormatJQMessage["Request"],
+    supercede,
+  );
 }
-
-export async function formatJQ(query: string): Promise<string> {
-  await ensureWasmLoaded();
-  return window.FormatJQ(query);
-}
-
-// Initialize WASM on module load
-loadWasm().catch(console.error);
