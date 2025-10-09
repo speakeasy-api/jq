@@ -23,7 +23,20 @@ type execState struct {
 	schemaToAlloc map[*oas3.Schema]string // Shared: schema pointer → allocID (for opAppend)
 	allocCounter  *int                     // Shared: Monotonic counter for unique allocation IDs
 	callstack     []int                    // Per-state: Return address stack for closures
+
+	// Path collection (for del/getpath/setpath operations)
+	pathMode    bool          // Are we collecting a path (between opPathBegin/opPathEnd)?
+	currentPath []PathSegment // Current path segments being collected
 }
+
+// PathSegment represents one segment of a path expression
+type PathSegment struct {
+	Key        interface{} // string (property), int (array index), or PathWildcard (symbolic)
+	IsSymbolic bool        // True if this is a wildcard from .[] iteration
+}
+
+// PathWildcard represents a symbolic array index (from .[])
+type PathWildcard struct{}
 
 // clone creates a deep copy of this state for forking.
 func (s *execState) clone() *execState {
@@ -47,6 +60,10 @@ func (s *execState) clone() *execState {
 	callstackCopy := make([]int, len(s.callstack))
 	copy(callstackCopy, s.callstack)
 
+	// Clone currentPath for path collection
+	pathCopy := make([]PathSegment, len(s.currentPath))
+	copy(pathCopy, s.currentPath)
+
 	return &execState{
 		pc:         s.pc,
 		stack:      stackCopy,
@@ -56,6 +73,8 @@ func (s *execState) clone() *execState {
 		schemaToAlloc: s.schemaToAlloc, // SHARED
 		allocCounter:  s.allocCounter,  // SHARED pointer
 		callstack:     callstackCopy,
+		pathMode:      s.pathMode,
+		currentPath:   pathCopy,
 	}
 }
 

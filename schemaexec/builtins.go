@@ -66,6 +66,11 @@ var builtinRegistry = map[string]builtinFunc{
 	// Aliases that jq actually uses
 	"_add":      builtinPlus,
 	"_subtract": builtinMinus,
+
+	// Path operations
+	"delpaths": builtinDelpaths,
+	"getpath":  builtinGetpath,
+	"setpath":  builtinSetpath,
 }
 
 // ============================================================================
@@ -393,6 +398,119 @@ func builtinWithEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv)
 	// For now, return object with Top values
 	result := ObjectType()
 	result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Top())
+
+	return []*oas3.Schema{result}, nil
+}
+
+// ============================================================================
+// PATH OPERATION BUILTINS
+// ============================================================================
+
+// builtinDelpaths implements delpaths(paths) - delete multiple paths from input
+// Used by del() which compiles to delpaths
+func builtinDelpaths(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if env.opts.EnableWarnings {
+		env.addWarning("delpaths called: input type=%s, args count=%d", getType(input), len(args))
+	}
+
+	if len(args) == 0 {
+		// No paths to delete
+		if env.opts.EnableWarnings {
+			env.addWarning("delpaths: no args, returning input unchanged")
+		}
+		return []*oas3.Schema{input}, nil
+	}
+
+	pathsArg := args[0]
+	if env.opts.EnableWarnings {
+		env.addWarning("delpaths: pathsArg type=%s", getType(pathsArg))
+		if pathsArg.PrefixItems != nil {
+			env.addWarning("delpaths: pathsArg has %d prefixItems", len(pathsArg.PrefixItems))
+		}
+		if pathsArg.Items != nil && pathsArg.Items.Left != nil {
+			env.addWarning("delpaths: pathsArg.Items type=%s", getType(pathsArg.Items.Left))
+			if pathsArg.Items.Left.PrefixItems != nil {
+				env.addWarning("delpaths: pathsArg.Items has %d prefixItems", len(pathsArg.Items.Left.PrefixItems))
+			}
+		}
+	}
+
+	// Extract paths from the schema (array of path arrays)
+	paths := extractPathsFromSchema(pathsArg)
+
+	if env.opts.EnableWarnings {
+		env.addWarning("delpaths: extracted %d paths", len(paths))
+		for i, path := range paths {
+			env.addWarning("delpaths: path[%d] has %d segments", i, len(path))
+		}
+	}
+
+	if len(paths) == 0 {
+		// No paths to delete
+		if env.opts.EnableWarnings {
+			env.addWarning("delpaths: no paths extracted, returning input unchanged")
+		}
+		return []*oas3.Schema{input}, nil
+	}
+
+	// Apply deletion for each path
+	result := input
+	for _, path := range paths {
+		result = deletePathFromSchema(result, path, env.opts)
+	}
+
+	if env.opts.EnableWarnings {
+		env.addWarning("delpaths: result type=%s", getType(result))
+	}
+
+	return []*oas3.Schema{result}, nil
+}
+
+// builtinGetpath implements getpath(path) - get value at path
+func builtinGetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) == 0 {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	pathArg := args[0]
+	paths := extractPathsFromSchema(pathArg)
+
+	if len(paths) == 0 {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// For single path, navigate and return schema at that location
+	// For multiple paths (union), return union of all results
+	results := make([]*oas3.Schema, len(paths))
+	for i, path := range paths {
+		results[i] = navigatePathInSchema(input, path, env.opts)
+	}
+
+	if len(results) == 1 {
+		return []*oas3.Schema{results[0]}, nil
+	}
+	return []*oas3.Schema{Union(results, env.opts)}, nil
+}
+
+// builtinSetpath implements setpath(path; value) - set value at path
+func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) < 2 {
+		return []*oas3.Schema{input}, nil
+	}
+
+	pathArg := args[0]
+	valueArg := args[1]
+
+	paths := extractPathsFromSchema(pathArg)
+	if len(paths) == 0 {
+		return []*oas3.Schema{input}, nil
+	}
+
+	// Set value at path (only handle single path for now)
+	result := input
+	for _, path := range paths {
+		result = setPathInSchema(result, path, valueArg, env.opts)
+	}
 
 	return []*oas3.Schema{result}, nil
 }

@@ -386,10 +386,12 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			return []*execState{next}, nil
 		}
 		if pc, ok := getClosurePC(clos); ok {
-			// Record call site for 1-CFA
-			// removed callSitePC = next.pc
 			// Push return address (next.pc is already incremented by executeOpMultiState)
 			next.callstack = append(next.callstack, next.pc)
+
+			// Push new scope frame for closure (balanced by opRet)
+			next.pushFrame()
+
 			// Jump to closure PC
 			next.pc = pc
 			return []*execState{next}, nil
@@ -431,9 +433,18 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		// For schema execution, these are no-ops
 		return []*execState{next}, nil
 
-	case opPathBegin, opPathEnd:
-		// Path operation markers - used for getpath/setpath
-		// For schema execution, these are no-ops
+	case opPathBegin:
+		// Enter path collection mode
+		next.pathMode = true
+		next.currentPath = make([]PathSegment, 0, 4)
+		return []*execState{next}, nil
+
+	case opPathEnd:
+		// Exit path collection mode and convert currentPath to schema
+		next.pathMode = false
+		pathSchema := buildPathSchemaFromSegments(next.currentPath)
+		next.push(pathSchema)
+		next.currentPath = nil
 		return []*execState{next}, nil
 
 	case opForkLabel:
@@ -851,6 +862,17 @@ func (env *schemaEnv) execConstMulti(state *execState, c *codeOp) ([]*execState,
 
 // execIndexMulti handles index in multi-state mode.
 func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState, error) {
+	// PATH MODE: Collect path segment instead of navigating
+	if state.pathMode {
+		indexKey := c.value
+		state.currentPath = append(state.currentPath, PathSegment{
+			Key:        indexKey,
+			IsSymbolic: false,
+		})
+		return []*execState{state}, nil
+	}
+
+	// NORMAL MODE: Navigate schema
 	base := state.pop()
 	if base == nil {
 		return []*execState{state}, nil
@@ -880,6 +902,19 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 
 // execIterMulti handles iteration in multi-state mode.
 func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, error) {
+	// PATH MODE: Add wildcard segment for symbolic iteration
+	if state.pathMode {
+		// Symbolic iteration: .[] means "any index"
+		// Represent as a wildcard in the path
+		state.currentPath = append(state.currentPath, PathSegment{
+			Key:        PathWildcard{},
+			IsSymbolic: true,
+		})
+		// Don't pop in path mode - we're building a path, not evaluating
+		return []*execState{state}, nil
+	}
+
+	// NORMAL MODE: Iterate and push item schema
 	val := state.pop()
 	if val == nil {
 		return []*execState{state}, nil
@@ -972,17 +1007,40 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 
 	// Get the array from the variable
 	var targetArray *oas3.Schema
+	fromVar := false
+
+	// Prefer variable-backed accumulation if key is provided
 	if key != "" {
 		if arr, ok := state.loadVar(key); ok {
 			targetArray = arr
+			fromVar = true
 		}
 	}
 
-	// Look up the allocID for this array via schema pointer
+	// FALLBACK: Stack-based accumulation (for del/path expressions)
+	// If no variable target, pop the array from the stack
+	if targetArray == nil && len(state.stack) > 0 {
+		candidate := state.pop()
+		if getType(candidate) == "array" {
+			targetArray = candidate
+			fromVar = false
+		} else {
+			// Not an array; push it back
+			state.push(candidate)
+		}
+	}
+
+	// Look up or assign allocID for this array
 	var accumKey string
 	if targetArray != nil {
 		if ak, ok := state.schemaToAlloc[targetArray]; ok {
 			accumKey = ak
+		} else {
+			// Not tagged yet - assign new allocID
+			*state.allocCounter++
+			accumKey = fmt.Sprintf("alloc%d", *state.allocCounter)
+			state.accum[accumKey] = targetArray
+			state.schemaToAlloc[targetArray] = accumKey
 		}
 	}
 
@@ -992,12 +1050,12 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 		if existing, ok := state.accum[accumKey]; ok {
 			canonicalArr = existing
 		} else {
-			// Shouldn't happen if opStore ran, but handle gracefully
+			// Shouldn't happen if we just tagged it, but handle gracefully
 			canonicalArr = ArrayType(Bottom())
 			state.accum[accumKey] = canonicalArr
 		}
 	} else {
-		// No allocID found - create standalone
+		// No target found - create standalone
 		canonicalArr = ArrayType(Bottom())
 	}
 
@@ -1007,21 +1065,49 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 		priorItems = canonicalArr.Items.Left
 	}
 
-	// Union new value with existing items (lattice join - monotone operation)
-	unionedItems := Union([]*oas3.Schema{priorItems, val}, env.opts)
+	// For path tuples (arrays with prefixItems), don't union - collect multiple paths
+	// This preserves the path structure for delpaths/getpath/setpath
+	var unionedItems *oas3.Schema
+	valType := getType(val)
+	hasTuplePrefixItems := val != nil && val.PrefixItems != nil && len(val.PrefixItems) > 0
+
+	if valType == "array" && hasTuplePrefixItems {
+		// This is a path tuple - don't union, but collect multiple paths
+		priorIsTuple := getType(priorItems) == "array" && priorItems.PrefixItems != nil && len(priorItems.PrefixItems) > 0
+
+		if priorItems == Bottom() || getType(priorItems) == "" {
+			// First path - use directly
+			unionedItems = val
+		} else if priorIsTuple {
+			// Multiple paths - create anyOf to preserve both tuples
+			unionedItems = &oas3.Schema{
+				Type:  oas3.NewTypeFromString(oas3.SchemaTypeArray),
+				AnyOf: []*oas3.JSONSchema[oas3.Referenceable]{
+					oas3.NewJSONSchemaFromSchema[oas3.Referenceable](priorItems),
+					oas3.NewJSONSchemaFromSchema[oas3.Referenceable](val),
+				},
+			}
+		} else {
+			// Prior exists but isn't a tuple - union normally
+			unionedItems = Union([]*oas3.Schema{priorItems, val}, env.opts)
+		}
+	} else {
+		// Normal array accumulation - union items
+		unionedItems = Union([]*oas3.Schema{priorItems, val}, env.opts)
+	}
 
 	// MUTATE canonical array in-place - safe with unique keys!
 	// All states/references to this array will see the update
 	if getType(canonicalArr) == "array" {
 		canonicalArr.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](unionedItems)
-		if env.opts.EnableWarnings {
-			env.addWarning("opAppend[%s]: appending type=%s, prior=%s, union=%s",
-				accumKey, getType(val), getType(priorItems), getType(unionedItems))
-		}
 	}
 
-	// Push the SAME canonical array (preserves aliasing)
-	state.push(canonicalArr)
+	// Push the canonical array back ONLY if we took it from the stack
+	// For variable-backed accumulation, the array stays in the variable
+	if !fromVar {
+		state.push(canonicalArr)
+	}
+
 	return []*execState{state}, nil
 }
 
@@ -1038,7 +1124,10 @@ func (env *schemaEnv) execFork(state *execState, c *codeOp) ([]*execState, error
 	forkState.pc = targetPC
 	forkState.depth++
 
-	return []*execState{continueState, forkState}, nil
+	// Return fork target FIRST, continue SECOND
+	// This ensures LIFO worklist processes continue state first,
+	// which is critical for accumulator mutations (e.g., path collection)
+	return []*execState{forkState, continueState}, nil
 }
 
 // execForkAlt handles alternative fork (// operator).
@@ -1093,20 +1182,35 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 			funcName = fn
 		}
 
-		// Pop arguments
+		// Pop arguments FIRST (right-to-left), then input
 		args := make([]*oas3.Schema, argCount)
 		for i := argCount - 1; i >= 0; i-- {
 			if len(state.stack) == 0 {
-				return nil, fmt.Errorf("stack underflow on call")
+				return nil, fmt.Errorf("stack underflow on call args")
 			}
 			args[i] = state.pop()
 		}
 
-		// Pop input
+		// Pop input (from bottom of stack)
 		if len(state.stack) == 0 {
 			return nil, fmt.Errorf("stack underflow on call input")
 		}
 		input := state.pop()
+
+		// SPECIAL CASE: Path builtins have inverted calling convention
+		// For delpaths/getpath/setpath: input should be the object, not the paths array
+		if (funcName == "delpaths" || funcName == "getpath" || funcName == "setpath") && len(args) >= 1 {
+			// Swap input and first arg
+			input, args[0] = args[0], input
+		}
+
+		// DEBUG: Trace builtin calls
+		if env.opts.EnableWarnings && funcName == "delpaths" {
+			env.addWarning("execCallMulti: calling %s with input type=%s, %d args", funcName, getType(input), len(args))
+			for i, arg := range args {
+				env.addWarning("execCallMulti: arg[%d] type=%s", i, getType(arg))
+			}
+		}
 
 		// Call builtin
 		results, err := env.callBuiltin(funcName, input, args)
@@ -1347,6 +1451,34 @@ func valueToSchemaStatic(v any) *oas3.Schema {
 	default:
 		return Top()
 	}
+}
+
+// buildPathSchemaFromSegments converts path segments to a schema representation
+// Path is represented as an array with prefixItems (tuple)
+// Example: ["a", "b", 0] -> array with items [const"a", const"b", const 0]
+func buildPathSchemaFromSegments(segments []PathSegment) *oas3.Schema {
+	if len(segments) == 0 {
+		// Empty path - represents root
+		return ArrayType(Bottom())
+	}
+
+	prefixItems := make([]*oas3.Schema, len(segments))
+	for i, seg := range segments {
+		if seg.IsSymbolic {
+			// Wildcard: represent as integer type (any index)
+			prefixItems[i] = IntegerType()
+		} else if s, ok := seg.Key.(string); ok {
+			prefixItems[i] = ConstString(s)
+		} else if n, ok := seg.Key.(int); ok {
+			prefixItems[i] = ConstInteger(int64(n))
+		} else {
+			// Fallback for unknown segment type
+			prefixItems[i] = Top()
+		}
+	}
+
+	// Return tuple array (array with specific prefixItems)
+	return BuildArray(Top(), prefixItems)
 }
 
 // Simple closure tracking (maps schema pointer to PC)
