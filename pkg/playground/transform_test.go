@@ -788,6 +788,26 @@ components:
 		t.Error("Panel2 should contain 'total' field")
 	}
 
+	// id and title should preserve their schema from the input
+	// They should be type: string, not empty schemas {}
+	if !strings.Contains(result.Panel2, "id:") || !strings.Contains(result.Panel2, "type: string") {
+		// Check that we don't have empty schema {} for id
+		if strings.Contains(result.Panel2, "id: {}") {
+			t.Errorf("Panel2 contains empty schema for 'id', should be type: string")
+		}
+	}
+	if !strings.Contains(result.Panel2, "title:") || !strings.Contains(result.Panel2, "type: string") {
+		// Check that we don't have empty schema {} for title
+		if strings.Contains(result.Panel2, "title: {}") {
+			t.Errorf("Panel2 contains empty schema for 'title', should be type: string")
+		}
+	}
+
+	// status should be computed as enum [active, inactive]
+	if !strings.Contains(result.Panel2, "status:") {
+		t.Error("Panel2 should contain 'status' field")
+	}
+
 	t.Logf("Pagination flattening successful")
 }
 

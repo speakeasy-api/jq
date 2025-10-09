@@ -365,8 +365,24 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 		}
 
 		if len(propSchemas) > 0 {
+			// CRITICAL FIX: Filter out unconstrained/unknown schemas before Union to preserve precision
+			// When merging {id: {type: string}} with {id: {}}, keep {type: string}
+			// Empty schemas {} represent "unknown" and should not eliminate concrete schemas
+			filteredSchemas := make([]*oas3.Schema, 0, len(propSchemas))
+			hasConcreteSchema := false
+			for _, ps := range propSchemas {
+				if !isUnconstrainedSchema(ps) {
+					filteredSchemas = append(filteredSchemas, ps)
+					hasConcreteSchema = true
+				}
+			}
+			// If all are unconstrained, keep exactly one
+			if !hasConcreteSchema && len(propSchemas) > 0 {
+				filteredSchemas = []*oas3.Schema{propSchemas[0]}
+			}
+
 			// Recursively union the property schemas
-			unionSchema := Union(propSchemas, opts)
+			unionSchema := Union(filteredSchemas, opts)
 			// Unwrap single-branch anyOf
 			if unionSchema.AnyOf != nil && len(unionSchema.AnyOf) == 1 && unionSchema.AnyOf[0].GetLeft() != nil {
 				unionSchema = unionSchema.AnyOf[0].GetLeft()
@@ -1193,6 +1209,7 @@ func isSubschemaOf(a, b *oas3.Schema) bool {
 		}
 	} else if aType != "" && bType == "" {
 		// B has no type constraint = accepts anything
+		// But this was already handled by isTopSchema check above
 		return true
 	} else if aType == "" && bType != "" {
 		// A has no type but B requires specific type
@@ -1201,6 +1218,47 @@ func isSubschemaOf(a, b *oas3.Schema) bool {
 
 	// Both have no explicit type - compare constraints generically
 	return true
+}
+
+// isUnconstrainedSchema checks if a schema is completely unconstrained (empty schema {})
+//
+// In the symbolic execution lattice, Top represents "unknown/any value" and is created
+// when the engine loses precision. It's represented as an empty schema with no type,
+// no properties, no constraints - just {}.
+//
+// This function identifies such schemas so they can be filtered during merging to
+// preserve precision. For example, when merging property schemas from multiple paths:
+//   Path 1: {id: {type: string}}  (concrete)
+//   Path 2: {id: {}}              (unknown/lost precision)
+// We want to keep {type: string}, not the empty schema.
+func isUnconstrainedSchema(s *oas3.Schema) bool {
+	if s == nil {
+		return false
+	}
+
+	// Check all possible constraint fields
+	// An unconstrained schema has NONE of these set
+	hasType := getType(s) != ""
+	propCount := 0
+	if s.Properties != nil {
+		for range s.Properties.All() {
+			propCount++
+		}
+	}
+	hasProperties := propCount > 0
+	hasEnum := s.Enum != nil && len(s.Enum) > 0
+	hasAnyOf := s.AnyOf != nil && len(s.AnyOf) > 0
+	hasAllOf := s.AllOf != nil && len(s.AllOf) > 0
+	hasOneOf := s.OneOf != nil && len(s.OneOf) > 0
+	hasConstraints := s.Minimum != nil || s.Maximum != nil || s.Pattern != nil ||
+		s.MinLength != nil || s.MaxLength != nil || s.Format != nil
+	hasItems := s.Items != nil && s.Items.Left != nil
+	hasAdditionalProps := s.AdditionalProperties != nil && s.AdditionalProperties.Left != nil
+	hasRequired := s.Required != nil && len(s.Required) > 0
+
+	// Unconstrained = completely empty (no type, properties, constraints, etc.)
+	return !hasType && !hasProperties && !hasEnum && !hasAnyOf && !hasAllOf && !hasOneOf &&
+		!hasConstraints && !hasItems && !hasAdditionalProps && !hasRequired
 }
 
 // numericConstraintsSubsumed checks if A's numeric constraints are stricter than or equal to B's

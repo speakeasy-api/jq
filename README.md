@@ -10,7 +10,7 @@ go get github.com/speakeasy-api/jq
 
 ## Playground
 
-Run `make build-wasm && cd web && npm install && npm run dev`, then visit http://localhost:5174/. Execute: run jq on JSON data. Symbolic: transform OpenAPI schemas with `x-speakeasy-transform-from-json: 'jq {id, total: (.price * .qty)}'`.
+Run `make build-wasm && cd web && npm install && npm run dev`, then visit http://localhost:5174/. Execute: run jq on JSON data. Symbolic: transform OpenAPI schemas with `x-speakeasy-transform-from-api: 'jq {id, total: (.price * .qty)}'`.
 
 ## Quick example (symbolic)
 
@@ -58,7 +58,7 @@ func main() {
 - Schema inference for common jq constructs: property access (`.foo`, `.foo.bar`), arrays (`.[0]`, `.[]`), object construction (`{name: .x}`), type narrowing and constraints
 - Conditionals: `if .score >= 90 then "gold" else "silver"` → `enum: ["gold", "silver"]`
 - Object merging: reconcile compatible branches into unions
-- OpenAPI aware: designed for `x-speakeasy-transform-from-json` workflows
+- OpenAPI aware: designed for `x-speakeasy-transform-from-api` workflows
 
 ## Why this exists
 
