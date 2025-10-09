@@ -12,9 +12,9 @@ components:
     EntityResponse:
       type: object
       description: Extract nested ID to top-level, minimal schema coupling.
-      x-speakeasy-transform-from-json:
+      x-speakeasy-transform-from-api:
         jq: '. + {id: .data.result[0].id}'
-      x-speakeasy-transform-to-json:
+      x-speakeasy-transform-to-api:
         jq: '{data}'
       properties:
         data:
@@ -42,7 +42,7 @@ components:
     PaginatedItemsResponse:
       type: object
       description: Flattened pagination with normalized item status.
-      x-speakeasy-transform-from-json:
+      x-speakeasy-transform-from-api:
         jq: >
           {
             items: (.data.items // []) | map({
@@ -54,7 +54,7 @@ components:
             total: (.data.pagination.total // 0),
             nextCursor: (.data.pagination.nextCursor // null)
           }
-      x-speakeasy-transform-to-json:
+      x-speakeasy-transform-to-api:
         jq: >
           {
             data: {
@@ -95,7 +95,7 @@ components:
     UserPreferences:
       type: object
       description: Flattened user profile with computed fullName.
-      x-speakeasy-transform-from-json:
+      x-speakeasy-transform-from-api:
         jq: >
           {
             userId: .data.user.id,
@@ -108,7 +108,7 @@ components:
               notifySms: .data.user.profile.preferences.settings.notifications.sms
             }
           }
-      x-speakeasy-transform-to-json:
+      x-speakeasy-transform-to-api:
         jq: >
           {
             data: {
@@ -179,7 +179,7 @@ components:
     TagList:
       type: object
       description: Enriched tag list with computed slug and length.
-      x-speakeasy-transform-from-json:
+      x-speakeasy-transform-from-api:
         jq: >
           {
             tags: (.tags // []) | map({
@@ -194,7 +194,7 @@ components:
                 end
             )
           }
-      x-speakeasy-transform-to-json:
+      x-speakeasy-transform-to-api:
         jq: >
           {
             tags: (.tags // []) | map(.value)
@@ -275,7 +275,7 @@ export function SymbolicTab() {
       <Panel defaultSize={33} minSize={20}>
         <div className="flex flex-col h-full border-r">
           <div className="px-4 py-2 border-b bg-muted/40 flex items-center justify-between">
-            <h3 className="text-sm font-medium">Apply x-speakeasy-transform-from-json</h3>
+            <h3 className="text-sm font-medium">Apply x-speakeasy-transform-from-api</h3>
             {isExecuting && (
               <span className="text-xs text-muted-foreground">Transforming...</span>
             )}
@@ -320,7 +320,7 @@ export function SymbolicTab() {
       <Panel defaultSize={34} minSize={20}>
         <div className="flex flex-col h-full">
           <div className="px-4 py-2 border-b bg-muted/40">
-            <h3 className="text-sm font-medium">Apply x-speakeasy-transform-to-json</h3>
+            <h3 className="text-sm font-medium">Apply x-speakeasy-transform-to-api</h3>
           </div>
           <div className="flex-1 overflow-hidden">
             {result ? (

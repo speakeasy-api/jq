@@ -67,7 +67,7 @@ func main() {
 - Array item schemas with proper merging
 
 **Production Features:**
-- Designed for `x-speakeasy-transform-from-json` workflows
+- Designed for `x-speakeasy-transform-from-api` workflows
 - Keeps codegen type-safe
 - Comprehensive termination safeguards
 - Fast execution (~0.4s for full test suite)

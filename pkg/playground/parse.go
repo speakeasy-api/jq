@@ -21,11 +21,11 @@ type TransformerFunc struct {
 	Config string // The actual JQ expression
 }
 
-// ParseTransformExtension parses the x-speakeasy-transform-from-json extension
+// ParseTransformExtension parses the x-speakeasy-transform-from-api extension
 func ParseTransformExtension(yamlNode *yaml.Node) (*TransformerFunc, error) {
 	// Check YAML node is a mapping (object)
 	if yamlNode.Kind != yaml.MappingNode {
-		return nil, fmt.Errorf("x-speakeasy-transform-from-json must be an object")
+		return nil, fmt.Errorf("x-speakeasy-transform-from-api must be an object")
 	}
 
 	// Parse mapping to find "jq" key
@@ -44,7 +44,7 @@ func ParseTransformExtension(yamlNode *yaml.Node) (*TransformerFunc, error) {
 		if keyNode.Value == "jq" {
 			// Validate the value is a string
 			if valueNode.Kind != yaml.ScalarNode {
-				return nil, fmt.Errorf("x-speakeasy-transform-from-json: 'jq' value must be a string")
+				return nil, fmt.Errorf("x-speakeasy-transform-from-api: 'jq' value must be a string")
 			}
 			jqValue = strings.TrimSpace(valueNode.Value)
 			found = true
@@ -53,17 +53,17 @@ func ParseTransformExtension(yamlNode *yaml.Node) (*TransformerFunc, error) {
 	}
 
 	if !found {
-		return nil, fmt.Errorf("x-speakeasy-transform-from-json requires 'jq' key")
+		return nil, fmt.Errorf("x-speakeasy-transform-from-api requires 'jq' key")
 	}
 
 	if jqValue == "" {
-		return nil, fmt.Errorf("x-speakeasy-transform-from-json: 'jq' requires a jq expression")
+		return nil, fmt.Errorf("x-speakeasy-transform-from-api: 'jq' requires a jq expression")
 	}
 
 	// Validate the JQ expression can be parsed
 	q, err := gojq.Parse(jqValue)
 	if err != nil {
-		return nil, fmt.Errorf("x-speakeasy-transform-from-json: '%s' is an invalid jq expression: %w", jqValue, err)
+		return nil, fmt.Errorf("x-speakeasy-transform-from-api: '%s' is an invalid jq expression: %w", jqValue, err)
 	}
 
 	// Use the parsed query's string representation

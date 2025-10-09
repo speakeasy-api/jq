@@ -8,6 +8,7 @@ import (
 
 	gojq "github.com/speakeasy-api/jq"
 	"github.com/speakeasy-api/jq/schemaexec"
+	"github.com/speakeasy-api/openapi/extensions"
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 	"github.com/speakeasy-api/openapi/openapi"
 )
@@ -27,7 +28,7 @@ func SymbolicExecuteJQ(oasYAML string) (string, error) {
 		return "", fmt.Errorf("OpenAPI validation failed: %v", validationErrs[0])
 	}
 
-	// Transform schemas with x-speakeasy-transform-from-json using Walk API
+	// Transform schemas with x-speakeasy-transform-from-api using Walk API
 	ctx := context.Background()
 	var transformErrors []string
 
@@ -42,7 +43,7 @@ func SymbolicExecuteJQ(oasYAML string) (string, error) {
 		err := item.Match(openapi.Matcher{
 			Schema: func(schema *oas3.JSONSchema[oas3.Referenceable]) error {
 				if schema.GetExtensions() != nil {
-					if _, ok := schema.GetExtensions().Get("x-speakeasy-transform-from-json"); ok {
+					if _, ok := schema.GetExtensions().Get("x-speakeasy-transform-from-api"); ok {
 						locationStr := fmt.Sprintf("%v", item.Location)
 						schemasToTransform = append(schemasToTransform, schemaToTransform{
 							schema:   schema,
@@ -91,7 +92,7 @@ func transformSchema(schema *oas3.JSONSchema[oas3.Referenceable], location strin
 		return nil
 	}
 
-	transformExpr, ok := ext.Get("x-speakeasy-transform-from-json")
+	transformExpr, ok := ext.Get("x-speakeasy-transform-from-api")
 	if !ok {
 		return nil
 	}
@@ -128,9 +129,21 @@ func transformSchema(schema *oas3.JSONSchema[oas3.Referenceable], location strin
 		return fmt.Errorf("symbolic execution produced no output schema")
 	}
 
-	// Remove the transform extension from the result to prevent re-application
-	if result.Schema.Extensions != nil {
-		result.Schema.Extensions.Delete("x-speakeasy-transform-from-json")
+	// Ensure all nested properties are properly initialized
+	ensurePropertiesInitialized(result.Schema)
+
+	// Preserve original extensions (including the transform extension so it's visible in output)
+	originalExtensions := schema.GetExtensions()
+
+	// Copy over all extensions from the original schema
+	if originalExtensions != nil && originalExtensions.Len() > 0 {
+		if result.Schema.Extensions == nil {
+			result.Schema.Extensions = extensions.New()
+		}
+		// Copy all extensions from original
+		for k, v := range originalExtensions.All() {
+			result.Schema.Extensions.Set(k, v)
+		}
 	}
 
 	// Replace the original schema with the symbolically executed result
@@ -181,8 +194,8 @@ func SymbolicExecuteJQPipeline(oasYAML string) (*PipelineResult, error) {
 		return nil, fmt.Errorf("failed to clone for panel2: %w", err)
 	}
 
-	// Apply from-json transformation
-	appliedFrom, warnings := applyTransformationsToDoc(ctx, doc2, "x-speakeasy-transform-from-json")
+	// Apply from-api transformation
+	appliedFrom, warnings := applyTransformationsToDoc(ctx, doc2, "x-speakeasy-transform-from-api")
 	result.AppliedFromJson = appliedFrom
 	result.Warnings = append(result.Warnings, warnings...)
 
@@ -199,8 +212,8 @@ func SymbolicExecuteJQPipeline(oasYAML string) (*PipelineResult, error) {
 		return nil, fmt.Errorf("failed to clone for panel3: %w", err)
 	}
 
-	// Apply to-json transformation
-	appliedTo, warningsTo := applyTransformationsToDoc(ctx, doc3, "x-speakeasy-transform-to-json")
+	// Apply to-api transformation
+	appliedTo, warningsTo := applyTransformationsToDoc(ctx, doc3, "x-speakeasy-transform-to-api")
 	result.AppliedToJson = appliedTo
 	result.Warnings = append(result.Warnings, warningsTo...)
 
@@ -311,9 +324,28 @@ func transformSchemaWithExtension(schema *oas3.JSONSchema[oas3.Referenceable], l
 		return fmt.Errorf("symbolic execution produced no output schema")
 	}
 
+	// Ensure all nested properties are properly initialized
+	ensurePropertiesInitialized(result.Schema)
+
+	// Preserve original extensions (except the one we're processing)
+	originalExtensions := schema.GetExtensions()
+
 	// Remove the transform extension from the result
 	if result.Schema.Extensions != nil {
 		result.Schema.Extensions.Delete(extensionName)
+	}
+
+	// Copy over any other extensions from the original schema that should be preserved
+	if originalExtensions != nil && originalExtensions.Len() > 0 {
+		if result.Schema.Extensions == nil {
+			result.Schema.Extensions = extensions.New()
+		}
+		// Copy all extensions from original except the one we're processing
+		for k, v := range originalExtensions.All() {
+			if k != extensionName {
+				result.Schema.Extensions.Set(k, v)
+			}
+		}
 	}
 
 	// Replace the schema
@@ -321,6 +353,92 @@ func transformSchemaWithExtension(schema *oas3.JSONSchema[oas3.Referenceable], l
 	*schema = *newJSONSchema
 
 	return nil
+}
+
+// ensurePropertiesInitialized recursively ensures all Properties in a schema are properly initialized as JSONSchemas
+func ensurePropertiesInitialized(schema *oas3.Schema) {
+	if schema == nil {
+		return
+	}
+
+	// If Properties exist, ensure each property is properly wrapped as a JSONSchema
+	if schema.Properties != nil && schema.Properties.Len() > 0 {
+		for name, prop := range schema.Properties.All() {
+			if prop == nil {
+				// Skip nil properties
+				continue
+			}
+			// Get the underlying schema
+			propSchema := prop.GetLeft()
+			if propSchema == nil {
+				// Property is a reference or has no schema - skip it
+				continue
+			}
+			// Recursively ensure nested properties are initialized
+			ensurePropertiesInitialized(propSchema)
+
+			// Recreate the JSONSchema to ensure it's properly initialized
+			newProp := oas3.NewJSONSchemaFromSchema[oas3.Referenceable](propSchema)
+			schema.Properties.Set(name, newProp)
+		}
+	}
+
+	// Handle other schema fields that contain JSONSchemas
+	if schema.Items != nil {
+		itemSchema := schema.Items.GetLeft()
+		if itemSchema != nil {
+			ensurePropertiesInitialized(itemSchema)
+			schema.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](itemSchema)
+		}
+	}
+
+	if schema.AdditionalProperties != nil {
+		addSchema := schema.AdditionalProperties.GetLeft()
+		if addSchema != nil {
+			ensurePropertiesInitialized(addSchema)
+			schema.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](addSchema)
+		}
+	}
+
+	// Handle composition keywords
+	if len(schema.AllOf) > 0 {
+		for i, allOfSchema := range schema.AllOf {
+			if allOfSchema == nil {
+				continue
+			}
+			innerSchema := allOfSchema.GetLeft()
+			if innerSchema != nil {
+				ensurePropertiesInitialized(innerSchema)
+				schema.AllOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](innerSchema)
+			}
+		}
+	}
+
+	if len(schema.AnyOf) > 0 {
+		for i, anyOfSchema := range schema.AnyOf {
+			if anyOfSchema == nil {
+				continue
+			}
+			innerSchema := anyOfSchema.GetLeft()
+			if innerSchema != nil {
+				ensurePropertiesInitialized(innerSchema)
+				schema.AnyOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](innerSchema)
+			}
+		}
+	}
+
+	if len(schema.OneOf) > 0 {
+		for i, oneOfSchema := range schema.OneOf {
+			if oneOfSchema == nil {
+				continue
+			}
+			innerSchema := oneOfSchema.GetLeft()
+			if innerSchema != nil {
+				ensurePropertiesInitialized(innerSchema)
+				schema.OneOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](innerSchema)
+			}
+		}
+	}
 }
 
 // executeJQInternal runs a JQ query against JSON input and returns the result

@@ -663,10 +663,15 @@ func (env *schemaEnv) execIndex(c *codeOp) error {
 		}
 
 	case "array":
-		// Array indexing
-		result = getArrayElement(base, indexKey, env.opts)
-		if result == nil {
-			result = Top()
+		// Array slicing or indexing
+		if isSliceIndex(indexKey) {
+			// Slicing preserves array schema
+			result = base
+		} else {
+			result = getArrayElement(base, indexKey, env.opts)
+			if result == nil {
+				result = Top()
+			}
 		}
 
 	case "":
@@ -796,6 +801,25 @@ func getCodeValue(c any) any {
 	return nil
 }
 
+// isSliceIndex checks if index is an array slice (e.g., .[1:], .[:2], .[1:3])
+func isSliceIndex(v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return false
+	}
+	// Slice maps have "start", "end", and/or "step" keys
+	if _, ok := m["start"]; ok {
+		return true
+	}
+	if _, ok := m["end"]; ok {
+		return true
+	}
+	if _, ok := m["step"]; ok {
+		return true
+	}
+	return false
+}
+
 // getArrayElement returns the schema for arr[index].
 // Handles prefixItems, items, and unknown indices.
 func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oas3.Schema {
@@ -865,6 +889,14 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 	// PATH MODE: Collect path segment instead of navigating
 	if state.pathMode {
 		indexKey := c.value
+		// Array slicing in path mode: treat as wildcard (symbolic index)
+		if isSliceIndex(indexKey) {
+			state.currentPath = append(state.currentPath, PathSegment{
+				Key:        PathWildcard{},
+				IsSymbolic: true,
+			})
+			return []*execState{state}, nil
+		}
 		state.currentPath = append(state.currentPath, PathSegment{
 			Key:        indexKey,
 			IsSymbolic: false,
@@ -890,7 +922,12 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 			result = Top()
 		}
 	case "array":
-		result = getArrayElement(base, indexKey, env.opts)
+		// Array slicing: .[start:end] returns same array type
+		if isSliceIndex(indexKey) {
+			result = base
+		} else {
+			result = getArrayElement(base, indexKey, env.opts)
+		}
 	default:
 		// Unknown type - conservative
 		result = Top()
@@ -969,6 +1006,11 @@ func (env *schemaEnv) execObjectMulti(state *execState, c *codeOp) ([]*execState
 		if getType(key) == "string" && key.Enum != nil && len(key.Enum) > 0 {
 			keyNode := key.Enum[0]
 			if keyNode.Kind == yaml.ScalarNode {
+				// Guard against nil values (would create invalid JSONSchema wrappers)
+				if val == nil {
+					env.addWarning("opObject: nil value for key %q; widening to Top", keyNode.Value)
+					val = Top()
+				}
 				props[keyNode.Value] = val
 				required = append(required, keyNode.Value)
 			}
@@ -1222,17 +1264,26 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 
 		// For single result, push and continue
 		if len(results) == 1 {
-			state.push(results[0])
+			r := results[0]
+			if r == nil {
+				env.addWarning("builtin %s returned nil; widening to Top", funcName)
+				r = Top()
+			}
+			state.push(r)
 			return []*execState{state}, nil
 		}
 
 		// For multiple results, create separate states for each
 		// This handles builtins that can return different schemas
-		states := make([]*execState, len(results))
-		for i, result := range results {
+		states := make([]*execState, 0, len(results))
+		for _, result := range results {
 			s := state.clone()
+			if result == nil {
+				env.addWarning("builtin %s produced nil result; widening to Top", funcName)
+				result = Top()
+			}
 			s.push(result)
-			states[i] = s
+			states = append(states, s)
 		}
 		return states, nil
 
