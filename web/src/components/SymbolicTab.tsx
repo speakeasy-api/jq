@@ -271,7 +271,7 @@ export function SymbolicTab() {
 
       <PanelResizeHandle className="w-1 bg-border hover:bg-primary transition-colors" />
 
-      {/* Panel 2 - After from-json */}
+      {/* Panel 2 - After from-api */}
       <Panel defaultSize={33} minSize={20}>
         <div className="flex flex-col h-full border-r">
           <div className="px-4 py-2 border-b bg-muted/40 flex items-center justify-between">
@@ -307,7 +307,7 @@ export function SymbolicTab() {
               />
             ) : (
               <div className="flex items-center justify-center h-full text-muted-foreground">
-                <p>Panel 2 will show after from-json transformation</p>
+                <p>Panel 2 will show after from-api transformation</p>
               </div>
             )}
           </div>
@@ -316,7 +316,7 @@ export function SymbolicTab() {
 
       <PanelResizeHandle className="w-1 bg-border hover:bg-primary transition-colors" />
 
-      {/* Panel 3 - After to-json */}
+      {/* Panel 3 - After to-api */}
       <Panel defaultSize={34} minSize={20}>
         <div className="flex flex-col h-full">
           <div className="px-4 py-2 border-b bg-muted/40">
@@ -340,7 +340,7 @@ export function SymbolicTab() {
               />
             ) : (
               <div className="flex items-center justify-center h-full text-muted-foreground">
-                <p>Panel 3 will show after to-json transformation</p>
+                <p>Panel 3 will show after to-api transformation</p>
               </div>
             )}
           </div>

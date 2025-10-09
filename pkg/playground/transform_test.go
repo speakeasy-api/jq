@@ -380,12 +380,12 @@ components:
 		t.Fatalf("Pipeline failed: %v", err)
 	}
 
-	// Panel2 should have serverTime (added by from-json)
+	// Panel2 should have serverTime (added by from-api)
 	if !strings.Contains(result.Panel2, "serverTime") {
 		t.Error("Panel2 should contain serverTime")
 	}
 
-	// Panel3 should only have id (to-json removes serverTime)
+	// Panel3 should only have id (to-api removes serverTime)
 	if !strings.Contains(result.Panel3, "id:") {
 		t.Error("Panel3 should contain id")
 	}
@@ -415,12 +415,12 @@ components:
 		t.Fatalf("Pipeline failed: %v", err)
 	}
 
-	// Panel2 should only have id (from-json keeps id)
+	// Panel2 should only have id (from-api keeps id)
 	if !strings.Contains(result.Panel2, "id:") {
 		t.Error("Panel2 should contain id")
 	}
 
-	// Panel3 should have both id and clientNonce (to-json adds clientNonce)
+	// Panel3 should have both id and clientNonce (to-api adds clientNonce)
 	if !strings.Contains(result.Panel3, "id:") {
 		t.Error("Panel3 should contain id")
 	}
@@ -453,11 +453,11 @@ components:
 	}
 
 	// Applied flags should be false
-	if result.AppliedFromJson {
-		t.Error("AppliedFromJson should be false")
+	if result.AppliedFromApi {
+		t.Error("AppliedFromApi should be false")
 	}
-	if result.AppliedToJson {
-		t.Error("AppliedToJson should be false")
+	if result.AppliedToApi {
+		t.Error("AppliedToApi should be false")
 	}
 
 	// All panels should be identical
@@ -469,7 +469,7 @@ components:
 	}
 }
 
-func TestSymbolicExecuteJQPipeline_OnlyFromJson(t *testing.T) {
+func TestSymbolicExecuteJQPipeline_OnlyFromApi(t *testing.T) {
 	oasYAML := `openapi: 3.0.3
 info:
   title: OnlyFrom
@@ -491,19 +491,19 @@ components:
 		t.Fatalf("Pipeline failed: %v", err)
 	}
 
-	// AppliedFromJson should be true, AppliedToJson false
-	if !result.AppliedFromJson {
-		t.Error("AppliedFromJson should be true")
+	// AppliedFromApi should be true, AppliedToApi false
+	if !result.AppliedFromApi {
+		t.Error("AppliedFromApi should be true")
 	}
-	if result.AppliedToJson {
-		t.Error("AppliedToJson should be false when extension missing")
+	if result.AppliedToApi {
+		t.Error("AppliedToApi should be false when extension missing")
 	}
 
 	t.Logf("Panel2:\n%s", result.Panel2)
 	t.Logf("Panel3:\n%s", result.Panel3)
 }
 
-func TestSymbolicExecuteJQPipeline_OnlyToJson(t *testing.T) {
+func TestSymbolicExecuteJQPipeline_OnlyToApi(t *testing.T) {
 	oasYAML := `openapi: 3.0.3
 info:
   title: OnlyTo
@@ -525,12 +525,12 @@ components:
 		t.Fatalf("Pipeline failed: %v", err)
 	}
 
-	// AppliedFromJson false, AppliedToJson true
-	if result.AppliedFromJson {
-		t.Error("AppliedFromJson should be false when extension missing")
+	// AppliedFromApi false, AppliedToApi true
+	if result.AppliedFromApi {
+		t.Error("AppliedFromApi should be false when extension missing")
 	}
-	if !result.AppliedToJson {
-		t.Error("AppliedToJson should be true")
+	if !result.AppliedToApi {
+		t.Error("AppliedToApi should be true")
 	}
 
 	t.Logf("Panel2:\n%s", result.Panel2)

@@ -156,12 +156,12 @@ func transformSchema(schema *oas3.JSONSchema[oas3.Referenceable], location strin
 
 // PipelineResult contains the three panels
 type PipelineResult struct {
-	Panel1          string   `json:"panel1"`
-	Panel2          string   `json:"panel2"`
-	Panel3          string   `json:"panel3"`
-	AppliedFromJson bool     `json:"appliedFromJson"`
-	AppliedToJson   bool     `json:"appliedToJson"`
-	Warnings        []string `json:"warnings"`
+	Panel1         string   `json:"panel1"`
+	Panel2         string   `json:"panel2"`
+	Panel3         string   `json:"panel3"`
+	AppliedFromApi bool     `json:"appliedFromApi"`
+	AppliedToApi   bool     `json:"appliedToApi"`
+	Warnings       []string `json:"warnings"`
 }
 
 // SymbolicExecuteJQPipeline performs sequential transformation pipeline
@@ -196,7 +196,7 @@ func SymbolicExecuteJQPipeline(oasYAML string) (*PipelineResult, error) {
 
 	// Apply from-api transformation
 	appliedFrom, warnings := applyTransformationsToDoc(ctx, doc2, "x-speakeasy-transform-from-api")
-	result.AppliedFromJson = appliedFrom
+	result.AppliedFromApi = appliedFrom
 	result.Warnings = append(result.Warnings, warnings...)
 
 	// Marshal panel2
@@ -214,7 +214,7 @@ func SymbolicExecuteJQPipeline(oasYAML string) (*PipelineResult, error) {
 
 	// Apply to-api transformation
 	appliedTo, warningsTo := applyTransformationsToDoc(ctx, doc3, "x-speakeasy-transform-to-api")
-	result.AppliedToJson = appliedTo
+	result.AppliedToApi = appliedTo
 	result.Warnings = append(result.Warnings, warningsTo...)
 
 	// Marshal panel3

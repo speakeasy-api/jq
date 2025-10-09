@@ -100,8 +100,8 @@ export type PipelineResult = {
   panel1: string;
   panel2: string;
   panel3: string;
-  appliedFromJson: boolean;
-  appliedToJson: boolean;
+  appliedFromApi: boolean;
+  appliedToApi: boolean;
   warnings: string[];
 };
 
