@@ -2,7 +2,10 @@ package schemaexec
 
 import (
 	"fmt"
+	"math"
+	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 	"gopkg.in/yaml.v3"
@@ -71,6 +74,50 @@ var builtinRegistry = map[string]builtinFunc{
 	"delpaths": builtinDelpaths,
 	"getpath":  builtinGetpath,
 	"setpath":  builtinSetpath,
+
+	// String operations
+	"split":          builtinSplit,
+	"join":           builtinJoin,
+	"startswith":     builtinStartswith,
+	"endswith":       builtinEndswith,
+	"ltrimstr":       builtinLtrimstr,
+	"rtrimstr":       builtinRtrimstr,
+	"ascii_downcase": builtinAsciiDowncase,
+	"ascii_upcase":   builtinAsciiUpcase,
+
+	// Math operations
+	"floor": builtinFloor,
+	"ceil":  builtinCeil,
+	"round": builtinRound,
+	"sqrt":  builtinSqrt,
+	"pow":   builtinPow,
+	"log":   builtinLog,
+	"exp":   builtinExp,
+
+	// Array grouping
+	"_group_by":  builtinGroupBy,
+	"_sort_by":   builtinSortBy,
+	"_unique_by": builtinUniqueBy,
+	"_min_by":    builtinMinMaxBy,
+	"_max_by":    builtinMinMaxBy,
+
+	// Array manipulation
+	"flatten": builtinFlatten,
+	"indices": builtinIndices,
+	"index":   builtinIndex,
+	"rindex":  builtinRindex,
+	"contains": builtinContains,
+	"inside":   builtinInside,
+
+	// Regex
+	"test":   builtinTest,
+	"_match": builtinMatch,
+
+	// Internal
+	"_break":     builtinBreak,
+	"_allocator": builtinAllocator,
+	"_setpath":   builtinSetpath, // Reuse public version
+	"_delpaths":  builtinDelpaths, // Reuse public version
 }
 
 // ============================================================================
@@ -403,6 +450,608 @@ func builtinWithEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv)
 }
 
 // ============================================================================
+// STRING OPERATION BUILTINS
+// ============================================================================
+
+// builtinSplit splits a string into an array
+func builtinSplit(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	if len(args) == 0 {
+		return []*oas3.Schema{ArrayType(StringType())}, nil
+	}
+
+	// Const folding: if both input and separator are const
+	if inputStr, ok := extractConstString(input); ok {
+		if sepStr, ok := extractConstString(args[0]); ok {
+			parts := strings.Split(inputStr, sepStr)
+			// Return const array if small enough
+			if len(parts) <= env.opts.EnumLimit {
+				return []*oas3.Schema{buildArrayOfConstStrings(parts)}, nil
+			}
+		}
+	}
+
+	// Conservative: return array<string>
+	return []*oas3.Schema{ArrayType(StringType())}, nil
+}
+
+// builtinJoin joins an array into a string
+func builtinJoin(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeArray(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Const folding: if array is tuple of const strings and sep is provided
+	if len(args) > 0 && input.PrefixItems != nil {
+		if sepStr, ok := extractConstString(args[0]); ok {
+			strs := extractConstStringsFromTuple(input)
+			if strs != nil {
+				joined := strings.Join(strs, sepStr)
+				return []*oas3.Schema{ConstString(joined)}, nil
+			}
+		}
+	}
+
+	// Conservative: return string
+	return []*oas3.Schema{StringType()}, nil
+}
+
+// builtinStartswith checks if string starts with prefix
+func builtinStartswith(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	if len(args) == 0 {
+		return []*oas3.Schema{BoolType()}, nil
+	}
+
+	// Const folding: if both const
+	if inputStr, ok := extractConstString(input); ok {
+		if prefixStr, ok := extractConstString(args[0]); ok {
+			result := strings.HasPrefix(inputStr, prefixStr)
+			return []*oas3.Schema{ConstBool(result)}, nil
+		}
+	}
+
+	// Conservative: return boolean
+	return []*oas3.Schema{BoolType()}, nil
+}
+
+// builtinEndswith checks if string ends with suffix
+func builtinEndswith(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	if len(args) == 0 {
+		return []*oas3.Schema{BoolType()}, nil
+	}
+
+	// Const folding
+	if inputStr, ok := extractConstString(input); ok {
+		if suffixStr, ok := extractConstString(args[0]); ok {
+			result := strings.HasSuffix(inputStr, suffixStr)
+			return []*oas3.Schema{ConstBool(result)}, nil
+		}
+	}
+
+	return []*oas3.Schema{BoolType()}, nil
+}
+
+// builtinLtrimstr removes prefix from string
+func builtinLtrimstr(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	if len(args) == 0 {
+		return []*oas3.Schema{input}, nil
+	}
+
+	// Const folding
+	if inputStr, ok := extractConstString(input); ok {
+		if prefixStr, ok := extractConstString(args[0]); ok {
+			result := strings.TrimPrefix(inputStr, prefixStr)
+			return []*oas3.Schema{ConstString(result)}, nil
+		}
+	}
+
+	return []*oas3.Schema{StringType()}, nil
+}
+
+// builtinRtrimstr removes suffix from string
+func builtinRtrimstr(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	if len(args) == 0 {
+		return []*oas3.Schema{input}, nil
+	}
+
+	// Const folding
+	if inputStr, ok := extractConstString(input); ok {
+		if suffixStr, ok := extractConstString(args[0]); ok {
+			result := strings.TrimSuffix(inputStr, suffixStr)
+			return []*oas3.Schema{ConstString(result)}, nil
+		}
+	}
+
+	return []*oas3.Schema{StringType()}, nil
+}
+
+// builtinAsciiDowncase converts string to lowercase
+func builtinAsciiDowncase(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Const folding
+	if inputStr, ok := extractConstString(input); ok {
+		return []*oas3.Schema{ConstString(strings.ToLower(inputStr))}, nil
+	}
+
+	// Enum preservation
+	if input.Enum != nil && len(input.Enum) > 0 && len(input.Enum) <= env.opts.EnumLimit {
+		newEnum := make([]*yaml.Node, len(input.Enum))
+		for i, node := range input.Enum {
+			if node.Kind == yaml.ScalarNode {
+				newEnum[i] = &yaml.Node{
+					Kind:  yaml.ScalarNode,
+					Value: strings.ToLower(node.Value),
+					Tag:   "!!str",
+				}
+			} else {
+				newEnum[i] = node
+			}
+		}
+		result := StringType()
+		result.Enum = newEnum
+		return []*oas3.Schema{result}, nil
+	}
+
+	return []*oas3.Schema{StringType()}, nil
+}
+
+// builtinAsciiUpcase converts string to uppercase
+func builtinAsciiUpcase(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Const folding
+	if inputStr, ok := extractConstString(input); ok {
+		return []*oas3.Schema{ConstString(strings.ToUpper(inputStr))}, nil
+	}
+
+	// Enum preservation
+	if input.Enum != nil && len(input.Enum) > 0 && len(input.Enum) <= env.opts.EnumLimit {
+		newEnum := make([]*yaml.Node, len(input.Enum))
+		for i, node := range input.Enum {
+			if node.Kind == yaml.ScalarNode {
+				newEnum[i] = &yaml.Node{
+					Kind:  yaml.ScalarNode,
+					Value: strings.ToUpper(node.Value),
+					Tag:   "!!str",
+				}
+			} else {
+				newEnum[i] = node
+			}
+		}
+		result := StringType()
+		result.Enum = newEnum
+		return []*oas3.Schema{result}, nil
+	}
+
+	return []*oas3.Schema{StringType()}, nil
+}
+
+// ============================================================================
+// MATH OPERATION BUILTINS
+// ============================================================================
+
+// builtinFloor rounds down to integer
+func builtinFloor(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeNumber(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Const folding
+	if val, ok := extractConstValue(input); ok {
+		if f, ok := val.(float64); ok {
+			return []*oas3.Schema{ConstInteger(int64(math.Floor(f)))}, nil
+		}
+	}
+
+	return []*oas3.Schema{IntegerType()}, nil
+}
+
+// builtinCeil rounds up to integer
+func builtinCeil(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeNumber(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Const folding
+	if val, ok := extractConstValue(input); ok {
+		if f, ok := val.(float64); ok {
+			return []*oas3.Schema{ConstInteger(int64(math.Ceil(f)))}, nil
+		}
+	}
+
+	return []*oas3.Schema{IntegerType()}, nil
+}
+
+// builtinRound rounds to nearest integer
+func builtinRound(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeNumber(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Const folding
+	if val, ok := extractConstValue(input); ok {
+		if f, ok := val.(float64); ok {
+			return []*oas3.Schema{ConstInteger(int64(math.Round(f)))}, nil
+		}
+	}
+
+	return []*oas3.Schema{IntegerType()}, nil
+}
+
+// builtinSqrt computes square root
+func builtinSqrt(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeNumber(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Const folding
+	if val, ok := extractConstValue(input); ok {
+		if f, ok := val.(float64); ok {
+			if f < 0 {
+				return []*oas3.Schema{ConstNull()}, nil
+			}
+			return []*oas3.Schema{ConstNumber(math.Sqrt(f))}, nil
+		}
+	}
+
+	// Domain analysis: if definitely non-negative, return number
+	if input.Minimum != nil && *input.Minimum >= 0 {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+
+	// Might be negative → number|null
+	return []*oas3.Schema{Union([]*oas3.Schema{NumberType(), ConstNull()}, env.opts)}, nil
+}
+
+// builtinLog computes natural logarithm
+func builtinLog(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeNumber(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Const folding
+	if val, ok := extractConstValue(input); ok {
+		if f, ok := val.(float64); ok {
+			if f <= 0 {
+				return []*oas3.Schema{ConstNull()}, nil
+			}
+			return []*oas3.Schema{ConstNumber(math.Log(f))}, nil
+		}
+	}
+
+	// Domain analysis: if definitely positive, return number
+	if input.Minimum != nil && *input.Minimum > 0 {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+
+	// Might be ≤0 → number|null
+	return []*oas3.Schema{Union([]*oas3.Schema{NumberType(), ConstNull()}, env.opts)}, nil
+}
+
+// builtinExp computes e^x
+func builtinExp(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeNumber(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Const folding
+	if val, ok := extractConstValue(input); ok {
+		if f, ok := val.(float64); ok {
+			return []*oas3.Schema{ConstNumber(math.Exp(f))}, nil
+		}
+	}
+
+	return []*oas3.Schema{NumberType()}, nil
+}
+
+// builtinPow computes base^exponent
+func builtinPow(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeNumber(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	if len(args) == 0 {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+
+	// Const folding
+	if baseVal, ok := extractConstValue(input); ok {
+		if expVal, ok := extractConstValue(args[0]); ok {
+			if base, ok := baseVal.(float64); ok {
+				if exp, ok := expVal.(float64); ok {
+					result := math.Pow(base, exp)
+					if math.IsNaN(result) || math.IsInf(result, 0) {
+						return []*oas3.Schema{ConstNull()}, nil
+					}
+					return []*oas3.Schema{ConstNumber(result)}, nil
+				}
+			}
+		}
+	}
+
+	// Conservative: return number (might be null for invalid domains, but hard to detect)
+	return []*oas3.Schema{NumberType()}, nil
+}
+
+// ============================================================================
+// ARRAY GROUPING BUILTINS
+// ============================================================================
+
+// builtinGroupBy groups array elements by key expression
+func builtinGroupBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeArray(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Get item type
+	itemType := Top()
+	if input.Items != nil && input.Items.Left != nil {
+		itemType = input.Items.Left
+	} else if input.PrefixItems != nil && len(input.PrefixItems) > 0 {
+		// For tuples, union all items
+		items := make([]*oas3.Schema, 0, len(input.PrefixItems))
+		for _, item := range input.PrefixItems {
+			if item.Left != nil {
+				items = append(items, item.Left)
+			}
+		}
+		itemType = Union(items, env.opts)
+	}
+
+	// group_by: array<T> → array<array<T>>
+	return []*oas3.Schema{ArrayType(ArrayType(itemType))}, nil
+}
+
+// builtinSortBy sorts array by key expression
+func builtinSortBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeArray(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Sorting doesn't change schema - return input as-is
+	return []*oas3.Schema{input}, nil
+}
+
+// builtinUniqueBy removes duplicates by key expression
+func builtinUniqueBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeArray(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Dedup doesn't change schema - return input as-is
+	return []*oas3.Schema{input}, nil
+}
+
+// builtinMinMaxBy returns min/max element by key (reuses min/max logic)
+func builtinMinMaxBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	// Same as builtinMinMax - return single item from array
+	return builtinMinMax(input, args, env)
+}
+
+// ============================================================================
+// ARRAY MANIPULATION BUILTINS
+// ============================================================================
+
+// builtinFlatten flattens nested arrays
+func builtinFlatten(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeArray(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Determine flatten depth
+	depth := -1 // -1 means fully flatten
+	if len(args) > 0 {
+		if depthVal, ok := extractConstValue(args[0]); ok {
+			if d, ok := depthVal.(float64); ok {
+				depth = int(d)
+			}
+		}
+	}
+
+	result := flattenSchemaRecursive(input, depth, env.opts)
+	return []*oas3.Schema{result}, nil
+}
+
+// flattenSchemaRecursive recursively flattens array schema
+func flattenSchemaRecursive(schema *oas3.Schema, depth int, opts SchemaExecOptions) *oas3.Schema {
+	if depth == 0 || getType(schema) != "array" {
+		return schema
+	}
+
+	// Collect all item schemas
+	items := make([]*oas3.Schema, 0)
+
+	// Add prefixItems
+	if schema.PrefixItems != nil {
+		for _, item := range schema.PrefixItems {
+			if item.Left != nil {
+				items = append(items, item.Left)
+			}
+		}
+	}
+
+	// Add items schema
+	if schema.Items != nil && schema.Items.Left != nil {
+		items = append(items, schema.Items.Left)
+	}
+
+	if len(items) == 0 {
+		return ArrayType(Bottom())
+	}
+
+	// Flatten each item recursively
+	flattenedItems := make([]*oas3.Schema, 0)
+	for _, item := range items {
+		if getType(item) == "array" {
+			// Recursively flatten
+			flattened := flattenSchemaRecursive(item, depth-1, opts)
+			if getType(flattened) == "array" {
+				// Extract items from flattened result
+				if flattened.Items != nil && flattened.Items.Left != nil {
+					flattenedItems = append(flattenedItems, flattened.Items.Left)
+				}
+				if flattened.PrefixItems != nil {
+					for _, pi := range flattened.PrefixItems {
+						if pi.Left != nil {
+							flattenedItems = append(flattenedItems, pi.Left)
+						}
+					}
+				}
+			} else {
+				flattenedItems = append(flattenedItems, flattened)
+			}
+		} else {
+			// Already flat (non-array item)
+			flattenedItems = append(flattenedItems, item)
+		}
+	}
+
+	if len(flattenedItems) == 0 {
+		return ArrayType(Bottom())
+	}
+
+	// Union all flattened items
+	unionedType := Union(flattenedItems, opts)
+	return ArrayType(unionedType)
+}
+
+// builtinIndices finds all indices of value in array
+func builtinIndices(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeArray(input) && !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Return array of integers (can't determine which indices match)
+	return []*oas3.Schema{ArrayType(IntegerType())}, nil
+}
+
+// builtinIndex finds first index of value
+func builtinIndex(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeArray(input) && !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Return integer|null (might find, might not)
+	return []*oas3.Schema{Union([]*oas3.Schema{IntegerType(), ConstNull()}, env.opts)}, nil
+}
+
+// builtinRindex finds last index of value
+func builtinRindex(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeArray(input) && !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Return integer|null
+	return []*oas3.Schema{Union([]*oas3.Schema{IntegerType(), ConstNull()}, env.opts)}, nil
+}
+
+// builtinContains checks if input contains all elements from argument
+func builtinContains(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	// Conservative: return boolean (can't determine containment symbolically)
+	return []*oas3.Schema{BoolType()}, nil
+}
+
+// builtinInside checks if input is contained in argument
+func builtinInside(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	// Conservative: return boolean
+	return []*oas3.Schema{BoolType()}, nil
+}
+
+// ============================================================================
+// REGEX OPERATION BUILTINS
+// ============================================================================
+
+// builtinTest tests if string matches regex pattern
+func builtinTest(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	if len(args) == 0 {
+		return []*oas3.Schema{BoolType()}, nil
+	}
+
+	// Const folding: if both input and pattern are const
+	if inputStr, ok := extractConstString(input); ok {
+		if patternStr, ok := extractConstString(args[0]); ok {
+			matched, err := regexp.MatchString(patternStr, inputStr)
+			if err != nil {
+				// Invalid regex pattern - return boolean (unknown)
+				return []*oas3.Schema{BoolType()}, nil
+			}
+			return []*oas3.Schema{ConstBool(matched)}, nil
+		}
+	}
+
+	// Conservative: can't evaluate regex on symbolic input
+	return []*oas3.Schema{BoolType()}, nil
+}
+
+// builtinMatch returns match object for regex
+func builtinMatch(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	// Build match object schema
+	matchObj := BuildObject(map[string]*oas3.Schema{
+		"offset": IntegerType(),
+		"length": IntegerType(),
+		"string": StringType(),
+		"captures": ArrayType(BuildObject(map[string]*oas3.Schema{
+			"offset": Union([]*oas3.Schema{IntegerType(), ConstNull()}, env.opts),
+			"length": Union([]*oas3.Schema{IntegerType(), ConstNull()}, env.opts),
+			"string": Union([]*oas3.Schema{StringType(), ConstNull()}, env.opts),
+			"name":   Union([]*oas3.Schema{StringType(), ConstNull()}, env.opts),
+		}, []string{})),
+	}, []string{"offset", "length", "string", "captures"})
+
+	// Return match object | null (conservative - can't evaluate regex)
+	return []*oas3.Schema{Union([]*oas3.Schema{matchObj, ConstNull()}, env.opts)}, nil
+}
+
+// ============================================================================
+// INTERNAL BUILTINS
+// ============================================================================
+
+// builtinBreak signals iteration termination
+func builtinBreak(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	// Return empty to signal backtrack (terminates this execution path)
+	// The VM's opCall handler will treat this as no successors
+	return []*oas3.Schema{}, nil
+}
+
+// builtinAllocator is an internal allocator (no-op for symbolic execution)
+func builtinAllocator(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	// Return empty object (allocator doesn't affect schema)
+	return []*oas3.Schema{ObjectType()}, nil
+}
+
+// ============================================================================
 // PATH OPERATION BUILTINS
 // ============================================================================
 
@@ -514,6 +1163,54 @@ func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 
 	return []*oas3.Schema{result}, nil
 }
+
+// ============================================================================
+// STRING OPERATION HELPERS
+// ============================================================================
+
+// extractConstString extracts a const string value from a schema
+func extractConstString(schema *oas3.Schema) (string, bool) {
+	if val, ok := extractConstValue(schema); ok {
+		if s, ok := val.(string); ok {
+			return s, true
+		}
+	}
+	return "", false
+}
+
+// buildArrayOfConstStrings creates an array schema from const string values
+func buildArrayOfConstStrings(strs []string) *oas3.Schema {
+	if len(strs) == 0 {
+		return ArrayType(StringType())
+	}
+
+	prefixItems := make([]*oas3.Schema, len(strs))
+	for i, s := range strs {
+		prefixItems[i] = ConstString(s)
+	}
+	return BuildArray(StringType(), prefixItems)
+}
+
+// extractConstStringsFromTuple extracts const strings from tuple array
+func extractConstStringsFromTuple(schema *oas3.Schema) []string {
+	if schema.PrefixItems == nil {
+		return nil
+	}
+
+	strs := make([]string, 0, len(schema.PrefixItems))
+	for _, item := range schema.PrefixItems {
+		if item.Left != nil {
+			if s, ok := extractConstString(item.Left); ok {
+				strs = append(strs, s)
+			} else {
+				return nil // Non-const item
+			}
+		}
+	}
+	return strs
+}
+
+// Note: MightBeString and MightBeNumber are defined in schemaops.go
 
 // ============================================================================
 // HELPER FUNCTIONS
