@@ -1,0 +1,20 @@
+type: object
+properties:
+  tags:
+    type: array
+    items:
+      type: object
+      properties:
+        value: {}
+        slug: {}
+        length:
+          type: number
+          minimum: 0
+      required:
+        - length
+        - slug
+        - value
+  primarySlug: {}
+required:
+  - primarySlug
+  - tags

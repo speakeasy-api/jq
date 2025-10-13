@@ -1,0 +1,24 @@
+type: object
+properties:
+  data:
+    type: object
+    properties:
+      result:
+        type: array
+        items:
+          type: object
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+            active:
+              type: boolean
+      meta:
+        type: object
+        properties:
+          timestamp:
+            type: string
+            format: date-time
+          version:
+            type: integer

@@ -1,0 +1,24 @@
+type: object
+properties:
+  data:
+    type: object
+    properties:
+      items:
+        type: array
+        items:
+          type: object
+          properties:
+            id:
+              type: string
+            title:
+              type: string
+            active:
+              type: boolean
+      pagination:
+        type: object
+        properties:
+          nextCursor:
+            type: string
+            nullable: true
+          total:
+            type: integer

@@ -1,0 +1,32 @@
+type: object
+properties:
+  items:
+    type: array
+    items:
+      type: object
+      properties:
+        id: {}
+        title: {}
+        status:
+          type: string
+          enum:
+            - inactive
+            - active
+      required:
+        - status
+        - title
+        - id
+  hasMore:
+    type: boolean
+  total:
+    type: integer
+  nextCursor:
+    anyOf:
+      - type: string
+        nullable: true
+      - type: "null"
+required:
+  - nextCursor
+  - total
+  - hasMore
+  - items

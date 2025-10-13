@@ -1,9 +1,48 @@
 package playground
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
+
+// loadTestSchema loads a schema from testdata directory
+func loadTestSchema(t *testing.T, filename string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", filename))
+	if err != nil {
+		t.Fatalf("Failed to read %s: %v", filename, err)
+	}
+	var schema map[string]any
+	if err := yaml.Unmarshal(data, &schema); err != nil {
+		t.Fatalf("Failed to parse %s: %v", filename, err)
+	}
+	return schema
+}
+
+// normalizeSchema converts YAML to canonical form for comparison
+func normalizeSchema(yamlStr string) (map[string]any, error) {
+	var schema map[string]any
+	if err := yaml.Unmarshal([]byte(yamlStr), &schema); err != nil {
+		return nil, err
+	}
+	return schema, nil
+}
+
+// compareSchemas compares two schemas for structural equality
+func compareSchemas(t *testing.T, name string, expected, actual map[string]any) {
+	t.Helper()
+	expectedYAML, _ := yaml.Marshal(expected)
+	actualYAML, _ := yaml.Marshal(actual)
+
+	if string(expectedYAML) != string(actualYAML) {
+		t.Errorf("%s schema mismatch:\nExpected:\n%s\n\nActual:\n%s",
+			name, string(expectedYAML), string(actualYAML))
+	}
+}
 
 func TestSymbolicExecuteJQ(t *testing.T) {
 	oasYAML := `openapi: 3.0.0
@@ -315,6 +354,164 @@ components:
 	if !strings.Contains(result, "street") {
 		t.Errorf("Expected transformed schema to contain 'street' property.\nResult:\n%s", result)
 	}
+}
+
+// TestSymbolicExecuteJQ_WithGoldenFiles tests schema transformation with expected output validation
+func TestSymbolicExecuteJQ_WithGoldenFiles(t *testing.T) {
+	tests := []struct {
+		name             string
+		jqExpr           string
+		schemaKey        string
+		skipIteration2   bool
+		iteration2XFail  bool
+	}{
+		{
+			name:      "TestSymbolicExecuteJQ_UserInput",
+			jqExpr:    "{userId: .id, displayName: .name, tier: (if .score >= 90 then \"gold\" else \"silver\" end), location: {city: .address.city, zip: .address.postalCode}}",
+			schemaKey: "UserInput",
+		},
+		{
+			name:      "TestSymbolicExecuteJQ_ProductInput",
+			jqExpr:    "{productId: .id, displayName: .name, total: (.price * .quantity), tags: (.tags | map({value: .}))}",
+			schemaKey: "ProductInput",
+		},
+		{
+			name:      "TestSymbolicExecuteJQ_CartInput",
+			jqExpr:    "{grandTotal: (.items | map(.price * .quantity) | add // 0), items: (.items | map({sku, total: (.price * .quantity)}))}",
+			schemaKey: "CartInput",
+		},
+		{
+			name:      "TestSymbolicExecuteJQ_NestedTransformation",
+			jqExpr:    "{street, zipcode: .zip}",
+			schemaKey: "Address",
+		},
+		{
+			name:      "EntityResponse",
+			jqExpr:    ". + {id: .data.result[0].id}",
+			schemaKey: "EntityResponse",
+		},
+		{
+			name:            "PaginatedItemsResponse",
+			jqExpr:          "{items: (.data.items // []) | map({id: .id, title: .title, status: (if (.active // false) then \"active\" else \"inactive\" end)}), hasMore: (.data.pagination.nextCursor != null), total: (.data.pagination.total // 0), nextCursor: (.data.pagination.nextCursor // null)}",
+			schemaKey:       "PaginatedItemsResponse",
+			iteration2XFail: true, // Stack underflow on iteration 2 - known bug with complex // operator chains
+		},
+		{
+			name:      "TagList",
+			jqExpr:    "{tags: (.tags // []) | map({value: ., slug: (. | ascii_downcase | gsub(\"[^a-z0-9]+\"; \"-\") | gsub(\"(^-|-$)\"; \"\")), length: (. | length)}), primarySlug: ((.tags[0] // null) | if . == null then null else (. | ascii_downcase | gsub(\"[^a-z0-9]+\"; \"-\") | gsub(\"(^-|-$)\"; \"\")) end)}",
+			schemaKey: "TagList",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Load input schema
+			inputSchema := loadTestSchema(t, tt.name+".in.yaml")
+
+			// Build OAS document
+			oasYAML := buildOASWithJQ(tt.schemaKey, inputSchema, tt.jqExpr)
+
+			// Execute iteration 1
+			result1, err := SymbolicExecuteJQ(oasYAML)
+			if err != nil {
+				t.Fatalf("Iteration 1 failed: %v", err)
+			}
+
+			// Parse result and extract the transformed schema
+			var oasDoc map[string]any
+			if err := yaml.Unmarshal([]byte(result1), &oasDoc); err != nil {
+				t.Fatalf("Failed to parse iteration 1 result: %v", err)
+			}
+
+			actualIter1 := extractSchema(t, oasDoc, tt.schemaKey)
+			expectedIter1 := loadTestSchema(t, tt.name+".out.1.yaml")
+
+			// Compare iteration 1
+			t.Logf("Comparing iteration 1 output...")
+			compareSchemas(t, "Iteration 1", expectedIter1, actualIter1)
+
+			// Skip iteration 2 if requested
+			if tt.skipIteration2 {
+				t.Log("Skipping iteration 2 as requested")
+				return
+			}
+
+			// Execute iteration 2 (apply transform to iteration 1 output)
+			oasYAML2 := buildOASWithJQ(tt.schemaKey, actualIter1, tt.jqExpr)
+			result2, err := SymbolicExecuteJQ(oasYAML2)
+
+			// Handle expected failures
+			if tt.iteration2XFail {
+				if err != nil {
+					t.Logf("Iteration 2 failed as expected: %v", err)
+					return
+				}
+				t.Error("Iteration 2 should have failed but didn't - bug may be fixed!")
+			}
+
+			if err != nil {
+				t.Fatalf("Iteration 2 failed: %v", err)
+			}
+
+			var oasDoc2 map[string]any
+			if err := yaml.Unmarshal([]byte(result2), &oasDoc2); err != nil {
+				t.Fatalf("Failed to parse iteration 2 result: %v", err)
+			}
+
+			actualIter2 := extractSchema(t, oasDoc2, tt.schemaKey)
+			expectedIter2 := loadTestSchema(t, tt.name+".out.2.yaml")
+
+			// Compare iteration 2
+			t.Logf("Comparing iteration 2 output...")
+			compareSchemas(t, "Iteration 2", expectedIter2, actualIter2)
+		})
+	}
+}
+
+// buildOASWithJQ builds an OAS YAML document with a schema and JQ transform
+func buildOASWithJQ(schemaKey string, schema map[string]any, jqExpr string) string {
+	// Add the JQ transform to the schema
+	schema["x-speakeasy-transform-from-api"] = map[string]any{
+		"jq": jqExpr,
+	}
+
+	oasDoc := map[string]any{
+		"openapi": "3.1.0",
+		"info": map[string]any{
+			"title":   "Test",
+			"version": "1.0.0",
+		},
+		"components": map[string]any{
+			"schemas": map[string]any{
+				schemaKey: schema,
+			},
+		},
+	}
+
+	yamlBytes, _ := yaml.Marshal(oasDoc)
+	return string(yamlBytes)
+}
+
+// extractSchema extracts a schema from an OAS document
+func extractSchema(t *testing.T, oasDoc map[string]any, schemaKey string) map[string]any {
+	t.Helper()
+	components, ok := oasDoc["components"].(map[string]any)
+	if !ok {
+		t.Fatal("No components in OAS document")
+	}
+	schemas, ok := components["schemas"].(map[string]any)
+	if !ok {
+		t.Fatal("No schemas in components")
+	}
+	schema, ok := schemas[schemaKey].(map[string]any)
+	if !ok {
+		t.Fatalf("Schema %s not found", schemaKey)
+	}
+
+	// Remove the JQ transform extension for comparison
+	delete(schema, "x-speakeasy-transform-from-api")
+
+	return schema
 }
 
 // Pipeline Tests for SymbolicExecuteJQPipeline

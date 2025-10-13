@@ -1,0 +1,9 @@
+type: object
+properties:
+  street:
+    type: string
+  zipcode:
+    type: "null"
+required:
+  - zipcode
+  - street
