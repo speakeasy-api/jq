@@ -27,6 +27,13 @@ type SchemaExecOptions struct {
 	// 1 = conservative (keep types, drop facets when limits exceeded)
 	// 2 = aggressive (collapse to Top when limits exceeded)
 	WideningLevel int // default: 1
+
+	// Logging configuration
+	LogLevel             string // Log level: "error", "warn", "info", "debug" (default: "warn")
+	LogMaxEnumValues     int    // Max enum values to show in logs (default: 5)
+	LogMaxProps          int    // Max object properties to show in logs (default: 5)
+	LogStackPreviewDepth int    // Max stack depth to preview in logs (default: 3)
+	LogSchemaDeltas      bool   // If true, include schema deltas in debug logs (default: true)
 }
 
 // SchemaExecResult contains the output schema and diagnostic information.
@@ -38,12 +45,17 @@ type SchemaExecResult struct {
 // DefaultOptions returns the default configuration for schema execution.
 func DefaultOptions() SchemaExecOptions {
 	return SchemaExecOptions{
-		AnyOfLimit:     10,
-		EnumLimit:      50,
-		MaxDepth:       100,
-		StrictMode:     false,
-		EnableWarnings: true,
-		EnableMemo:     true,
-		WideningLevel:  1,
+		AnyOfLimit:           10,
+		EnumLimit:            50,
+		MaxDepth:             100,
+		StrictMode:           false,
+		EnableWarnings:       true,
+		EnableMemo:           true,
+		WideningLevel:        1,
+		LogLevel:             "warn",
+		LogMaxEnumValues:     5,
+		LogMaxProps:          5,
+		LogStackPreviewDepth: 3,
+		LogSchemaDeltas:      true,
 	}
 }

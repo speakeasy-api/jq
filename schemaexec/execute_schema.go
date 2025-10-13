@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"time"
 
 	gojq "github.com/speakeasy-api/jq"
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
@@ -21,6 +22,8 @@ type schemaEnv struct {
 	pc       int
 	warnings []string
 	scopes   *scopeFrames // Scope frame stack for variable management
+	logger   Logger       // Logger for debug tracing
+	execID   string       // Unique execution ID
 }
 
 // scopeFrames manages nested variable scopes.
@@ -75,8 +78,9 @@ func (sf *scopeFrames) load(key string) (*oas3.Schema, bool) {
 
 // codeOp represents a bytecode operation for schema execution.
 type codeOp struct {
-	op    int // Opcode as int (from GetOp())
-	value any // Opcode value
+	op     int    // Opcode as int (from GetOp())
+	value  any    // Opcode value
+	opName string // Opcode name string (from OpString())
 }
 
 // Opcode constants matching gojq's internal opcodes
@@ -118,12 +122,26 @@ func newSchemaEnv(ctx context.Context, opts SchemaExecOptions) *schemaEnv {
 	scopes := newScopeFrames()
 	scopes.pushFrame() // Initial global frame
 
+	// Create logger
+	var logger Logger
+	if opts.LogLevel != "" {
+		level := ParseLogLevel(opts.LogLevel)
+		logger = NewLogger(level, nil)
+	} else {
+		logger = newNoopLogger()
+	}
+
+	// Generate unique execution ID
+	execID := fmt.Sprintf("e%d", time.Now().UnixNano()%1000000)
+
 	return &schemaEnv{
 		ctx:      ctx,
 		opts:     opts,
 		stack:    newSchemaStack(),
 		warnings: make([]string, 0),
 		scopes:   scopes,
+		logger:   logger,
+		execID:   execID,
 	}
 }
 
@@ -137,8 +155,9 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 	env.codes = make([]codeOp, len(rawCodes))
 	for i, rc := range rawCodes {
 		env.codes[i] = codeOp{
-			op:    getCodeOp(rc),
-			value: getCodeValue(rc),
+			op:     getCodeOp(rc),
+			value:  getCodeValue(rc),
+			opName: getCodeOpName(rc),
 		}
 	}
 
@@ -148,6 +167,12 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 	// Create worklist
 	worklist := newStateWorklist()
 	worklist.push(initialState)
+
+	// Log execution start
+	env.logger.With(map[string]any{
+		"exec":  env.execID,
+		"codes": len(env.codes),
+	}).Infof("Starting symbolic execution")
 
 	// Outputs accumulator
 	outputs := make([]*oas3.Schema, 0)
@@ -199,8 +224,17 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		// Execute one step
 		if state.pc >= len(env.codes) {
 			// Terminal state - collect output
-			if state.top() != nil {
-				outputs = append(outputs, state.top())
+			outputSchema := state.top()
+			if outputSchema != nil {
+				outputs = append(outputs, outputSchema)
+
+				// Log terminal state
+				env.logger.With(map[string]any{
+					"exec":    env.execID,
+					"state":   fmt.Sprintf("s%d", state.id),
+					"lineage": state.lineage,
+					"result":  schemaTypeSummary(outputSchema, 1),
+				}).Debugf("Terminal state reached")
 			}
 			// Save reference to shared maps (all states share the same maps)
 			if sharedAccum == nil && state.accum != nil {
@@ -212,14 +246,46 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 
 		code := env.codes[state.pc]
 
+		// Log before opcode execution
+		topType := "empty"
+		if state.top() != nil {
+			topType = schemaTypeSummary(state.top(), 1)
+		}
+		env.logger.With(map[string]any{
+			"exec":    env.execID,
+			"state":   fmt.Sprintf("s%d", state.id),
+			"lineage": state.lineage,
+			"pc":      state.pc,
+			"op":      code.opName,
+			"depth":   state.depth,
+			"stack":   len(state.stack),
+			"top":     topType,
+		}).Debugf("Executing %s", code.opName)
+
 		// Execute opcode on this state
 		newStates, err := env.executeOpMultiState(state, &code)
 		if err != nil {
-			return nil, fmt.Errorf("error at pc=%d op=%d: %w", state.pc, code.op, err)
+			return nil, fmt.Errorf("error at pc=%d op=%s: %w", state.pc, code.opName, err)
 		}
 
-		// Add successor states to worklist
+		// Assign IDs to successor states and log their creation
 		for _, newState := range newStates {
+			// Assign new state ID if this is a new state (not the same as parent)
+			if newState != state && newState.id == state.id {
+				newState.id = worklist.nextStateID
+				worklist.nextStateID++
+				newState.parentID = state.id
+
+				// Log successor creation
+				env.logger.With(map[string]any{
+					"exec":     env.execID,
+					"state":    fmt.Sprintf("s%d", newState.id),
+					"parent":   fmt.Sprintf("s%d", newState.parentID),
+					"lineage":  newState.lineage,
+					"pc":       newState.pc,
+					"op":       code.opName,
+				}).Debugf("Created successor state")
+			}
 			worklist.push(newState)
 		}
 	}
@@ -242,6 +308,14 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 	if sharedAccum != nil && sharedSchemaToAlloc != nil {
 		result = env.materializeArrays(result, sharedAccum, sharedSchemaToAlloc)
 	}
+
+	// Log execution completion
+	env.logger.With(map[string]any{
+		"exec":        env.execID,
+		"outputs":     len(outputs),
+		"result_type": schemaTypeSummary(result, 1),
+		"warnings":    len(env.warnings),
+	}).Infof("Execution completed")
 
 	return &SchemaExecResult{
 		Schema:   result,
@@ -417,9 +491,11 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		// Create two states: one continues (success), one jumps (error handler)
 		continueState := state.clone()
 		continueState.pc++
+		continueState.lineage = state.lineage + ".S" // Success branch
 
 		errorState := state.clone()
 		errorState.pc = targetPC
+		errorState.lineage = state.lineage + ".E" // Error branch
 
 		return []*execState{continueState, errorState}, nil
 
@@ -778,8 +854,14 @@ func (env *schemaEnv) execObject(c *codeOp) error {
 
 // addWarning adds a warning message to the execution result.
 func (env *schemaEnv) addWarning(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+
+	// Always log warnings via logger
+	env.logger.Warnf("%s", msg)
+
+	// Also collect in warnings array if enabled
 	if env.opts.EnableWarnings {
-		env.warnings = append(env.warnings, fmt.Sprintf(format, args...))
+		env.warnings = append(env.warnings, msg)
 	}
 }
 
@@ -799,6 +881,15 @@ func getCodeValue(c any) any {
 		return code.GetValue()
 	}
 	return nil
+}
+
+// getCodeOpName extracts the opcode name string from gojq's code.
+func getCodeOpName(c any) string {
+	// Access via the public OpString method we added to code
+	if code, ok := c.(interface{ OpString() string }); ok {
+		return code.OpString()
+	}
+	return "unknown"
 }
 
 // isSliceIndex checks if index is an array slice (e.g., .[1:], .[:2], .[1:3])
@@ -1161,10 +1252,12 @@ func (env *schemaEnv) execFork(state *execState, c *codeOp) ([]*execState, error
 	// Create two states: one continues, one jumps to target
 	continueState := state.clone()
 	continueState.pc++
+	continueState.lineage = state.lineage + ".C" // Continue branch
 
 	forkState := state.clone()
 	forkState.pc = targetPC
 	forkState.depth++
+	forkState.lineage = state.lineage + ".F" // Fork branch
 
 	// Return fork target FIRST, continue SECOND
 	// This ensures LIFO worklist processes continue state first,
@@ -1201,8 +1294,10 @@ func (env *schemaEnv) execJumpIfNot(state *execState, c *codeOp) ([]*execState, 
 	// Conservative: explore both paths
 	jumpState := state.clone()
 	jumpState.pc = c.value.(int)
+	jumpState.lineage = state.lineage + ".F" // False branch (jump)
 
 	continueState := state.clone()
+	continueState.lineage = state.lineage + ".T" // True branch (continue)
 	// NOTE: Do NOT increment pc here - it's already been incremented by the framework
 	// before calling this handler (see executeOpMultiState line 224)
 

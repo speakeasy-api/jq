@@ -27,6 +27,11 @@ type execState struct {
 	// Path collection (for del/getpath/setpath operations)
 	pathMode    bool          // Are we collecting a path (between opPathBegin/opPathEnd)?
 	currentPath []PathSegment // Current path segments being collected
+
+	// State tracking for logging
+	id       int    // Unique state ID
+	parentID int    // Parent state ID (0 for root)
+	lineage  string // Lineage string (e.g., "0", "0.F", "0.F.C")
 }
 
 // PathSegment represents one segment of a path expression
@@ -75,6 +80,9 @@ func (s *execState) clone() *execState {
 		callstack:     callstackCopy,
 		pathMode:      s.pathMode,
 		currentPath:   pathCopy,
+		id:            s.id,       // Clone inherits ID initially, will be reassigned
+		parentID:      s.parentID, // Clone inherits parent
+		lineage:       s.lineage,  // Clone inherits lineage, will be extended
 	}
 }
 
@@ -279,6 +287,9 @@ func newExecState(input *oas3.Schema) *execState {
 		schemaToAlloc: make(map[*oas3.Schema]string), // Schema → allocID mapping
 		allocCounter:  &counter,                       // Shared counter (pointer)
 		callstack:     make([]int, 0, 8),
+		id:            0,    // Initial state ID
+		parentID:      0,    // Root has no parent
+		lineage:       "0",  // Root lineage
 	}
 	state.pushFrame() // Initial global frame
 	state.push(input) // Push input onto stack
@@ -287,15 +298,17 @@ func newExecState(input *oas3.Schema) *execState {
 
 // stateWorklist manages the queue of states to execute.
 type stateWorklist struct {
-	states []*execState
-	seen   map[uint64]bool // Memoization: fingerprint → visited
+	states       []*execState
+	seen         map[uint64]bool // Memoization: fingerprint → visited
+	nextStateID  int             // Monotonic counter for state IDs
 }
 
 // newStateWorklist creates a new worklist.
 func newStateWorklist() *stateWorklist {
 	return &stateWorklist{
-		states: make([]*execState, 0, 32),
-		seen:   make(map[uint64]bool),
+		states:      make([]*execState, 0, 32),
+		seen:        make(map[uint64]bool),
+		nextStateID: 1, // Start from 1 (0 is reserved for root)
 	}
 }
 
