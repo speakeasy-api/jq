@@ -1,9 +1,17 @@
 type: object
+x-speakeasy-transform-from-api:
+  jq: '{grandTotal: (.items | map(.price * .quantity) | add // 0), items: (.items | map({sku, total: (.price * .quantity)}))}'
+required:
+  - items
 properties:
   items:
     type: array
     items:
       type: object
+      required:
+        - sku
+        - price
+        - quantity
       properties:
         sku:
           type: string

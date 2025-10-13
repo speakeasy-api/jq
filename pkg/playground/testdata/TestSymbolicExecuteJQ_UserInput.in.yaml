@@ -1,4 +1,11 @@
 type: object
+x-speakeasy-transform-from-api:
+  jq: '{userId: .id, displayName: .name, tier: (if .score >= 90 then "gold" else "silver" end), location: {city: .address.city, zip: .address.postalCode}}'
+required:
+  - id
+  - name
+  - score
+  - address
 properties:
   id:
     type: integer
@@ -8,6 +15,9 @@ properties:
     type: integer
   address:
     type: object
+    required:
+      - city
+      - postalCode
     properties:
       city:
         type: string

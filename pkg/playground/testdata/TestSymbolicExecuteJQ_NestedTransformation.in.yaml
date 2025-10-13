@@ -1,6 +1,13 @@
 type: object
+x-speakeasy-transform-from-api:
+  jq: '{street, zipcode: .zip}'
+x-speakeasy-transform-to-api:
+  jq: '{street, zip: .zipcode}'
 properties:
   street:
     type: string
   zip:
     type: string
+required:
+  - street
+  - zip

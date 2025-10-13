@@ -1,4 +1,8 @@
 type: object
+x-speakeasy-transform-from-api:
+  jq: '{tags: (.tags // []) | map({value: ., slug: (. | ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("(^-|-$)"; "")), length: (. | length)}), primarySlug: ((.tags[0] // null) | if . == null then null else (. | ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("(^-|-$)"; "")) end)}'
+x-speakeasy-transform-to-api:
+  jq: '{tags: (.tags // []) | map(.value)}'
 properties:
   tags:
     type: array

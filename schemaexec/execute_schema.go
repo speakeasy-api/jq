@@ -1123,7 +1123,7 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 		} else if priorIsTuple {
 			// Multiple paths - create anyOf to preserve both tuples
 			unionedItems = &oas3.Schema{
-				Type:  oas3.NewTypeFromString(oas3.SchemaTypeArray),
+				Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
 				AnyOf: []*oas3.JSONSchema[oas3.Referenceable]{
 					oas3.NewJSONSchemaFromSchema[oas3.Referenceable](priorItems),
 					oas3.NewJSONSchemaFromSchema[oas3.Referenceable](val),

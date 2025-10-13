@@ -1,6 +1,7 @@
 package schemaexec
 
 import (
+	"sort"
 	"strconv"
 
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
@@ -333,7 +334,6 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 			return nil
 		}
 	}
-
 
 	// All must have identical required sets (critical for correctness)
 	if !haveSameRequiredSets(schemas) {
@@ -770,9 +770,16 @@ func widenUnion(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 // Simplified version for Phase 1.
 func BuildObject(props map[string]*oas3.Schema, required []string) *oas3.Schema {
 	propMap := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
-	for k, v := range props {
+	keysInOrder := make([]string, 0, len(props))
+	for k := range props {
+		keysInOrder = append(keysInOrder, k)
+	}
+	sort.Strings(keysInOrder)
+	for _, k := range keysInOrder {
+		v := props[k]
 		propMap.Set(k, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](v))
 	}
+	sort.Strings(required)
 
 	schema := &oas3.Schema{
 		Type:       oas3.NewTypeFromString(oas3.SchemaTypeObject),
@@ -1228,8 +1235,10 @@ func isSubschemaOf(a, b *oas3.Schema) bool {
 //
 // This function identifies such schemas so they can be filtered during merging to
 // preserve precision. For example, when merging property schemas from multiple paths:
-//   Path 1: {id: {type: string}}  (concrete)
-//   Path 2: {id: {}}              (unknown/lost precision)
+//
+//	Path 1: {id: {type: string}}  (concrete)
+//	Path 2: {id: {}}              (unknown/lost precision)
+//
 // We want to keep {type: string}, not the empty schema.
 func isUnconstrainedSchema(s *oas3.Schema) bool {
 	if s == nil {

@@ -1,4 +1,8 @@
 type: object
+x-speakeasy-transform-from-api:
+  jq: '{items: (.data.items // []) | map({id: .id, title: .title, status: (if (.active // false) then "active" else "inactive" end)}), hasMore: (.data.pagination.nextCursor != null), total: (.data.pagination.total // 0), nextCursor: (.data.pagination.nextCursor // null)}'
+x-speakeasy-transform-to-api:
+  jq: '{data: {items: (.items // []) | map({id: .id, title: .title, active: (.status == "active")}), pagination: {nextCursor: .nextCursor, total: (.total // 0)}}}'
 properties:
   data:
     type: object

@@ -1,0 +1,26 @@
+type: object
+properties:
+  userId:
+    type: integer
+  displayName:
+    type: string
+  tier:
+    type: string
+    enum:
+      - silver
+      - gold
+  location:
+    type: object
+    properties:
+      city:
+        type: string
+      zip:
+        type: string
+    required:
+      - city
+      - zip
+required:
+  - displayName
+  - location
+  - tier
+  - userId

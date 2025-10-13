@@ -1,0 +1,19 @@
+type: object
+properties:
+  grandTotal:
+    type: number
+  items:
+    type: array
+    items:
+      type: object
+      properties:
+        sku:
+          type: string
+        total:
+          type: number
+      required:
+        - sku
+        - total
+required:
+  - grandTotal
+  - items

@@ -1,4 +1,10 @@
 type: object
+x-speakeasy-transform-from-api:
+  jq: '. + {id: .data.result[0].id}'
+x-speakeasy-transform-to-api:
+  jq: '{data}'
+required:
+  - data
 properties:
   data:
     type: object

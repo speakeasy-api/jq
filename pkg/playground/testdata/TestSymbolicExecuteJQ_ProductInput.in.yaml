@@ -1,4 +1,12 @@
 type: object
+x-speakeasy-transform-from-api:
+  jq: '{productId: .id, displayName: .name, total: (.price * .quantity), tags: (.tags | map({value: .}))}'
+required:
+  - id
+  - name
+  - price
+  - quantity
+  - tags
 properties:
   id:
     type: string
