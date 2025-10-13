@@ -1,4 +1,4 @@
-module github.com/itchyny/gojq
+module github.com/speakeasy-api/jq
 
 go 1.22
 
