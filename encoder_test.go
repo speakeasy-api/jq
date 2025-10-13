@@ -7,7 +7,7 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/itchyny/gojq"
+	"github.com/speakeasy-api/jq"
 )
 
 func TestMarshal(t *testing.T) {

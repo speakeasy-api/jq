@@ -12,7 +12,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/itchyny/gojq"
+	"github.com/speakeasy-api/jq"
 )
 
 func ExampleCompile() {

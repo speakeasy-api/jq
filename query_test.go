@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/itchyny/gojq"
+	"github.com/speakeasy-api/jq"
 )
 
 func ExampleQuery_Run() {

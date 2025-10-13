@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/itchyny/gojq"
+	"github.com/speakeasy-api/jq"
 )
 
 func TestWithModuleLoaderError(t *testing.T) {

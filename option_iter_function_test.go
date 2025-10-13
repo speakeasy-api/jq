@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/itchyny/gojq"
+	"github.com/speakeasy-api/jq"
 )
 
 // Implementation of range/2 using WithIterFunction option.
