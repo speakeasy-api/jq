@@ -17,9 +17,8 @@ properties:
         - slug
         - value
   primarySlug:
-    anyOf:
-      - type: string
-      - type: "null"
+    type: string
+    nullable: true
 required:
   - primarySlug
   - tags

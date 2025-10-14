@@ -235,6 +235,30 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		return collapsed[0]
 	}
 
+	// NULLABLE OPTIMIZATION: Convert [type, null] to {type: T, nullable: true}
+	// This simplifies anyOf: [{type: string}, {type: null}] → {type: string, nullable: true}
+	if len(collapsed) == 2 {
+		var nullSchema *oas3.Schema
+		var otherSchema *oas3.Schema
+
+		for _, s := range collapsed {
+			if getType(s) == "null" {
+				nullSchema = s
+			} else if getType(s) != "" {
+				otherSchema = s
+			}
+		}
+
+		// If we have exactly one null and one non-null typed schema, merge to nullable
+		if nullSchema != nil && otherSchema != nil {
+			// Clone the non-null schema to avoid mutation
+			result := cloneSchema(otherSchema)
+			nullable := true
+			result.Nullable = &nullable
+			return result
+		}
+	}
+
 	// Try to merge compatible arrays into a single array
 	if merged := tryMergeArrays(collapsed, opts); merged != nil {
 		return merged
@@ -768,6 +792,16 @@ func widenUnion(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 			WideningLevel: 1,
 		})
 	}
+}
+
+// cloneSchema creates a shallow copy of a schema to avoid mutation
+func cloneSchema(s *oas3.Schema) *oas3.Schema {
+	if s == nil {
+		return nil
+	}
+	// Create shallow copy
+	clone := *s
+	return &clone
 }
 
 // BuildObject creates an object schema from property map.
