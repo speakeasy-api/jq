@@ -5,7 +5,8 @@ properties:
     items:
       type: object
       properties:
-        value: {}
+        value:
+          type: string
         slug:
           type: string
         length:

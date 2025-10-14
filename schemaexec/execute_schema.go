@@ -1054,23 +1054,29 @@ func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, 
 
 	switch baseType {
 	case "array":
-		if val.Items != nil && val.Items.Left != nil {
-			itemSchema = val.Items.Left
-			// Special case: if Items is Bottom (nil), this is an empty array constant
-			// Iterating it produces no values, but we still need to push something
-			// Push Bottom which will not affect the iteration
-			if itemSchema == nil {
-				env.addWarning("opIter: array items is Bottom (empty array), iterations will be skipped")
-				itemSchema = Bottom()
+		if val.Items != nil {
+			// Items field is set
+			if val.Items.Left != nil {
+				// Items.Left is set to actual schema
+				itemSchema = val.Items.Left
+			} else {
+				// Items.Left is nil, meaning Bottom (empty array with 0 elements)
+				// Iterating an empty array produces no values, terminate this execution path
+				return []*execState{}, nil
 			}
 		} else {
-			// An array with no `items` field is unconstrained; its items can be of any type (Top).
+			// Items field not set at all - unconstrained array, items can be any type
 			itemSchema = Top()
 		}
 	case "object":
 		itemSchema = unionAllObjectValues(val, env.opts)
 	default:
 		itemSchema = Bottom()
+	}
+
+	// Don't push Bottom - it should terminate paths earlier
+	if itemSchema == Bottom() {
+		return []*execState{}, nil
 	}
 
 	state.push(itemSchema)
@@ -1550,9 +1556,12 @@ func buildObjectFromLiteral(m map[string]any) *oas3.Schema {
 func buildArrayFromLiteral(arr []any) *oas3.Schema {
 	if len(arr) == 0 {
 		// Empty array constant: Use Bottom() as items to signify "no elements".
-		// When iterated, this will NOT push Top() but instead handle the empty case.
-		// When merged with real arrays via Union, tryMergeArrays will ignore the Bottom.
-		return ArrayType(Bottom())
+		// Items.Left = nil allows iteration to detect and skip empty arrays.
+		// Also set maxItems=0 for schema validation clarity.
+		emptyArray := ArrayType(Bottom())
+		maxItems := int64(0)
+		emptyArray.MaxItems = &maxItems
+		return emptyArray
 	}
 
 	// Build prefixItems for tuple if heterogeneous

@@ -128,9 +128,12 @@ func ArrayType(items *oas3.Schema) *oas3.Schema {
 	schema := &oas3.Schema{
 		Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
 	}
-	if items != nil {
-		schema.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](items)
-	}
+	// ALWAYS set Items field, even if items is nil (Bottom).
+	// This allows us to distinguish:
+	// - ArrayType(Bottom()) → Items.Left = nil (empty array, 0 elements)
+	// - ArrayType(StringType()) → Items.Left = StringType() (array of strings)
+	// - Unconstrained array → Items = nil (Items field not set at all)
+	schema.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](items)
 	return schema
 }
 
