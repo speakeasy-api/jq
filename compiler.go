@@ -10,16 +10,17 @@ import (
 )
 
 type compiler struct {
-	moduleLoader  ModuleLoader
-	environLoader func() []string
-	variables     []string
-	customFuncs   map[string]function
-	inputIter     Iter
-	codes         []*code
-	codeinfos     []codeinfo
-	builtinScope  *scopeinfo
-	scopes        []*scopeinfo
-	scopecnt      int
+	moduleLoader         ModuleLoader
+	environLoader        func() []string
+	variables            []string
+	customFuncs          map[string]function
+	inputIter            Iter
+	codes                []*code
+	codeinfos            []codeinfo
+	builtinScope         *scopeinfo
+	scopes               []*scopeinfo
+	scopecnt             int
+	skipLibraryExpansion map[string]bool // Skip inline expansion for these library functions
 }
 
 // Code is a compiled jq query.
@@ -943,29 +944,34 @@ func (c *compiler) compileFunc(e *Func) error {
 	if f := c.lookupBuiltin(e.Name, len(e.Args)); f != nil {
 		return c.compileCallPc(f, e.Args)
 	}
-	if fds, ok := builtinFuncDefs[e.Name]; ok {
-		var compiled bool
-		for _, fd := range fds {
-			if len(fd.Args) == len(e.Args) {
-				if err := c.compileFuncDef(fd, true); err != nil {
-					return err
+	// Check if we should skip library expansion for this function
+	// (used by symbolic execution to avoid inlining complex library functions)
+	skipExpansion := c.skipLibraryExpansion != nil && c.skipLibraryExpansion[e.Name]
+	if !skipExpansion {
+		if fds, ok := builtinFuncDefs[e.Name]; ok {
+			var compiled bool
+			for _, fd := range fds {
+				if len(fd.Args) == len(e.Args) {
+					if err := c.compileFuncDef(fd, true); err != nil {
+						return err
+					}
+					compiled = true
+					break
 				}
-				compiled = true
-				break
 			}
-		}
-		if !compiled {
-			switch e.Name {
-			case "_assign":
-				c.compileAssign()
-			case "_modify":
-				c.compileModify()
-			case "_last":
-				c.compileLast()
+			if !compiled {
+				switch e.Name {
+				case "_assign":
+					c.compileAssign()
+				case "_modify":
+					c.compileModify()
+				case "_last":
+					c.compileLast()
+				}
 			}
-		}
-		if f := c.lookupBuiltin(e.Name, len(e.Args)); f != nil {
-			return c.compileCallPc(f, e.Args)
+			if f := c.lookupBuiltin(e.Name, len(e.Args)); f != nil {
+				return c.compileCallPc(f, e.Args)
+			}
 		}
 	}
 	if fn, ok := internalFuncs[e.Name]; ok && fn.accept(len(e.Args)) {

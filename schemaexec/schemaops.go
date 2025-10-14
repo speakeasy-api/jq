@@ -308,8 +308,9 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 	}
 
 	if len(itemSchemas) == 0 {
-		// All arrays have empty items - return array with no item constraint
-		return ArrayType(nil)
+		// All arrays have empty/nil items - return array with Bottom() items
+		// This represents "no specific item type" which is correct for merging empty arrays
+		return ArrayType(Bottom())
 	}
 
 	// Union the item schemas
@@ -1352,16 +1353,34 @@ func arrayConstraintsSubsumed(a, b *oas3.Schema) bool {
 	}
 
 	// Check items: A.items must be subschema of B.items
-	if a.Items != nil && a.Items.Left != nil {
-		if b.Items == nil || b.Items.Left == nil {
-			// B has no item constraint, so A ⊆ B is true for items
-			return true
-		}
-		// Recursively check items
+	aHasItems := a.Items != nil && a.Items.Left != nil
+	bHasItems := b.Items != nil && b.Items.Left != nil
+
+	if aHasItems && !bHasItems {
+		// A has specific items, B doesn't
+		// This means A is MORE constrained, B is LESS constrained
+		// So B subsumes A (every array<string> is an array<any>)
+		// But we want to keep A (more specific) in Union!
+		// So return FALSE to prevent A from being removed
+		return false
+	}
+
+	if !aHasItems && bHasItems {
+		// A has no items (unconstrained), B has specific items
+		// A is less specific, so B does NOT subsume A
+		// But A might subsume B? No - A ⊆ B means A is stricter
+		// This case: A is less strict, so A is NOT subsumed by B
+		return false
+	}
+
+	if aHasItems && bHasItems {
+		// Both have items - recursively check
 		if !isSubschemaOf(a.Items.Left, b.Items.Left) {
 			return false
 		}
 	}
+
+	// If neither has items, they're equivalent for items purposes
 
 	// Check uniqueItems
 	if b.UniqueItems != nil && *b.UniqueItems {

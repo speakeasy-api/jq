@@ -222,6 +222,9 @@ func builtinValues(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*
 	// For objects: return array of value schemas
 	if MightBeObject(input) {
 		valueSchema := unionAllObjectValues(input, env.opts)
+		if valueSchema == nil {
+			valueSchema = Bottom()
+		}
 		return []*oas3.Schema{ArrayType(valueSchema)}, nil
 	}
 
@@ -587,7 +590,8 @@ func builtinRtrimstr(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([
 // builtinAsciiDowncase converts string to lowercase
 func builtinAsciiDowncase(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
 	if !MightBeString(input) {
-		return []*oas3.Schema{Bottom()}, nil
+		// Conservative: return string type (don't prune path completely)
+		return []*oas3.Schema{StringType()}, nil
 	}
 
 	// Const folding
@@ -620,7 +624,8 @@ func builtinAsciiDowncase(input *oas3.Schema, args []*oas3.Schema, env *schemaEn
 // builtinAsciiUpcase converts string to uppercase
 func builtinAsciiUpcase(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
 	if !MightBeString(input) {
-		return []*oas3.Schema{Bottom()}, nil
+		// Conservative: return string type
+		return []*oas3.Schema{StringType()}, nil
 	}
 
 	// Const folding
@@ -936,6 +941,9 @@ func flattenSchemaRecursive(schema *oas3.Schema, depth int, opts SchemaExecOptio
 
 	// Union all flattened items
 	unionedType := Union(flattenedItems, opts)
+	if unionedType == nil {
+		unionedType = Bottom()
+	}
 	return ArrayType(unionedType)
 }
 
@@ -1740,6 +1748,9 @@ func concatArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema 
 		}
 	}
 	// Widen to homogeneous array of merged items (drop tuple info for safe concat)
+	if mergedItems == nil {
+		mergedItems = Bottom()
+	}
 	return ArrayType(mergedItems)
 }
 

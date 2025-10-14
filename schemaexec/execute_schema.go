@@ -388,7 +388,8 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			next.push(val)
 		} else {
 			next.push(Top())
-			env.addWarning("variable %s not found", key)
+			env.addWarning("variable %s not found (scopeDepth=%d, state=%d, pc=%d) - pushing Top()",
+				key, len(next.scopes), next.id, next.pc)
 		}
 		return []*execState{next}, nil
 
@@ -1055,7 +1056,15 @@ func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, 
 	case "array":
 		if val.Items != nil && val.Items.Left != nil {
 			itemSchema = val.Items.Left
+			// Special case: if Items is Bottom (nil), this is an empty array constant
+			// Iterating it produces no values, but we still need to push something
+			// Push Bottom which will not affect the iteration
+			if itemSchema == nil {
+				env.addWarning("opIter: array items is Bottom (empty array), iterations will be skipped")
+				itemSchema = Bottom()
+			}
 		} else {
+			// An array with no `items` field is unconstrained; its items can be of any type (Top).
 			itemSchema = Top()
 		}
 	case "object":
@@ -1540,9 +1549,10 @@ func buildObjectFromLiteral(m map[string]any) *oas3.Schema {
 // buildArrayFromLiteral creates a schema from an array literal.
 func buildArrayFromLiteral(arr []any) *oas3.Schema {
 	if len(arr) == 0 {
-		// Empty array - items will be determined on first append
-		// Use nil (Bottom) so Union(nil, itemType) = itemType rather than Top
-		return ArrayType(nil)
+		// Empty array constant: Use Bottom() as items to signify "no elements".
+		// When iterated, this will NOT push Top() but instead handle the empty case.
+		// When merged with real arrays via Union, tryMergeArrays will ignore the Bottom.
+		return ArrayType(Bottom())
 	}
 
 	// Build prefixItems for tuple if heterogeneous

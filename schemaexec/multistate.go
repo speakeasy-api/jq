@@ -223,6 +223,7 @@ func (s *execState) push(schema *oas3.Schema) {
 // pop removes and returns the top schema.
 func (s *execState) pop() *oas3.Schema {
 	if len(s.stack) == 0 {
+		// Stack underflow - should not happen in correct bytecode
 		return nil
 	}
 	top := s.stack[len(s.stack)-1].Schema

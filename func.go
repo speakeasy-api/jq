@@ -205,6 +205,8 @@ func init() {
 		"error":          {argcount0 | argcount1, false, funcError},
 		"halt":           argFunc0(funcHalt),
 		"halt_error":     {argcount0 | argcount1, false, funcHaltError},
+		"gsub":           {argcount2 | argcount3, false, funcGsub},
+		"sub":            {argcount2 | argcount3, false, funcSub},
 	}
 }
 
@@ -2134,6 +2136,75 @@ func funcHaltError(v any, args []any) any {
 	}
 	return &HaltError{v, code}
 }
+
+// funcGsub implements global regex substitution (replace all matches).
+// Args: pattern (string), replacement (string), optional flags (string)
+func funcGsub(v any, args []any) any {
+	return funcSubInternal(v, args, true) // true = global (add 'g' flag)
+}
+
+// funcSub implements regex substitution (replace first match, or all if 'g' flag present).
+// Args: pattern (string), replacement (string), optional flags (string)
+func funcSub(v any, args []any) any {
+	return funcSubInternal(v, args, false) // false = not forced global
+}
+
+// funcSubInternal is the shared implementation for sub and gsub.
+func funcSubInternal(v any, args []any, forceGlobal bool) any {
+	if len(args) < 2 {
+		return &func0TypeError{"sub", v}
+	}
+
+	s, ok := v.(string)
+	if !ok {
+		return &func0TypeError{"sub", v}
+	}
+
+	pattern, ok := args[0].(string)
+	if !ok {
+		return &func0TypeError{"sub", args[0]}
+	}
+
+	replacement, ok := args[1].(string)
+	if !ok {
+		return &func0TypeError{"sub", args[1]}
+	}
+
+	flags := ""
+	if len(args) >= 3 && args[2] != nil {
+		flags, ok = args[2].(string)
+		if !ok {
+			return &func0TypeError{"sub", args[2]}
+		}
+	}
+
+	// For gsub, ensure 'g' flag is present
+	if forceGlobal && !strings.ContainsRune(flags, 'g') {
+		flags = flags + "g"
+	}
+
+	r, err := compileRegexp(pattern, flags)
+	if err != nil {
+		return err
+	}
+
+	// Check if global replacement
+	if strings.ContainsRune(flags, 'g') {
+		return r.ReplaceAllString(s, replacement)
+	}
+
+	// Replace only first match (no 'g' flag)
+	loc := r.FindStringIndex(s)
+	if loc == nil {
+		// No match found
+		return s
+	}
+
+	// Build result: prefix + replacement + suffix
+	return s[:loc[0]] + r.ReplaceAllString(s[loc[0]:loc[1]], replacement) + s[loc[1]:]
+}
+
+
 
 func toInt(x any) (int, bool) {
 	switch x := x.(type) {

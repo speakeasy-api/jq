@@ -6,7 +6,8 @@ properties:
       type: object
       properties:
         value: {}
-        slug: {}
+        slug:
+          type: string
         length:
           type: number
           minimum: 0
@@ -14,7 +15,10 @@ properties:
         - length
         - slug
         - value
-  primarySlug: {}
+  primarySlug:
+    anyOf:
+      - type: string
+      - type: "null"
 required:
   - primarySlug
   - tags

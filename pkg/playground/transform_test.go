@@ -365,7 +365,6 @@ func TestSymbolicExecuteJQ_WithGoldenFiles(t *testing.T) {
 	// Tests where 2-way round-trip is currently broken (even though to-api exists)
 	knownRoundTripFailures := []string{
 		"PaginatedItemsResponse", // Stack underflow on complex // chains
-		"TagList",                // gsub not implemented + precision loss
 	}
 
 	// Discover all test files automatically

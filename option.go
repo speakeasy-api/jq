@@ -94,3 +94,23 @@ func WithInputIter(inputIter Iter) CompilerOption {
 		c.inputIter = inputIter
 	}
 }
+
+// WithSkipLibraryExpansion is a compiler option that prevents inline expansion
+// of specified library functions from builtin.jq. Instead, these functions are
+// compiled as direct builtin calls, which can be handled by custom implementations
+// (e.g., in symbolic execution). This is useful for functions like "gsub" and "sub"
+// which have complex recursive implementations that cause precision loss during
+// symbolic execution.
+//
+// Functions specified here must have corresponding entries in internalFuncs.
+// For symbolic execution, schemaexec provides implementations in builtinRegistry.
+func WithSkipLibraryExpansion(names ...string) CompilerOption {
+	return func(c *compiler) {
+		if c.skipLibraryExpansion == nil {
+			c.skipLibraryExpansion = make(map[string]bool)
+		}
+		for _, name := range names {
+			c.skipLibraryExpansion[name] = true
+		}
+	}
+}
