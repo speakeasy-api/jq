@@ -1349,9 +1349,17 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 		}
 		input := state.pop()
 
-		// SPECIAL CASE: Path builtins have inverted calling convention
+		// SPECIAL CASE: Some builtins have inverted calling convention in jq bytecode
+		// The jq compiler pushes arguments in an inverted order for certain builtins
 		// For delpaths/getpath/setpath: input should be the object, not the paths array
-		if (funcName == "delpaths" || funcName == "getpath" || funcName == "setpath") && len(args) >= 1 {
+		// For split/join/startswith/endswith/ltrimstr/rtrimstr/index/indices:
+		//   input should be the string/array, not the separator/prefix/suffix/search value
+		// NOTE: test/_match/contains/inside do NOT need swapping (they use normal convention)
+		if (funcName == "delpaths" || funcName == "getpath" || funcName == "setpath" ||
+			funcName == "split" || funcName == "join" ||
+			funcName == "startswith" || funcName == "endswith" ||
+			funcName == "ltrimstr" || funcName == "rtrimstr" ||
+			funcName == "index" || funcName == "rindex" || funcName == "indices") && len(args) >= 1 {
 			// Swap input and first arg
 			input, args[0] = args[0], input
 		}

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	gojq "github.com/speakeasy-api/jq"
+	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 )
 
 // TestSplit tests string split operation
@@ -221,6 +222,49 @@ func TestLtrimRtrim(t *testing.T) {
 			if s != "suf" {
 				t.Errorf("Expected 'suf', got '%s'", s)
 			}
+		}
+	})
+}
+
+// TestSplitSliceJoin reproduces the bug where a pipeline involving join results in Top.
+func TestSplitSliceJoin(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("split | slice | join pipeline", func(t *testing.T) {
+		query, _ := gojq.Parse(`.fullName | split(" ") | .[1:] | join(" ")`)
+		input := BuildObject(map[string]*oas3.Schema{
+			"fullName": StringType(),
+		}, []string{"fullName"})
+
+		// Enable warnings to see the diagnostic output from builtinJoin
+		opts := SchemaExecOptions{
+			EnableWarnings: true,
+			EnumLimit:      10,
+			AnyOfLimit:     10,
+			WideningLevel:  1,
+			MaxDepth:       100,
+		}
+
+		result, err := RunSchema(ctx, query, input, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Print warnings to help debug
+		if len(result.Warnings) > 0 {
+			t.Logf("Warnings (%d):", len(result.Warnings))
+			for _, w := range result.Warnings {
+				t.Logf("  - %s", w)
+			}
+		}
+
+		// The final result should be a string, not Top (`{}`)
+		if isUnconstrainedSchema(result.Schema) {
+			t.Errorf("Result is an unconstrained schema (Top), expected string. Got: %+v", result.Schema)
+		}
+
+		if getType(result.Schema) != "string" {
+			t.Errorf("Expected schema type string, got %q", getType(result.Schema))
 		}
 	})
 }
