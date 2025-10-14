@@ -39,6 +39,29 @@ components:
                   format: date-time
                 version:
                   type: integer
+    KeyValuePairs:
+      x-speakeasy-transform-from-api:
+        jq: '.configs | map({key: .name, value: .value}) | from_entries'
+      description: A schema for an array of name/value configuration pairs.
+      type: object
+      properties:
+        configs:
+          type: array
+          description: A list of configuration items.
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                description: The name of the configuration key.
+              value:
+                type: string
+                nullable: true
+                description: The value of the configuration key.
+            required:
+              - name
+      required:
+        - configs
     PaginatedItemsResponse:
       type: object
       description: Flattened pagination with normalized item status.
