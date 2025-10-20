@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback } from 'react';
 import Editor from '@monaco-editor/react';
 import { symbolicExecuteJQPipeline, PipelineResult } from '../bridge';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
+import { Switch } from './ui/switch';
+import { Label } from './ui/label';
 
 const DEFAULT_OAS = `openapi: 3.1.0
 info:
@@ -234,6 +236,7 @@ export function SymbolicTab() {
   const [result, setResult] = useState<PipelineResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isExecuting, setIsExecuting] = useState(false);
+  const [strictMode, setStrictMode] = useState(true); // Default to strict mode ON
 
   const transformOAS = useCallback(async () => {
     if (!oasInput.trim()) {
@@ -246,7 +249,7 @@ export function SymbolicTab() {
     setError(null);
 
     try {
-      const pipelineResult = await symbolicExecuteJQPipeline(oasInput);
+      const pipelineResult = await symbolicExecuteJQPipeline(oasInput, strictMode);
       setResult(pipelineResult);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -254,7 +257,7 @@ export function SymbolicTab() {
     } finally {
       setIsExecuting(false);
     }
-  }, [oasInput]);
+  }, [oasInput, strictMode]);
 
   // Auto-transform when input changes
   useEffect(() => {
@@ -271,7 +274,19 @@ export function SymbolicTab() {
       <Panel defaultSize={33} minSize={20}>
         <div className="flex flex-col h-full border-r">
           <div className="px-4 py-2 border-b bg-muted/40">
-            <h3 className="text-sm font-medium">Original OpenAPI Specification</h3>
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-medium">Original OpenAPI Specification</h3>
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="strict-mode"
+                  checked={strictMode}
+                  onCheckedChange={setStrictMode}
+                />
+                <Label htmlFor="strict-mode" className="text-xs cursor-pointer">
+                  Strict Mode
+                </Label>
+              </div>
+            </div>
           </div>
           <div className="flex-1 overflow-hidden">
             <Editor

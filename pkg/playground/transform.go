@@ -165,7 +165,7 @@ type PipelineResult struct {
 }
 
 // SymbolicExecuteJQPipeline performs sequential transformation pipeline
-func SymbolicExecuteJQPipeline(oasYAML string) (*PipelineResult, error) {
+func SymbolicExecuteJQPipeline(oasYAML string, strict bool) (*PipelineResult, error) {
 	ctx := context.Background()
 	result := &PipelineResult{
 		Warnings: []string{},
@@ -195,8 +195,12 @@ func SymbolicExecuteJQPipeline(oasYAML string) (*PipelineResult, error) {
 	}
 
 	// Apply from-api transformation
-	appliedFrom, warnings := applyTransformationsToDoc(ctx, doc2, "x-speakeasy-transform-from-api")
+	appliedFrom, warnings := applyTransformationsToDoc(ctx, doc2, "x-speakeasy-transform-from-api", strict)
 	result.AppliedFromApi = appliedFrom
+	// If there are transformation errors and strict mode is enabled, return them as errors
+	if strict && len(warnings) > 0 {
+		return nil, fmt.Errorf("%s", FormatTransformErrors(warnings))
+	}
 	result.Warnings = append(result.Warnings, warnings...)
 
 	// Marshal panel2
@@ -213,8 +217,12 @@ func SymbolicExecuteJQPipeline(oasYAML string) (*PipelineResult, error) {
 	}
 
 	// Apply to-api transformation
-	appliedTo, warningsTo := applyTransformationsToDoc(ctx, doc3, "x-speakeasy-transform-to-api")
+	appliedTo, warningsTo := applyTransformationsToDoc(ctx, doc3, "x-speakeasy-transform-to-api", strict)
 	result.AppliedToApi = appliedTo
+	// If there are transformation errors and strict mode is enabled, return them as errors
+	if strict && len(warningsTo) > 0 {
+		return nil, fmt.Errorf("%s", FormatTransformErrors(warningsTo))
+	}
 	result.Warnings = append(result.Warnings, warningsTo...)
 
 	// Marshal panel3
@@ -238,7 +246,7 @@ func cloneDocument(ctx context.Context, yamlStr string) (*openapi.OpenAPI, error
 }
 
 // applyTransformationsToDoc applies transformations with the given extension name
-func applyTransformationsToDoc(ctx context.Context, doc *openapi.OpenAPI, extensionName string) (bool, []string) {
+func applyTransformationsToDoc(ctx context.Context, doc *openapi.OpenAPI, extensionName string, strict bool) (bool, []string) {
 	var transformErrors []string
 	applied := false
 
@@ -273,7 +281,7 @@ func applyTransformationsToDoc(ctx context.Context, doc *openapi.OpenAPI, extens
 	// Process transformations in reverse order
 	for i := len(schemasToTransform) - 1; i >= 0; i-- {
 		st := schemasToTransform[i]
-		if err := transformSchemaWithExtension(st.schema, st.location, extensionName); err != nil {
+		if err := transformSchemaWithExtension(st.schema, st.location, extensionName, strict); err != nil {
 			transformErrors = append(transformErrors, fmt.Sprintf("%s: %v", st.location, err))
 		}
 	}
@@ -282,7 +290,7 @@ func applyTransformationsToDoc(ctx context.Context, doc *openapi.OpenAPI, extens
 }
 
 // transformSchemaWithExtension applies transformation using the specified extension
-func transformSchemaWithExtension(schema *oas3.JSONSchema[oas3.Referenceable], location string, extensionName string) error {
+func transformSchemaWithExtension(schema *oas3.JSONSchema[oas3.Referenceable], location string, extensionName string, strict bool) error {
 	ext := schema.GetExtensions()
 	if ext == nil {
 		return nil
@@ -315,7 +323,9 @@ func transformSchemaWithExtension(schema *oas3.JSONSchema[oas3.Referenceable], l
 	}
 
 	// Symbolically execute the JQ
-	result, err := schemaexec.RunSchema(context.Background(), query, schemaValue)
+	opts := schemaexec.DefaultOptions()
+	opts.StrictMode = strict
+	result, err := schemaexec.RunSchema(context.Background(), query, schemaValue, opts)
 	if err != nil {
 		return fmt.Errorf("symbolic execution failed: %w", err)
 	}

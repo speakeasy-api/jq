@@ -110,6 +110,7 @@ export type SymbolicExecuteJQPipelineMessage = {
     type: "SymbolicExecuteJQPipeline";
     payload: {
       oasYAML: string;
+      strict?: boolean;
     };
   };
   Response:
@@ -152,12 +153,13 @@ export function symbolicExecuteJQ(
 
 export function symbolicExecuteJQPipeline(
   oasYAML: string,
+  strict: boolean = false,
   supercede = false,
 ): Promise<PipelineResult> {
   return sendMessage(
     {
       type: "SymbolicExecuteJQPipeline",
-      payload: { oasYAML },
+      payload: { oasYAML, strict },
     } satisfies SymbolicExecuteJQPipelineMessage["Request"],
     supercede,
   ).then((result: string) => JSON.parse(result));

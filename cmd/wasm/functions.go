@@ -143,11 +143,14 @@ func main() {
 
 	// Register SymbolicExecuteJQPipeline function
 	js.Global().Set("SymbolicExecuteJQPipeline", promisify(func(args []js.Value) (string, error) {
-		if len(args) != 1 {
-			return "", fmt.Errorf("SymbolicExecuteJQPipeline: expected 1 arg (oasYAML), got %v", len(args))
+		if len(args) != 2 {
+			return "", fmt.Errorf("SymbolicExecuteJQPipeline: expected 2 args (oasYAML, strict), got %v", len(args))
 		}
 
-		result, err := playground.SymbolicExecuteJQPipeline(args[0].String())
+		oasYAML := args[0].String()
+		strict := args[1].Bool()
+
+		result, err := playground.SymbolicExecuteJQPipeline(oasYAML, strict)
 		if err != nil {
 			return "", err
 		}

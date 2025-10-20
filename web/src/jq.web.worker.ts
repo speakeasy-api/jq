@@ -30,7 +30,7 @@ const messageHandlers: MessageHandlers = {
   SymbolicExecuteJQPipeline: async (
     payload: SymbolicExecuteJQPipelineMessage["Request"]["payload"],
   ) => {
-    return exec("SymbolicExecuteJQPipeline", payload.oasYAML);
+    return exec("SymbolicExecuteJQPipeline", payload.oasYAML, payload.strict || false);
   },
   FormatJQ: async (payload: FormatJQMessage["Request"]["payload"]) => {
     return exec("FormatJQ", payload.query);

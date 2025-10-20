@@ -24,6 +24,21 @@ type schemaEnv struct {
 	scopes   *scopeFrames // Scope frame stack for variable management
 	logger   Logger       // Logger for debug tracing
 	execID   string       // Unique execution ID
+	strict   bool         // If true, fail on unsupported ops and Top/Bottom results
+
+	// Tracks why a Top schema was created during execution.
+	// Keyed by the exact Top() schema pointer identity.
+	topCauses map[*oas3.Schema]string
+}
+
+// NewTopWithCause creates a Top schema and records the reason why it was created.
+func (env *schemaEnv) NewTopWithCause(cause string) *oas3.Schema {
+	s := Top()
+	if env.topCauses == nil {
+		env.topCauses = make(map[*oas3.Schema]string)
+	}
+	env.topCauses[s] = cause
+	return s
 }
 
 // scopeFrames manages nested variable scopes.
@@ -142,6 +157,7 @@ func newSchemaEnv(ctx context.Context, opts SchemaExecOptions) *schemaEnv {
 		scopes:   scopes,
 		logger:   logger,
 		execID:   execID,
+		strict:   opts.StrictMode,
 	}
 }
 
@@ -216,6 +232,9 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 
 		// Check depth limit
 		if state.depth > env.opts.MaxDepth {
+			if env.strict {
+				return nil, fmt.Errorf("strict mode: exceeded maximum execution depth (MaxDepth=%d)", env.opts.MaxDepth)
+			}
 			env.addWarning("max depth exceeded, widening to Top")
 			outputs = append(outputs, Top())
 			continue
@@ -317,6 +336,13 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		"warnings":    len(env.warnings),
 	}).Infof("Execution completed")
 
+	// Strict mode: validate result does not contain Top or Bottom
+	if env.strict {
+		if err := env.validateStrictResult(result); err != nil {
+			return nil, err
+		}
+	}
+
 	return &SchemaExecResult{
 		Schema:   result,
 		Warnings: env.warnings,
@@ -387,6 +413,9 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		if val, ok := next.loadVar(key); ok {
 			next.push(val)
 		} else {
+			if env.strict {
+				return nil, fmt.Errorf("strict mode: variable %s not found at pc=%d (state=%d)", key, state.pc, next.id)
+			}
 			next.push(Top())
 			env.addWarning("variable %s not found (scopeDepth=%d, state=%d, pc=%d) - pushing Top()",
 				key, len(next.scopes), next.id, next.pc)
@@ -472,11 +501,17 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			return []*execState{next}, nil
 		}
 		// Unknown closure
+		if env.strict {
+			return nil, fmt.Errorf("strict mode: attempted to call unknown closure at pc=%d", state.pc)
+		}
 		next.push(Top())
 		return []*execState{next}, nil
 
 	case opCallRec:
 		// Recursive call - similar to CallPC
+		if env.strict {
+			return nil, fmt.Errorf("strict mode: recursive calls (opCallRec) are not supported")
+		}
 		if len(next.stack) > 0 {
 			next.pop()
 		}
@@ -531,8 +566,8 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 
 	// Unsupported opcodes
 	default:
-		if env.opts.StrictMode {
-			return nil, fmt.Errorf("unsupported opcode: %d", c.op)
+		if env.strict {
+			return nil, fmt.Errorf("strict mode: unsupported opcode %s (%d) at pc=%d", c.opName, c.op, state.pc)
 		}
 		// Permissive: widen to Top
 		if len(next.stack) > 0 {
@@ -619,8 +654,8 @@ func (env *schemaEnv) executeOp(c *codeOp) error {
 
 	// Unsupported opcodes - handle gracefully
 	default:
-		if env.opts.StrictMode {
-			return fmt.Errorf("unsupported opcode: %d", c.op)
+		if env.strict {
+			return fmt.Errorf("strict mode: unsupported opcode %d", c.op)
 		}
 
 		// Permissive mode: widen to Top
@@ -841,6 +876,9 @@ func (env *schemaEnv) execObject(c *codeOp) error {
 			}
 		} else {
 			// Dynamic key - not fully supported yet
+			if env.strict {
+				return fmt.Errorf("strict mode: dynamic object keys in object constructor are not supported")
+			}
 			env.addWarning("dynamic object key not fully supported")
 		}
 	}
@@ -1021,8 +1059,17 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 			result = getArrayElement(base, indexKey, env.opts)
 		}
 	default:
-		// Unknown type - conservative
-		result = Top()
+		// Non-object type. If we are attempting property access (string key), annotate the Top with cause.
+		if _, ok := indexKey.(string); ok {
+			cause := "property access on non-object type"
+			if baseType != "" {
+				cause += " (got " + baseType + ")"
+			}
+			result = env.NewTopWithCause(cause)
+		} else {
+			// Not a property access; keep existing conservative behavior.
+			result = Top()
+		}
 	}
 
 	state.push(result)
@@ -1375,6 +1422,9 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 		// Call builtin
 		results, err := env.callBuiltin(funcName, input, args)
 		if err != nil {
+			if env.strict {
+				return nil, fmt.Errorf("strict mode: builtin %s failed: %v", funcName, err)
+			}
 			env.addWarning("builtin %s: %v", funcName, err)
 			state.push(Top())
 			return []*execState{state}, nil
@@ -1384,6 +1434,9 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 		if len(results) == 1 {
 			r := results[0]
 			if r == nil {
+				if env.strict {
+					return nil, fmt.Errorf("strict mode: builtin %s produced nil result", funcName)
+				}
 				env.addWarning("builtin %s returned nil; widening to Top", funcName)
 				r = Top()
 			}
@@ -1397,6 +1450,9 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 		for _, result := range results {
 			s := state.clone()
 			if result == nil {
+				if env.strict {
+					return nil, fmt.Errorf("strict mode: builtin %s produced nil result", funcName)
+				}
 				env.addWarning("builtin %s produced nil result; widening to Top", funcName)
 				result = Top()
 			}
@@ -1419,6 +1475,9 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 
 	default:
 		// Unknown call format
+		if env.strict {
+			return nil, fmt.Errorf("strict mode: unknown function call format: %T", v)
+		}
 		env.addWarning("unknown function call format: %T", v)
 		state.push(Top())
 		return []*execState{state}, nil
@@ -1666,6 +1725,169 @@ func newClosureSchema(pc int) *oas3.Schema {
 func getClosurePC(s *oas3.Schema) (int, bool) {
 	pc, ok := closureRegistry[s]
 	return pc, ok
+}
+
+// validateStrictResult performs a deep scan of the result schema to ensure
+// it does not contain any Top or Bottom structures when in strict mode.
+// Returns an error with a path to the first offending node if found.
+func (env *schemaEnv) validateStrictResult(schema *oas3.Schema) error {
+	return env.validateStrictResultPath(schema, "$")
+}
+
+// validateStrictResultPath recursively validates a schema at the given path.
+func (env *schemaEnv) validateStrictResultPath(schema *oas3.Schema, path string) error {
+	// Check if this is Bottom (which is represented as nil)
+	if isBottomSchema(schema) {
+		return fmt.Errorf("strict mode: result contains Bottom at %s", path)
+	}
+
+	// After Bottom check, if nil, it's safe to skip
+	if schema == nil {
+		return nil
+	}
+
+	// Check if this is Top
+	if isTopSchema(schema) {
+		if env.topCauses != nil {
+			if cause, ok := env.topCauses[schema]; ok {
+				return fmt.Errorf("strict mode: result contains Top at %s; cause: %s", path, cause)
+			}
+		}
+		return fmt.Errorf("strict mode: result contains Top at %s", path)
+	}
+
+	// Recursively check array items
+	if schema.Items != nil && schema.Items.Left != nil {
+		if err := env.validateStrictResultPath(schema.Items.Left, path+".items"); err != nil {
+			return err
+		}
+	}
+
+	// Recursively check prefixItems (tuple items)
+	if schema.PrefixItems != nil {
+		for i, item := range schema.PrefixItems {
+			if item.Left != nil {
+				itemPath := fmt.Sprintf("%s.prefixItems[%d]", path, i)
+				if err := env.validateStrictResultPath(item.Left, itemPath); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Recursively check object properties
+	if schema.Properties != nil {
+		for k, prop := range schema.Properties.All() {
+			if prop.Left != nil {
+				propPath := fmt.Sprintf("%s.properties.%s", path, k)
+				if err := env.validateStrictResultPath(prop.Left, propPath); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Recursively check additionalProperties
+	if schema.AdditionalProperties != nil && schema.AdditionalProperties.Left != nil {
+		if err := env.validateStrictResultPath(schema.AdditionalProperties.Left, path+".additionalProperties"); err != nil {
+			return err
+		}
+	}
+
+	// Recursively check anyOf branches
+	if schema.AnyOf != nil {
+		for i, branch := range schema.AnyOf {
+			if branch.Left != nil {
+				branchPath := fmt.Sprintf("%s.anyOf[%d]", path, i)
+				if err := env.validateStrictResultPath(branch.Left, branchPath); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Recursively check allOf branches
+	if schema.AllOf != nil {
+		for i, branch := range schema.AllOf {
+			if branch.Left != nil {
+				branchPath := fmt.Sprintf("%s.allOf[%d]", path, i)
+				if err := env.validateStrictResultPath(branch.Left, branchPath); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Recursively check oneOf branches
+	if schema.OneOf != nil {
+		for i, branch := range schema.OneOf {
+			if branch.Left != nil {
+				branchPath := fmt.Sprintf("%s.oneOf[%d]", path, i)
+				if err := env.validateStrictResultPath(branch.Left, branchPath); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Recursively check not
+	if schema.Not != nil && schema.Not.Left != nil {
+		if err := env.validateStrictResultPath(schema.Not.Left, path+".not"); err != nil {
+			return err
+		}
+	}
+
+	// Recursively check contains
+	if schema.Contains != nil && schema.Contains.Left != nil {
+		if err := env.validateStrictResultPath(schema.Contains.Left, path+".contains"); err != nil {
+			return err
+		}
+	}
+
+	// Recursively check unevaluatedProperties
+	if schema.UnevaluatedProperties != nil && schema.UnevaluatedProperties.Left != nil {
+		if err := env.validateStrictResultPath(schema.UnevaluatedProperties.Left, path+".unevaluatedProperties"); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// isTopSchema checks if a schema is Top using both pointer identity and structural checks.
+func isTopSchema(s *oas3.Schema) bool {
+	// Pointer identity check
+	if s == Top() {
+		return true
+	}
+
+	// Structural check: empty type with no constraints
+	if getType(s) == "" &&
+		s.Properties == nil &&
+		s.AdditionalProperties == nil &&
+		s.Enum == nil &&
+		s.AllOf == nil &&
+		s.AnyOf == nil &&
+		s.OneOf == nil &&
+		s.Not == nil &&
+		s.Const == nil &&
+		s.Format == nil &&
+		s.Pattern == nil &&
+		s.MinLength == nil &&
+		s.MaxLength == nil &&
+		s.Minimum == nil &&
+		s.Maximum == nil &&
+		s.Items == nil &&
+		s.PrefixItems == nil {
+		return true
+	}
+
+	return false
+}
+
+// isBottomSchema checks if a schema is Bottom using pointer identity.
+func isBottomSchema(s *oas3.Schema) bool {
+	return s == Bottom()
 }
 
 // materializeArrays recursively walks a schema and replaces arrays with
