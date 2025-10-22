@@ -31,7 +31,7 @@ func RunSchema(ctx context.Context, query *gojq.Query, input *oas3.Schema, opts 
 
 	// Compile the query to bytecode
 	// Use WithSkipLibraryExpansion to bypass inlining of gsub/sub for better precision
-	code, err := gojq.Compile(query, gojq.WithSkipLibraryExpansion("gsub", "sub"))
+	code, err := gojq.Compile(query, gojq.WithSkipLibraryExpansion("gsub", "sub", "test"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile query: %w", err)
 	}

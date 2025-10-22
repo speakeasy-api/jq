@@ -207,6 +207,7 @@ func init() {
 		"halt_error":     {argcount0 | argcount1, false, funcHaltError},
 		"gsub":           {argcount2 | argcount3, false, funcGsub},
 		"sub":            {argcount2 | argcount3, false, funcSub},
+		"test":           {argcount1 | argcount2, false, funcTest},
 	}
 }
 
@@ -2149,6 +2150,16 @@ func funcSub(v any, args []any) any {
 	return funcSubInternal(v, args, false) // false = not forced global
 }
 
+// funcTest implements regex testing
+// Args: pattern (string), optional flags (string)
+func funcTest(v any, args []any) any {
+	var flags any
+	if len(args) >= 2 {
+		flags = args[1]
+	}
+	return funcMatch(v, args[0], flags, true)
+}
+
 // funcSubInternal is the shared implementation for sub and gsub.
 func funcSubInternal(v any, args []any, forceGlobal bool) any {
 	if len(args) < 2 {
@@ -2203,8 +2214,6 @@ func funcSubInternal(v any, args []any, forceGlobal bool) any {
 	// Build result: prefix + replacement + suffix
 	return s[:loc[0]] + r.ReplaceAllString(s[loc[0]:loc[1]], replacement) + s[loc[1]:]
 }
-
-
 
 func toInt(x any) (int, bool) {
 	switch x := x.(type) {

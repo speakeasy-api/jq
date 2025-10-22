@@ -13,6 +13,7 @@ import (
 func init() {
 	// String regex substitution
 	builtinRegistry["gsub"] = builtinGsub
+	builtinRegistry["test"] = builtinTest
 
 	// Trimming family
 	builtinRegistry["trim"] = builtinTrim

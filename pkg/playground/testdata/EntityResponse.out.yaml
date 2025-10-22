@@ -1,29 +1,29 @@
-type: object
-required:
-  - data
-  - id
 properties:
   data:
-    type: object
     properties:
+      meta:
+        properties:
+          timestamp:
+            format: date-time
+            type: string
+          version:
+            type: integer
+        type: object
       result:
-        type: array
         items:
-          type: object
           properties:
+            active:
+              type: boolean
             id:
               type: string
             name:
               type: string
-            active:
-              type: boolean
-      meta:
-        type: object
-        properties:
-          timestamp:
-            type: string
-            format: date-time
-          version:
-            type: integer
+          type: object
+        type: array
+    type: object
   id:
     type: string
+required:
+  - data
+  - id
+type: object

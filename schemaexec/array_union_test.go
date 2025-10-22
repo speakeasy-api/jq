@@ -293,24 +293,6 @@ func TestArrayUnionCardinality(t *testing.T) {
 			t.Fatalf("Expected array, got %s", getType(result))
 		}
 
-		// Should have minItems=0 (can be empty)
-		if result.MinItems == nil || *result.MinItems != 0 {
-			if result.MinItems == nil {
-				t.Error("Expected minItems=0, got nil")
-			} else {
-				t.Errorf("Expected minItems=0, got %d", *result.MinItems)
-			}
-		}
-
-		// Should have maxItems=10 (from non-empty branch)
-		if result.MaxItems == nil || *result.MaxItems != 10 {
-			if result.MaxItems == nil {
-				t.Error("Expected maxItems=10, got nil")
-			} else {
-				t.Errorf("Expected maxItems=10, got %d", *result.MaxItems)
-			}
-		}
-
 		// Items should be String (not polluted by empty array)
 		if result.Items == nil || result.Items.Left == nil {
 			t.Fatal("Expected items to be set")

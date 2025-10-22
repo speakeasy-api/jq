@@ -1,32 +1,32 @@
-type: object
 properties:
+  hasMore:
+    type: boolean
   items:
-    type: array
     items:
-      type: object
       properties:
-        id: {}
-        title: {}
-        status:
+        id:
           type: string
+        status:
           enum:
             - inactive
             - active
+          type: string
+        title:
+          type: string
       required:
         - id
         - status
         - title
-  hasMore:
-    type: boolean
+      type: object
+    type: array
+  nextCursor:
+    nullable: true
+    type: string
   total:
     type: integer
-  nextCursor:
-    anyOf:
-      - type: string
-        nullable: true
-      - type: "null"
 required:
   - hasMore
   - items
   - nextCursor
   - total
+type: object

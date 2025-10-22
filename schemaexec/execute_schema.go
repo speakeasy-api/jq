@@ -263,12 +263,12 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 
 				// Log successor creation
 				env.logger.With(map[string]any{
-					"exec":     env.execID,
-					"state":    fmt.Sprintf("s%d", newState.id),
-					"parent":   fmt.Sprintf("s%d", newState.parentID),
-					"lineage":  newState.lineage,
-					"pc":       newState.pc,
-					"op":       code.opName,
+					"exec":    env.execID,
+					"state":   fmt.Sprintf("s%d", newState.id),
+					"parent":  fmt.Sprintf("s%d", newState.parentID),
+					"lineage": newState.lineage,
+					"pc":      newState.pc,
+					"op":      code.opName,
 				}).Debugf("Created successor state")
 			}
 			worklist.push(newState)
@@ -950,6 +950,10 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 	// MUTATE canonical array in-place - safe with unique keys!
 	// All states/references to this array will see the update
 	if getType(canonicalArr) == "array" {
+		// If we've got MaxItems=0 (e.g. were created from a bottom()), drop that
+		if canonicalArr.MaxItems != nil && *canonicalArr.MaxItems == 0 {
+			canonicalArr.MaxItems = nil
+		}
 		canonicalArr.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](unionedItems)
 	}
 
@@ -1164,6 +1168,7 @@ func (env *schemaEnv) valueToSchema(v any) *oas3.Schema {
 		return Top()
 	}
 }
+
 // unionAllObjectValues creates union of all property and additionalProperty schemas.
 func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	schemas := make([]*oas3.Schema, 0)
