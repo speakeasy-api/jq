@@ -124,7 +124,7 @@ func TestUnionMergesIntegerEnums(t *testing.T) {
 	}
 
 	// Should not be anyOf
-	if merged.AnyOf != nil && len(merged.AnyOf) > 0 {
+	if len(merged.AnyOf) > 0 {
 		t.Errorf("Expected single schema, got anyOf with %d variants", len(merged.AnyOf))
 		for i, variant := range merged.AnyOf {
 			if variant.Left != nil {

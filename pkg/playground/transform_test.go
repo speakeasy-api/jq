@@ -24,14 +24,6 @@ func loadTestSchema(t *testing.T, filename string) map[string]any {
 }
 
 // normalizeSchema converts YAML to canonical form for comparison
-func normalizeSchema(yamlStr string) (map[string]any, error) {
-	var schema map[string]any
-	if err := yaml.Unmarshal([]byte(yamlStr), &schema); err != nil {
-		return nil, err
-	}
-	return schema, nil
-}
-
 // compareSchemas compares two schemas for structural equality
 func compareSchemas(t *testing.T, name string, expected, actual map[string]any) {
 	t.Helper()
@@ -526,39 +518,6 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-// copyMap deep copies a map for safe mutation
-func copyMap(m map[string]any) map[string]any {
-	result := make(map[string]any)
-	for k, v := range m {
-		result[k] = v
-	}
-	return result
-}
-
-// buildOASWithJQ builds an OAS YAML document with a schema and JQ transform
-func buildOASWithJQ(schemaKey string, schema map[string]any, jqExpr string) string {
-	// Add the JQ transform to the schema
-	schema["x-speakeasy-transform-from-api"] = map[string]any{
-		"jq": jqExpr,
-	}
-
-	oasDoc := map[string]any{
-		"openapi": "3.1.0",
-		"info": map[string]any{
-			"title":   "Test",
-			"version": "1.0.0",
-		},
-		"components": map[string]any{
-			"schemas": map[string]any{
-				schemaKey: schema,
-			},
-		},
-	}
-
-	yamlBytes, _ := yaml.Marshal(oasDoc)
-	return string(yamlBytes)
-}
-
 // extractSchema extracts a schema from an OAS document
 func extractSchema(t *testing.T, oasDoc map[string]any, schemaKey string) map[string]any {
 	t.Helper()
@@ -718,11 +677,11 @@ components:
 	}
 
 	// Applied flags should be false
-	if result.AppliedFromApi {
-		t.Error("AppliedFromApi should be false")
+	if result.AppliedFromAPI {
+		t.Error("AppliedFromAPI should be false")
 	}
-	if result.AppliedToApi {
-		t.Error("AppliedToApi should be false")
+	if result.AppliedToAPI {
+		t.Error("AppliedToAPI should be false")
 	}
 
 	// All panels should be identical
@@ -756,12 +715,12 @@ components:
 		t.Fatalf("Pipeline failed: %v", err)
 	}
 
-	// AppliedFromApi should be true, AppliedToApi false
-	if !result.AppliedFromApi {
-		t.Error("AppliedFromApi should be true")
+	// AppliedFromAPI should be true, AppliedToAPI false
+	if !result.AppliedFromAPI {
+		t.Error("AppliedFromAPI should be true")
 	}
-	if result.AppliedToApi {
-		t.Error("AppliedToApi should be false when extension missing")
+	if result.AppliedToAPI {
+		t.Error("AppliedToAPI should be false when extension missing")
 	}
 
 	t.Logf("Panel2:\n%s", result.Panel2)
@@ -790,12 +749,12 @@ components:
 		t.Fatalf("Pipeline failed: %v", err)
 	}
 
-	// AppliedFromApi false, AppliedToApi true
-	if result.AppliedFromApi {
-		t.Error("AppliedFromApi should be false when extension missing")
+	// AppliedFromAPI false, AppliedToAPI true
+	if result.AppliedFromAPI {
+		t.Error("AppliedFromAPI should be false when extension missing")
 	}
-	if !result.AppliedToApi {
-		t.Error("AppliedToApi should be true")
+	if !result.AppliedToAPI {
+		t.Error("AppliedToAPI should be true")
 	}
 
 	t.Logf("Panel2:\n%s", result.Panel2)
@@ -1080,78 +1039,6 @@ components:
 // See schemaexec/array_slice_bug_test.go for the isolated reproduction test case.
 // The bug causes "EitherValue has neither Left nor Right set" error during marshaling.
 // Property root.data.user.profile.name.last has an invalid JSONSchema wrapper.
-func _TestSymbolicExecuteJQPipeline_ComputedFullName(t *testing.T) {
-	oasYAML := `openapi: 3.1.0
-info:
-  title: ComputedFields
-  version: 1.0.0
-paths: {}
-components:
-  schemas:
-    UserPreferences:
-      type: object
-      x-speakeasy-transform-from-api:
-        jq: >
-          {
-            userId: .data.user.id,
-            email: .data.user.profile.contact.email,
-            fullName: (.data.user.profile.name.first + " " + .data.user.profile.name.last)
-          }
-      x-speakeasy-transform-to-api:
-        jq: >
-          {
-            data: {
-              user: {
-                id: .userId,
-                profile: {
-                  name: {
-                    first: (.fullName | split(" ") | .[0]),
-                    last:  (.fullName | split(" ") | .[1:] | join(" "))
-                  },
-                  contact: { email: .email }
-                }
-              }
-            }
-          }
-      properties:
-        data:
-          type: object
-          properties:
-            user:
-              type: object
-              properties:
-                id:
-                  type: string
-                profile:
-                  type: object
-                  properties:
-                    name:
-                      type: object
-                      properties:
-                        first:
-                          type: string
-                        last:
-                          type: string
-                    contact:
-                      type: object
-                      properties:
-                        email:
-                          type: string
-`
-
-	result, err := SymbolicExecuteJQPipeline(oasYAML, false)
-	if err != nil {
-		t.Fatalf("Pipeline failed: %v", err)
-	}
-
-	// Panel2 should have computed fullName
-	if !strings.Contains(result.Panel2, "fullName:") {
-		t.Error("Panel2 should contain computed 'fullName' field")
-	}
-
-	t.Logf("Computed fullName transformation successful")
-}
-
 func TestSymbolicExecuteJQPipeline_TagEnrichment(t *testing.T) {
 	oasYAML := `openapi: 3.1.0
 info:

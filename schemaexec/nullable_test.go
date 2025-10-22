@@ -38,7 +38,7 @@ func TestNullableUnion(t *testing.T) {
 		}
 		
 		// Should NOT have anyOf
-		if result.Schema.AnyOf != nil && len(result.Schema.AnyOf) > 0 {
+		if len(result.Schema.AnyOf) > 0 {
 			t.Error("Should not have anyOf, should use nullable instead")
 		}
 	})

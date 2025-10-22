@@ -201,7 +201,7 @@ func TestSimpleArrayIteration(t *testing.T) {
 
 	t.Logf("Output type: %s", getType(result.Schema))
 	t.Logf("Warnings: %v", result.Warnings)
-	t.Logf("Schema anyOf: %v", result.Schema.AnyOf != nil && len(result.Schema.AnyOf) > 0)
+	t.Logf("Schema anyOf: %v", len(result.Schema.AnyOf) > 0)
 
 	if result.Schema.Items != nil && result.Schema.Items.Left != nil {
 		itemType := getType(result.Schema.Items.Left)
@@ -214,7 +214,7 @@ func TestSimpleArrayIteration(t *testing.T) {
 	} else {
 		t.Logf("Items: %v, Items.Left: %v", result.Schema.Items, result.Schema.Items)
 		// Check if it's a union
-		if result.Schema.AnyOf != nil && len(result.Schema.AnyOf) > 0 {
+		if len(result.Schema.AnyOf) > 0 {
 			t.Logf("Schema is anyOf with %d branches", len(result.Schema.AnyOf))
 			for i, branch := range result.Schema.AnyOf {
 				if branch.Left != nil {

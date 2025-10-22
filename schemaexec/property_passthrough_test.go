@@ -336,7 +336,7 @@ func TestPropertyPassthroughInMap(t *testing.T) {
 	}
 
 	// Check status has enum
-	if statusProp.Left.Enum == nil || len(statusProp.Left.Enum) == 0 {
+	if len(statusProp.Left.Enum) == 0 {
 		t.Error("Property 'status' should have enum values")
 	}
 

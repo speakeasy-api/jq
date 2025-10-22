@@ -308,10 +308,10 @@ func TestIntegration_ProductInput(t *testing.T) {
 	}
 
 	// Check productId property (should be string)
-	if productIdSchema, ok := result.Schema.Properties.Get("productId"); !ok {
+	if productIDSchema, ok := result.Schema.Properties.Get("productId"); !ok {
 		t.Error("Expected 'productId' property in output schema")
-	} else if productIdSchema.Left != nil {
-		propType := getType(productIdSchema.Left)
+	} else if productIDSchema.Left != nil {
+		propType := getType(productIDSchema.Left)
 		if propType != "string" {
 			t.Errorf("Expected 'productId' to be string, got %s", propType)
 		}

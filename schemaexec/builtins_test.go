@@ -103,7 +103,7 @@ func TestBuiltin_Has(t *testing.T) {
 	}
 
 	// For required property, should be const true
-	if result.Schema.Enum != nil && len(result.Schema.Enum) > 0 {
+	if len(result.Schema.Enum) > 0 {
 		if result.Schema.Enum[0].Value != "true" {
 			t.Logf("has(name) on required property: %s", result.Schema.Enum[0].Value)
 		}

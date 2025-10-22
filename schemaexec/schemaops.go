@@ -212,7 +212,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	// Flatten nested anyOf schemas
 	flattened := make([]*oas3.Schema, 0, len(filtered)*2)
 	for _, s := range filtered {
-		if s.AnyOf != nil && len(s.AnyOf) > 0 {
+		if len(s.AnyOf) > 0 {
 			// Extract nested anyOf branches
 			for _, branch := range s.AnyOf {
 				if branch.Left != nil {
@@ -412,7 +412,7 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 			// Recursively union the property schemas
 			unionSchema := Union(filteredSchemas, opts)
 			// Unwrap single-branch anyOf
-			if unionSchema.AnyOf != nil && len(unionSchema.AnyOf) == 1 && unionSchema.AnyOf[0].GetLeft() != nil {
+			if len(unionSchema.AnyOf) == 1 && unionSchema.AnyOf[0].GetLeft() != nil {
 				unionSchema = unionSchema.AnyOf[0].GetLeft()
 			}
 			mergedProps[propName] = unionSchema
@@ -583,7 +583,7 @@ func canMergeStringEnums(schemas []*oas3.Schema) bool {
 			return false
 		}
 		// Must have at least one enum value
-		if s.Enum == nil || len(s.Enum) == 0 {
+		if len(s.Enum) == 0 {
 			return false
 		}
 		// All enum values must be strings
@@ -658,7 +658,7 @@ func canMergeIntegerEnums(schemas []*oas3.Schema) bool {
 			return false
 		}
 		// Must have at least one enum value
-		if s.Enum == nil || len(s.Enum) == 0 {
+		if len(s.Enum) == 0 {
 			return false
 		}
 		// All enum values must be integers
@@ -840,7 +840,7 @@ func getType(s *oas3.Schema) string {
 	}
 
 	// Check anyOf - if all branches have same type, return it
-	if s.AnyOf != nil && len(s.AnyOf) > 0 {
+	if len(s.AnyOf) > 0 {
 		firstType := ""
 		allSame := true
 		for _, branch := range s.AnyOf {
@@ -1112,7 +1112,7 @@ func schemaFingerprint(s *oas3.Schema) string {
 	}
 
 	// Enum
-	if s.Enum != nil && len(s.Enum) > 0 {
+	if len(s.Enum) > 0 {
 		parts = append(parts, "enum:"+canonicalizeYAMLNodes(s.Enum))
 	}
 
@@ -1181,7 +1181,7 @@ func schemaFingerprint(s *oas3.Schema) string {
 	}
 
 	// AnyOf (for nested unions)
-	if s.AnyOf != nil && len(s.AnyOf) > 0 {
+	if len(s.AnyOf) > 0 {
 		var anyOfParts []string
 		for _, branch := range s.AnyOf {
 			if branch.Left != nil {
@@ -1202,8 +1202,8 @@ func isSubschemaOf(a, b *oas3.Schema) bool {
 	}
 
 	// Handle enum/const cases first (most common in our use case)
-	aHasEnum := a.Enum != nil && len(a.Enum) > 0
-	bHasEnum := b.Enum != nil && len(b.Enum) > 0
+	aHasEnum := len(a.Enum) > 0
+	bHasEnum := len(b.Enum) > 0
 
 	if aHasEnum {
 		if bHasEnum {
@@ -1293,15 +1293,15 @@ func isUnconstrainedSchema(s *oas3.Schema) bool {
 		}
 	}
 	hasProperties := propCount > 0
-	hasEnum := s.Enum != nil && len(s.Enum) > 0
-	hasAnyOf := s.AnyOf != nil && len(s.AnyOf) > 0
-	hasAllOf := s.AllOf != nil && len(s.AllOf) > 0
-	hasOneOf := s.OneOf != nil && len(s.OneOf) > 0
+	hasEnum := len(s.Enum) > 0
+	hasAnyOf := len(s.AnyOf) > 0
+	hasAllOf := len(s.AllOf) > 0
+	hasOneOf := len(s.OneOf) > 0
 	hasConstraints := s.Minimum != nil || s.Maximum != nil || s.Pattern != nil ||
 		s.MinLength != nil || s.MaxLength != nil || s.Format != nil
 	hasItems := s.Items != nil && s.Items.Left != nil
 	hasAdditionalProps := s.AdditionalProperties != nil && s.AdditionalProperties.Left != nil
-	hasRequired := s.Required != nil && len(s.Required) > 0
+	hasRequired := len(s.Required) > 0
 
 	// Unconstrained = completely empty (no type, properties, constraints, etc.)
 	return !hasType && !hasProperties && !hasEnum && !hasAnyOf && !hasAllOf && !hasOneOf &&

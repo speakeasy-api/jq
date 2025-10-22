@@ -1,3 +1,4 @@
+// Package schemaexec provides symbolic execution of jq queries over JSON schemas.
 package schemaexec
 
 import (

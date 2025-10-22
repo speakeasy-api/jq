@@ -1,3 +1,4 @@
+// Package jqfmt provides formatting utilities for jq queries.
 package jqfmt
 
 import (
@@ -20,24 +21,6 @@ import (
 
 func toNumber(v string) interface{} {
 	return normalizeNumber(json.Number(v))
-}
-
-func funcOpNegate(v interface{}) interface{} {
-	switch v := v.(type) {
-	case int:
-		return -v
-	case float64:
-		return -v
-	case *big.Int:
-		return new(big.Int).Neg(v)
-	default:
-		return &unaryTypeError{"negate", v}
-	}
-}
-
-type unaryTypeError struct {
-	name string
-	v    interface{}
 }
 
 // Query
@@ -169,7 +152,7 @@ func (e *Query) writeTo(s *strings.Builder) {
 			opStr := e.Op.GoString()
 
 			for _, op := range cfg.Ops {
-				if opStr == fmt.Sprintf("gojq.Op%s", strings.Title(op)) {
+				if opStr == fmt.Sprintf("gojq.Op%s", strings.ToUpper(op[:1])+op[1:]) {
 					// Determine ancestor
 					ancestor := ""
 					if topQueryTerm {
@@ -213,20 +196,6 @@ func (e *Query) minify() {
 		e.Left.minify()
 		e.Right.minify()
 	}
-}
-
-func (e *Query) toIndexKey() interface{} {
-	if e.Term == nil {
-		return nil
-	}
-	return e.Term.toIndexKey()
-}
-
-func (e *Query) toIndices(xs []interface{}) []interface{} {
-	if e.Term == nil {
-		return nil
-	}
-	return e.Term.toIndices(xs)
 }
 
 // Import ...
@@ -437,50 +406,6 @@ func (e *Term) toFunc() string {
 	}
 }
 
-func (e *Term) toIndexKey() interface{} {
-	switch e.Type {
-	case gojq.TermTypeNumber:
-		return toNumber(e.Number)
-	case gojq.TermTypeUnary:
-		return e.Unary.toNumber()
-	case gojq.TermTypeString:
-		if e.Str.Queries == nil {
-			return e.Str.Str
-		}
-		return nil
-	default:
-		return nil
-	}
-}
-
-func (e *Term) toIndices(xs []interface{}) []interface{} {
-	switch e.Type {
-	case gojq.TermTypeIndex:
-		if xs = e.Index.toIndices(xs); xs == nil {
-			return nil
-		}
-	case gojq.TermTypeQuery:
-		if xs = e.Query.toIndices(xs); xs == nil {
-			return nil
-		}
-	default:
-		return nil
-	}
-	for _, s := range e.SuffixList {
-		if xs = s.toIndices(xs); xs == nil {
-			return nil
-		}
-	}
-	return xs
-}
-
-func (e *Term) toNumber() interface{} {
-	if e.Type == gojq.TermTypeNumber {
-		return toNumber(e.Number)
-	}
-	return nil
-}
-
 // Unary ...
 type Unary struct {
 	Op   gojq.Operator
@@ -500,14 +425,6 @@ func (e *Unary) writeTo(s *strings.Builder) {
 
 func (e *Unary) minify() {
 	e.Term.minify()
-}
-
-func (e *Unary) toNumber() interface{} {
-	v := e.Term.toNumber()
-	if v != nil && e.Op == gojq.OpSub {
-		v = funcOpNegate(v)
-	}
-	return v
 }
 
 // Pattern ...
@@ -635,40 +552,6 @@ func (e *Index) minify() {
 	if e.End != nil {
 		e.End.minify()
 	}
-}
-
-func (e *Index) toIndexKey() interface{} {
-	if e.Name != "" {
-		return e.Name
-	} else if e.Str != nil {
-		if e.Str.Queries == nil {
-			return e.Str.Str
-		}
-	} else if !e.IsSlice {
-		return e.Start.toIndexKey()
-	} else {
-		var start, end interface{}
-		ok := true
-		if e.Start != nil {
-			start = e.Start.toIndexKey()
-			ok = start != nil
-		}
-		if e.End != nil && ok {
-			end = e.End.toIndexKey()
-			ok = end != nil
-		}
-		if ok {
-			return map[string]interface{}{"start": start, "end": end}
-		}
-	}
-	return nil
-}
-
-func (e *Index) toIndices(xs []interface{}) []interface{} {
-	if k := e.toIndexKey(); k != nil {
-		return append(xs, k)
-	}
-	return nil
 }
 
 // Func ...
@@ -906,23 +789,6 @@ func (e *Suffix) minify() {
 	} else if e.Bind != nil {
 		e.Bind.minify()
 	}
-}
-
-func (e *Suffix) toTerm() *Term {
-	if e.Index != nil {
-		return &Term{Type: gojq.TermTypeIndex, Index: e.Index}
-	} else if e.Iter {
-		return &Term{Type: gojq.TermTypeIdentity, SuffixList: []*Suffix{{Iter: true}}}
-	} else {
-		return nil
-	}
-}
-
-func (e *Suffix) toIndices(xs []interface{}) []interface{} {
-	if e.Index == nil {
-		return nil
-	}
-	return e.Index.toIndices(xs)
 }
 
 // Bind ...
@@ -1311,12 +1177,6 @@ func Marshal(v interface{}) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-func jsonMarshal(v interface{}) string {
-	var sb strings.Builder
-	(&encoder{w: &sb}).encode(v)
-	return sb.String()
-}
-
 func jsonEncodeString(sb *strings.Builder, v string) {
 	(&encoder{w: sb}).encodeString(v)
 }
@@ -1497,60 +1357,3 @@ func normalizeNumber(v json.Number) interface{} {
 	return math.Inf(1)
 }
 
-func normalizeNumbers(v interface{}) interface{} {
-	switch v := v.(type) {
-	case json.Number:
-		return normalizeNumber(v)
-	case *big.Int:
-		if v.IsInt64() {
-			if i := v.Int64(); math.MinInt <= i && i <= math.MaxInt {
-				return int(i)
-			}
-		}
-		return v
-	case int64:
-		if math.MinInt <= v && v <= math.MaxInt {
-			return int(v)
-		}
-		return big.NewInt(v)
-	case int32:
-		return int(v)
-	case int16:
-		return int(v)
-	case int8:
-		return int(v)
-	case uint:
-		if v <= math.MaxInt {
-			return int(v)
-		}
-		return new(big.Int).SetUint64(uint64(v))
-	case uint64:
-		if v <= math.MaxInt {
-			return int(v)
-		}
-		return new(big.Int).SetUint64(v)
-	case uint32:
-		if uint64(v) <= math.MaxInt {
-			return int(v)
-		}
-		return new(big.Int).SetUint64(uint64(v))
-	case uint16:
-		return int(v)
-	case uint8:
-		return int(v)
-	case float32:
-		return float64(v)
-	case []interface{}:
-		for i, x := range v {
-			v[i] = normalizeNumbers(x)
-		}
-		return v
-	case map[string]interface{}:
-		for k, x := range v {
-			v[k] = normalizeNumbers(x)
-		}
-		return v
-	default:
-		return v
-	}
-}

@@ -348,36 +348,3 @@ func (w *stateWorklist) markSeen(state *execState) {
 	w.seen[fp] = true
 }
 
-// Merge states at the same PC by unioning their top-of-stack schemas.
-func mergeStates(states []*execState, opts SchemaExecOptions) *execState {
-	if len(states) == 0 {
-		return nil
-	}
-	if len(states) == 1 {
-		return states[0]
-	}
-
-	// Use first state as base
-	merged := states[0].clone()
-
-	// Union top-of-stack from all states
-	schemas := make([]*oas3.Schema, len(states))
-	for i, state := range states {
-		schemas[i] = state.top()
-	}
-
-	// Replace top with union
-	merged.pop()
-	merged.push(Union(schemas, opts))
-
-	return merged
-}
-
-// Error types for multi-state VM
-type haltError struct {
-	message string
-}
-
-func (e *haltError) Error() string {
-	return fmt.Sprintf("halt: %s", e.message)
-}

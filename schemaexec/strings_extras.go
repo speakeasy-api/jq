@@ -87,7 +87,7 @@ func builtinGsub(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 	}
 
 	// Enum preservation for small enums on input
-	if input.Enum != nil && len(input.Enum) > 0 && (env == nil || env.opts.EnumLimit == 0 || len(input.Enum) <= env.opts.EnumLimit) && patOK && replOK {
+	if len(input.Enum) > 0 && (env == nil || env.opts.EnumLimit == 0 || len(input.Enum) <= env.opts.EnumLimit) && patOK && replOK {
 		re, err := compile(pat, flags)
 		if err != nil {
 			// Invalid regex: cannot evaluate => Bottom
@@ -127,12 +127,8 @@ func builtinGsub(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 // Note: jq also supports 'g' but Go's regex ReplaceAllString is global by default.
 func compileRegexpWithFlags(pattern, flags string) (*regexp.Regexp, error) {
 	if flags != "" {
-		if strings.IndexFunc(flags, func(r rune) bool {
-			return r != 'g' && r != 'i' && r != 'm'
-		}) >= 0 {
-			// Unsupported flags present: ignore rather than fail for symbolic safety
-			// but preserve 'i' and 'm' below.
-		}
+		// Unsupported flags (not 'g', 'i', or 'm') are ignored rather than failing for symbolic safety.
+		// We preserve 'i' and 'm' below.
 		if strings.ContainsRune(flags, 'i') {
 			pattern = "(?i)" + pattern
 		}
@@ -159,7 +155,7 @@ func builtinTrim(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 	}
 
 	// Enum preservation
-	if input.Enum != nil && len(input.Enum) > 0 && (env == nil || env.opts.EnumLimit == 0 || len(input.Enum) <= env.opts.EnumLimit) {
+	if len(input.Enum) > 0 && (env == nil || env.opts.EnumLimit == 0 || len(input.Enum) <= env.opts.EnumLimit) {
 		newEnum := make([]*yaml.Node, 0, len(input.Enum))
 		seen := map[string]struct{}{}
 		for _, node := range input.Enum {
@@ -190,7 +186,7 @@ func builtinLtrim(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*o
 		return []*oas3.Schema{ConstString(strings.TrimLeftFunc(inStr, unicode.IsSpace))}, nil
 	}
 	// Enum preservation
-	if input.Enum != nil && len(input.Enum) > 0 && (env == nil || env.opts.EnumLimit == 0 || len(input.Enum) <= env.opts.EnumLimit) {
+	if len(input.Enum) > 0 && (env == nil || env.opts.EnumLimit == 0 || len(input.Enum) <= env.opts.EnumLimit) {
 		newEnum := make([]*yaml.Node, 0, len(input.Enum))
 		seen := map[string]struct{}{}
 		for _, node := range input.Enum {
@@ -220,7 +216,7 @@ func builtinRtrim(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*o
 		return []*oas3.Schema{ConstString(strings.TrimRightFunc(inStr, unicode.IsSpace))}, nil
 	}
 	// Enum preservation
-	if input.Enum != nil && len(input.Enum) > 0 && (env == nil || env.opts.EnumLimit == 0 || len(input.Enum) <= env.opts.EnumLimit) {
+	if len(input.Enum) > 0 && (env == nil || env.opts.EnumLimit == 0 || len(input.Enum) <= env.opts.EnumLimit) {
 		newEnum := make([]*yaml.Node, 0, len(input.Enum))
 		seen := map[string]struct{}{}
 		for _, node := range input.Enum {
@@ -261,7 +257,7 @@ func builtinTrimstr(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 	}
 
 	// Enum preservation
-	if input.Enum != nil && len(input.Enum) > 0 && (env == nil || env.opts.EnumLimit == 0 || len(input.Enum) <= env.opts.EnumLimit) {
+	if len(input.Enum) > 0 && (env == nil || env.opts.EnumLimit == 0 || len(input.Enum) <= env.opts.EnumLimit) {
 		newEnum := make([]*yaml.Node, 0, len(input.Enum))
 		seen := map[string]struct{}{}
 		for _, node := range input.Enum {
@@ -359,7 +355,7 @@ func sliceFallbackByType(s *oas3.Schema) []*oas3.Schema {
 			return []*oas3.Schema{ArrayType(s.Items.Left)}
 		}
 		// Tuple-only: widen to union-of-prefix items
-		if s.PrefixItems != nil && len(s.PrefixItems) > 0 {
+		if len(s.PrefixItems) > 0 {
 			items := make([]*oas3.Schema, 0, len(s.PrefixItems))
 			for _, pi := range s.PrefixItems {
 				if pi.Left != nil {
@@ -392,7 +388,7 @@ func sliceArray(arr, endArg, startArg *oas3.Schema, env *schemaEnv) *oas3.Schema
 	endIdx, hasEnd := extractConstSliceEnd(endArg)
 
 	// When we have tuple prefixItems and const indices, slice them precisely
-	if arr.PrefixItems != nil && len(arr.PrefixItems) > 0 && hasStart && hasEnd {
+	if len(arr.PrefixItems) > 0 && hasStart && hasEnd {
 		n := len(arr.PrefixItems)
 		s, e := clampSliceBounds(startIdx, endIdx, n)
 
@@ -417,7 +413,7 @@ func sliceArray(arr, endArg, startArg *oas3.Schema, env *schemaEnv) *oas3.Schema
 	switch {
 	case arr.Items != nil && arr.Items.Left != nil:
 		itemSchema = arr.Items.Left
-	case arr.PrefixItems != nil && len(arr.PrefixItems) > 0:
+	case len(arr.PrefixItems) > 0:
 		cands := make([]*oas3.Schema, 0, len(arr.PrefixItems))
 		for _, pi := range arr.PrefixItems {
 			if pi.Left != nil {

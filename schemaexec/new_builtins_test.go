@@ -84,7 +84,7 @@ func TestMathBuiltins(t *testing.T) {
 			if actualType == "" || actualType == "null" || actualType == "bottom" {
 				if tt.expectType == "number" {
 					// This might be OK if it's a union
-					if result.Schema.AnyOf == nil || len(result.Schema.AnyOf) == 0 {
+					if len(result.Schema.AnyOf) == 0 {
 						t.Errorf("Expected %s or union, got %s", tt.expectType, actualType)
 					}
 				}
@@ -189,7 +189,7 @@ func TestSearchOps(t *testing.T) {
 		actualType := getType(result.Schema)
 		if actualType != "integer" && actualType != "" {
 			// Check if it's a union
-			if result.Schema.AnyOf == nil || len(result.Schema.AnyOf) == 0 {
+			if len(result.Schema.AnyOf) == 0 {
 				t.Errorf("Expected integer|null union, got %s with no anyOf", actualType)
 			}
 		}

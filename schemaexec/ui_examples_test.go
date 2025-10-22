@@ -44,11 +44,11 @@ func TestUIExample_UserInput(t *testing.T) {
 	}
 
 	// Validate userId property
-	if userId, ok := result.Schema.Properties.Get("userId"); ok && userId.Left != nil {
-		userIdType := getType(userId.Left)
-		t.Logf("✅ userId exists with type: %s", userIdType)
-		if userIdType != "number" {
-			t.Errorf("Expected userId type 'number', got '%s'", userIdType)
+	if userID, ok := result.Schema.Properties.Get("userId"); ok && userID.Left != nil {
+		userIDType := getType(userID.Left)
+		t.Logf("✅ userId exists with type: %s", userIDType)
+		if userIDType != "number" {
+			t.Errorf("Expected userId type 'number', got '%s'", userIDType)
 		}
 	} else {
 		t.Error("❌ Missing userId property")
@@ -73,7 +73,7 @@ func TestUIExample_UserInput(t *testing.T) {
 			t.Errorf("Expected tier type 'string', got '%s'", tierType)
 		}
 		// Check if enum values are "gold" and "silver" (conservative union)
-		if tier.Left.Enum != nil && len(tier.Left.Enum) > 0 {
+		if len(tier.Left.Enum) > 0 {
 			t.Logf("  tier enum values: %d values", len(tier.Left.Enum))
 		}
 	} else {
@@ -151,11 +151,11 @@ func TestUIExample_ProductInput(t *testing.T) {
 	}
 
 	// Validate productId property
-	if productId, ok := result.Schema.Properties.Get("productId"); ok && productId.Left != nil {
-		productIdType := getType(productId.Left)
-		t.Logf("✅ productId exists with type: %s", productIdType)
-		if productIdType != "string" {
-			t.Errorf("Expected productId type 'string', got '%s'", productIdType)
+	if productID, ok := result.Schema.Properties.Get("productId"); ok && productID.Left != nil {
+		productIDType := getType(productID.Left)
+		t.Logf("✅ productId exists with type: %s", productIDType)
+		if productIDType != "string" {
+			t.Errorf("Expected productId type 'string', got '%s'", productIDType)
 		}
 	} else {
 		t.Error("❌ Missing productId property")

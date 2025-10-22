@@ -1,3 +1,4 @@
+// Package jqfmt provides formatting utilities for jq queries.
 package jqfmt
 
 import (
@@ -86,11 +87,11 @@ func strToQuery(jqStr string) (Query, error) {
 	}
 
 	// Convert from jq.Query to Query.
-	jqAstJson, err := json.Marshal(jqAstPty)
+	jqAstJSON, err := json.Marshal(jqAstPty)
 	if err != nil {
 		return jqAstQ, fmt.Errorf("could not convert query: %w", err)
 	}
-	json.Unmarshal([]byte(jqAstJson), &jqAstQ)
+	json.Unmarshal([]byte(jqAstJSON), &jqAstQ)
 
 	return jqAstQ, nil
 }

@@ -1,3 +1,4 @@
+// Package playground provides utilities for executing jq transformations on OpenAPI specifications.
 package playground
 
 import (

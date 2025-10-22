@@ -21,7 +21,7 @@ func extractPathsFromSchema(pathSchema *oas3.Schema) [][]PathSegment {
 	}
 
 	// Handle case where path is a single path (array with prefixItems)
-	if pathSchema.PrefixItems != nil && len(pathSchema.PrefixItems) > 0 {
+	if len(pathSchema.PrefixItems) > 0 {
 		// Single path represented as tuple
 		path := extractSinglePath(pathSchema)
 		if path != nil {
@@ -37,7 +37,7 @@ func extractPathsFromSchema(pathSchema *oas3.Schema) [][]PathSegment {
 
 		if itemType == "array" {
 			// Check if this is a union of multiple path tuples (AnyOf)
-			if itemSchema.AnyOf != nil && len(itemSchema.AnyOf) > 0 {
+			if len(itemSchema.AnyOf) > 0 {
 				// Multiple paths - extract each from AnyOf
 				paths := make([][]PathSegment, 0, len(itemSchema.AnyOf))
 				for _, anyOfSchema := range itemSchema.AnyOf {
@@ -89,7 +89,7 @@ func extractSinglePath(pathSchema *oas3.Schema) []PathSegment {
 // extractSegmentFromSchema converts a schema to a path segment
 func extractSegmentFromSchema(schema *oas3.Schema) PathSegment {
 	// Check for const string (property name)
-	if getType(schema) == "string" && schema.Enum != nil && len(schema.Enum) > 0 {
+	if getType(schema) == "string" && len(schema.Enum) > 0 {
 		if schema.Enum[0].Kind == yaml.ScalarNode {
 			return PathSegment{
 				Key:        schema.Enum[0].Value,
@@ -99,7 +99,7 @@ func extractSegmentFromSchema(schema *oas3.Schema) PathSegment {
 	}
 
 	// Check for const integer (array index)
-	if getType(schema) == "integer" && schema.Enum != nil && len(schema.Enum) > 0 {
+	if getType(schema) == "integer" && len(schema.Enum) > 0 {
 		if schema.Enum[0].Kind == yaml.ScalarNode {
 			// Parse integer value
 			var idx int64

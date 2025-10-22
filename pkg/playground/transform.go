@@ -1,8 +1,8 @@
+// Package playground provides utilities for executing jq transformations on OpenAPI specifications.
 package playground
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -159,8 +159,8 @@ type PipelineResult struct {
 	Panel1         string   `json:"panel1"`
 	Panel2         string   `json:"panel2"`
 	Panel3         string   `json:"panel3"`
-	AppliedFromApi bool     `json:"appliedFromApi"`
-	AppliedToApi   bool     `json:"appliedToApi"`
+	AppliedFromAPI bool     `json:"appliedFromApi"`
+	AppliedToAPI   bool     `json:"appliedToApi"`
 	Warnings       []string `json:"warnings"`
 }
 
@@ -196,7 +196,7 @@ func SymbolicExecuteJQPipeline(oasYAML string, strict bool) (*PipelineResult, er
 
 	// Apply from-api transformation
 	appliedFrom, warnings := applyTransformationsToDoc(ctx, doc2, "x-speakeasy-transform-from-api", strict)
-	result.AppliedFromApi = appliedFrom
+	result.AppliedFromAPI = appliedFrom
 	// If there are transformation errors and strict mode is enabled, return them as errors
 	if strict && len(warnings) > 0 {
 		return nil, fmt.Errorf("%s", FormatTransformErrors(warnings))
@@ -218,7 +218,7 @@ func SymbolicExecuteJQPipeline(oasYAML string, strict bool) (*PipelineResult, er
 
 	// Apply to-api transformation
 	appliedTo, warningsTo := applyTransformationsToDoc(ctx, doc3, "x-speakeasy-transform-to-api", strict)
-	result.AppliedToApi = appliedTo
+	result.AppliedToAPI = appliedTo
 	// If there are transformation errors and strict mode is enabled, return them as errors
 	if strict && len(warningsTo) > 0 {
 		return nil, fmt.Errorf("%s", FormatTransformErrors(warningsTo))
@@ -451,54 +451,3 @@ func ensurePropertiesInitialized(schema *oas3.Schema) {
 	}
 }
 
-// executeJQInternal runs a JQ query against JSON input and returns the result
-func executeJQInternal(query, jsonInput string) (string, error) {
-	// Parse the JQ query
-	q, err := gojq.Parse(query)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse jq query: %w", err)
-	}
-
-	// Parse the JSON input
-	var input any
-	if err := json.Unmarshal([]byte(jsonInput), &input); err != nil {
-		return "", fmt.Errorf("failed to parse JSON input: %w", err)
-	}
-
-	// Compile the query
-	code, err := gojq.Compile(q)
-	if err != nil {
-		return "", fmt.Errorf("failed to compile jq query: %w", err)
-	}
-
-	// Execute the query
-	iter := code.Run(input)
-	var results []any
-	for {
-		v, ok := iter.Next()
-		if !ok {
-			break
-		}
-		if err, ok := v.(error); ok {
-			return "", fmt.Errorf("execution error: %w", err)
-		}
-		results = append(results, v)
-	}
-
-	// If there's only one result, return it directly
-	// Otherwise return an array of results
-	var output any
-	if len(results) == 1 {
-		output = results[0]
-	} else {
-		output = results
-	}
-
-	// Marshal the result back to JSON
-	outBytes, err := json.MarshalIndent(output, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal result: %w", err)
-	}
-
-	return string(outBytes), nil
-}

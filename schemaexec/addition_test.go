@@ -197,7 +197,7 @@ func TestAddition_ArrayPlusArray_DifferentItemTypes(t *testing.T) {
 	hasStringType := false
 
 	// Check if it's an anyOf
-	if itemSchema.AnyOf != nil && len(itemSchema.AnyOf) > 0 {
+	if len(itemSchema.AnyOf) > 0 {
 		for _, variant := range itemSchema.AnyOf {
 			if variant.Left != nil {
 				vType := getType(variant.Left)
@@ -573,7 +573,7 @@ func TestAddition_ObjectLiteralChain(t *testing.T) {
 			t.Errorf("Expected property 'a' type 'integer', got '%s'", aType)
 		}
 		// Check that it's the value 42 (rightmost), not 1
-		if propA.Left.Enum != nil && len(propA.Left.Enum) == 1 {
+		if len(propA.Left.Enum) == 1 {
 			if propA.Left.Enum[0].Value != "42" {
 				t.Errorf("Expected property 'a' enum value '42', got '%s'", propA.Left.Enum[0].Value)
 			}

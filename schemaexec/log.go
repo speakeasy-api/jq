@@ -246,15 +246,6 @@ type SchemaLogOptions struct {
 	LogStackPreviewDepth int // default 3 (not used here, but kept for parity)
 }
 
-func defaultSchemaLogOptions() SchemaLogOptions {
-	return SchemaLogOptions{
-		LogMaxEnumValues:     5,
-		LogMaxProps:          5,
-		LogMaxAnyOfBranches:  5,
-		LogStackPreviewDepth: 3,
-	}
-}
-
 // schemaTypeSummary returns a compact one-line representation of a schema's shape.
 // It avoids heavy traversal and truncates collections to keep output small.
 func schemaTypeSummary(s *oas3.Schema, maxDepth int) string {
@@ -265,7 +256,7 @@ func schemaTypeSummary(s *oas3.Schema, maxDepth int) string {
 	if typ == "" {
 		// Unknown/Top-like
 		// Try to hint at structure
-		if s.AnyOf != nil && len(s.AnyOf) > 0 {
+		if len(s.AnyOf) > 0 {
 			return fmt.Sprintf("anyOf(%d)", len(s.AnyOf))
 		}
 		if s.Properties != nil {
@@ -283,7 +274,7 @@ func schemaTypeSummary(s *oas3.Schema, maxDepth int) string {
 
 	switch typ {
 	case "string", "number", "integer", "boolean", "null":
-		if s.Enum != nil && len(s.Enum) > 0 {
+		if len(s.Enum) > 0 {
 			values := previewEnumStrings(s.Enum, 5)
 			return fmt.Sprintf("%s(enum:%s)", typ, values)
 		}
@@ -301,7 +292,7 @@ func schemaTypeSummary(s *oas3.Schema, maxDepth int) string {
 
 	case "array":
 		// tuple?
-		if s.PrefixItems != nil && len(s.PrefixItems) > 0 {
+		if len(s.PrefixItems) > 0 {
 			if maxDepth <= 0 {
 				return fmt.Sprintf("tuple[len=%d]", len(s.PrefixItems))
 			}
@@ -324,7 +315,7 @@ func schemaTypeSummary(s *oas3.Schema, maxDepth int) string {
 
 	default:
 		// anyOf etc
-		if s.AnyOf != nil && len(s.AnyOf) > 0 {
+		if len(s.AnyOf) > 0 {
 			branches := make([]string, 0, min(3, len(s.AnyOf)))
 			limit := min(3, len(s.AnyOf))
 			for i := 0; i < limit; i++ {
@@ -348,82 +339,6 @@ func schemaTypeSummary(s *oas3.Schema, maxDepth int) string {
 // schemaDelta returns a compact delta from before -> after, focusing on type,
 // object props presence, array item shape, and anyOf size. It is intentionally
 // shallow to keep logs readable and low-cost.
-func schemaDelta(before, after *oas3.Schema, opts SchemaLogOptions) string {
-	if before == nil && after == nil {
-		return ""
-	}
-	if opts.LogMaxEnumValues <= 0 {
-		opts = defaultSchemaLogOptions()
-	}
-
-	var parts []string
-
-	bt := schemaTypeShort(before)
-	at := schemaTypeShort(after)
-	if bt != at {
-		parts = append(parts, fmt.Sprintf("type: %s -> %s", bt, at))
-	}
-
-	// object property presence deltas
-	if getType(after) == "object" || getType(before) == "object" {
-		added, removed := diffPropertyKeys(before, after)
-		if len(added) > 0 {
-			parts = append(parts, "+prop["+truncateList(added, opts.LogMaxProps)+"]")
-		}
-		if len(removed) > 0 {
-			parts = append(parts, "-prop["+truncateList(removed, opts.LogMaxProps)+"]")
-		}
-	}
-
-	// array items delta (homogenous)
-	if getType(before) == "array" || getType(after) == "array" {
-		var bi, ai string
-		if before != nil && before.Items != nil && before.Items.Left != nil {
-			bi = schemaTypeSummary(before.Items.Left, 1)
-		}
-		if after != nil && after.Items != nil && after.Items.Left != nil {
-			ai = schemaTypeSummary(after.Items.Left, 1)
-		}
-		if bi != ai {
-			if bi == "" {
-				bi = "Top"
-			}
-			if ai == "" {
-				ai = "Top"
-			}
-			parts = append(parts, fmt.Sprintf("items: %s -> %s", bi, ai))
-		}
-		// tuple lens
-		bl := tupleLen(before)
-		al := tupleLen(after)
-		if bl != al {
-			parts = append(parts, fmt.Sprintf("tuple: %d -> %d", bl, al))
-		}
-	}
-
-	// anyOf size
-	ba := anyOfLen(before)
-	aa := anyOfLen(after)
-	if ba != aa {
-		parts = append(parts, fmt.Sprintf("anyOf: %d -> %d", ba, aa))
-	}
-
-	// enum for primitives
-	if isPrimitive(after) {
-		aen := previewEnumStrings(nonNil(after).Enum, opts.LogMaxEnumValues)
-		ben := previewEnumStrings(nonNil(before).Enum, opts.LogMaxEnumValues)
-		if aen != ben {
-			if aen == "" && ben != "" {
-				parts = append(parts, "enum: cleared")
-			} else if aen != "" {
-				parts = append(parts, "enum: "+aen)
-			}
-		}
-	}
-
-	return strings.Join(parts, " ")
-}
-
 // truncateList joins items with "," and appends +N if truncated.
 func truncateList(items []string, max int) string {
 	if max <= 0 || len(items) <= max {
@@ -434,80 +349,6 @@ func truncateList(items []string, max int) string {
 }
 
 // Internal helpers ------------------------------------------------------------
-
-func schemaTypeShort(s *oas3.Schema) string {
-	if s == nil {
-		return "Bottom"
-	}
-	t := getType(s)
-	if t == "" {
-		return "Top"
-	}
-	return t
-}
-
-func diffPropertyKeys(before, after *oas3.Schema) (added []string, removed []string) {
-	bset := make(map[string]struct{})
-	aset := make(map[string]struct{})
-
-	if before != nil && before.Properties != nil {
-		for k := range before.Properties.All() {
-			bset[k] = struct{}{}
-		}
-	}
-	if after != nil && after.Properties != nil {
-		for k := range after.Properties.All() {
-			aset[k] = struct{}{}
-		}
-	}
-
-	for k := range aset {
-		if _, ok := bset[k]; !ok {
-			added = append(added, k)
-		}
-	}
-	for k := range bset {
-		if _, ok := aset[k]; !ok {
-			removed = append(removed, k)
-		}
-	}
-	sort.Strings(added)
-	sort.Strings(removed)
-	return
-}
-
-func tupleLen(s *oas3.Schema) int {
-	if s == nil || s.PrefixItems == nil {
-		return 0
-	}
-	return len(s.PrefixItems)
-}
-
-func anyOfLen(s *oas3.Schema) int {
-	if s == nil || s.AnyOf == nil {
-		return 0
-	}
-	return len(s.AnyOf)
-}
-
-func isPrimitive(s *oas3.Schema) bool {
-	if s == nil {
-		return false
-	}
-	switch getType(s) {
-	case "string", "number", "integer", "boolean", "null":
-		return true
-	default:
-		return false
-	}
-}
-
-func nonNil(s *oas3.Schema) *oas3.Schema {
-	if s == nil {
-		return &oas3.Schema{}
-	}
-	return s
-}
 
 func previewPropertyKeys(s *oas3.Schema, limit int) string {
 	if s == nil || s.Properties == nil {
@@ -522,7 +363,7 @@ func previewPropertyKeys(s *oas3.Schema, limit int) string {
 }
 
 func previewEnumStrings(enum []*yaml.Node, limit int) string {
-	if enum == nil || len(enum) == 0 {
+	if len(enum) == 0 {
 		return ""
 	}
 	vals := make([]string, 0, min(limit, len(enum)))

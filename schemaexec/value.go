@@ -25,7 +25,7 @@ type AValue struct {
 	Closure *Closure
 }
 
-// Constructors and accessors.
+// NewSchemaValue constructs an AValue containing a Schema.
 func NewSchemaValue(s *oas3.Schema) AValue {
 	return AValue{Kind: VSchema, Schema: s}
 }

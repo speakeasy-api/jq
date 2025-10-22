@@ -19,7 +19,6 @@ type schemaEnv struct {
 	opts     SchemaExecOptions
 	codes    []codeOp // Simplified view of bytecode
 	stack    *schemaStack
-	pc       int
 	warnings []string
 	scopes   *scopeFrames // Scope frame stack for variable management
 	logger   Logger       // Logger for debug tracing
@@ -56,39 +55,6 @@ func newScopeFrames() *scopeFrames {
 // pushFrame creates a new variable scope.
 func (sf *scopeFrames) pushFrame() {
 	sf.frames = append(sf.frames, make(map[string]*oas3.Schema))
-}
-
-// popFrame removes the current variable scope.
-func (sf *scopeFrames) popFrame() {
-	if len(sf.frames) > 0 {
-		sf.frames = sf.frames[:len(sf.frames)-1]
-	}
-}
-
-// currentFrame returns the current variable frame (or nil if no frames).
-func (sf *scopeFrames) currentFrame() map[string]*oas3.Schema {
-	if len(sf.frames) == 0 {
-		return nil
-	}
-	return sf.frames[len(sf.frames)-1]
-}
-
-// store saves a schema to the current frame.
-func (sf *scopeFrames) store(key string, schema *oas3.Schema) {
-	if frame := sf.currentFrame(); frame != nil {
-		frame[key] = schema
-	}
-}
-
-// load retrieves a schema from the current or outer frames.
-func (sf *scopeFrames) load(key string) (*oas3.Schema, bool) {
-	// Search from innermost to outermost frame
-	for i := len(sf.frames) - 1; i >= 0; i-- {
-		if schema, ok := sf.frames[i][key]; ok {
-			return schema, true
-		}
-	}
-	return nil, false
 }
 
 // codeOp represents a bytecode operation for schema execution.
@@ -581,316 +547,6 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 
 // executeOp executes a single bytecode operation (legacy single-state version).
 // Kept for backwards compatibility, not used in multi-state execution.
-func (env *schemaEnv) executeOp(c *codeOp) error {
-	switch c.op {
-	case opNop:
-		return nil
-
-	case opPush:
-		return env.execPush(c)
-
-	case opPop:
-		return env.execPop(c)
-
-	case opConst:
-		return env.execConst(c)
-
-	case opIndex:
-		return env.execIndex(c)
-
-	case opIndexArray:
-		return env.execIndexArray(c)
-
-	case opIter:
-		return env.execIter(c)
-
-	case opObject:
-		return env.execObject(c)
-
-	case opRet:
-		// Return from function - pop scope frame
-		env.scopes.popFrame()
-		return nil
-
-	case opScope:
-		// Enter new variable scope
-		env.scopes.pushFrame()
-		return nil
-
-	case opStore:
-		// Store variable in current scope frame
-		if !env.stack.empty() {
-			val := env.stack.popSchema()
-			// The value contains [scopeID, varIndex]
-			key := fmt.Sprintf("%v", c.value)
-			env.scopes.store(key, val)
-		}
-		return nil
-
-	case opLoad:
-		// Load variable from scope frames (searches inner to outer)
-		key := fmt.Sprintf("%v", c.value)
-		if val, ok := env.scopes.load(key); ok {
-			env.stack.pushSchema(val)
-		} else {
-			// Variable not found - push Top
-			env.stack.pushSchema(Top())
-			env.addWarning("variable %s not found, using Top", key)
-		}
-		return nil
-
-	case opDup:
-		// Duplicate top of stack
-		if env.stack.empty() {
-			return fmt.Errorf("stack underflow on dup")
-		}
-		top := env.stack.topSchema()
-		env.stack.pushSchema(top)
-		return nil
-
-	case opCall:
-		// Function call
-		return env.execCall(c)
-
-	// Unsupported opcodes - handle gracefully
-	default:
-		if env.strict {
-			return fmt.Errorf("strict mode: unsupported opcode %d", c.op)
-		}
-
-		// Permissive mode: widen to Top
-		env.addWarning("unsupported opcode %d, widening to Top", c.op)
-		if !env.stack.empty() {
-			env.stack.popSchema()
-		}
-		env.stack.pushSchema(Top())
-		return nil
-	}
-}
-
-// ============================================================================
-// OPCODE HANDLERS
-// ============================================================================
-
-// execPush handles oppush - push a constant value as a schema.
-func (env *schemaEnv) execPush(c *codeOp) error {
-	v := c.value
-
-	var schema *oas3.Schema
-	switch val := v.(type) {
-	case string:
-		schema = ConstString(val)
-	case float64:
-		if val == math.Trunc(val) {
-			schema = ConstInteger(int64(val))
-		} else {
-			schema = ConstNumber(val)
-		}
-	case int:
-		schema = ConstInteger(int64(val))
-	case bool:
-		schema = ConstBool(val)
-	case nil:
-		schema = ConstNull()
-	case map[string]any:
-		// Object literal - build schema from the literal values
-		schema = buildObjectFromLiteral(val)
-	case []any:
-		// Array literal - build schema from the literal values
-		schema = buildArrayFromLiteral(val)
-	default:
-		schema = Top()
-		env.addWarning("unknown constant type: %T", v)
-	}
-
-	env.stack.pushSchema(schema)
-	return nil
-}
-
-// execPop handles oppop - remove top value from stack.
-func (env *schemaEnv) execPop(c *codeOp) error {
-	if env.stack.empty() {
-		return fmt.Errorf("stack underflow on pop")
-	}
-	env.stack.popSchema()
-	return nil
-}
-
-// execConst handles opconst - replace top of stack with constant.
-func (env *schemaEnv) execConst(c *codeOp) error {
-	if env.stack.empty() {
-		return fmt.Errorf("stack underflow on const")
-	}
-
-	env.stack.popSchema()
-
-	// Push the constant value
-	v := c.value
-	var schema *oas3.Schema
-	switch val := v.(type) {
-	case string:
-		schema = ConstString(val)
-	case float64:
-		if val == math.Trunc(val) {
-			schema = ConstInteger(int64(val))
-		} else {
-			schema = ConstNumber(val)
-		}
-	case int:
-		schema = ConstInteger(int64(val))
-	case bool:
-		schema = ConstBool(val)
-	case nil:
-		schema = ConstNull()
-	default:
-		schema = Top()
-	}
-
-	env.stack.pushSchema(schema)
-	return nil
-}
-
-// execIndex handles opindex - index into object or array with a constant key.
-func (env *schemaEnv) execIndex(c *codeOp) error {
-	if env.stack.empty() {
-		return fmt.Errorf("stack underflow on index")
-	}
-
-	base := env.stack.popSchema()
-	indexKey := c.value // The key is stored in the code
-
-	var result *oas3.Schema
-
-	// Determine what we're indexing
-	baseType := getType(base)
-
-	switch baseType {
-	case "object":
-		// Object property access
-		if key, ok := indexKey.(string); ok {
-			result = GetProperty(base, key, env.opts)
-		} else {
-			result = Top()
-			env.addWarning("non-string object index")
-		}
-
-	case "array":
-		// Array slicing or indexing
-		if isSliceIndex(indexKey) {
-			// Slicing preserves array schema
-			result = base
-		} else {
-			result = getArrayElement(base, indexKey, env.opts)
-			if result == nil {
-				result = Top()
-			}
-		}
-
-	case "":
-		// Unknown type - could be object or array
-		// Try both and union
-		if key, ok := indexKey.(string); ok {
-			objResult := GetProperty(base, key, env.opts)
-			arrResult := Top() // Conservative for array case
-			result = Union([]*oas3.Schema{objResult, arrResult}, env.opts)
-		} else {
-			result = Top()
-		}
-
-	default:
-		// Indexing other types returns null in jq
-		result = ConstNull()
-	}
-
-	env.stack.pushSchema(result)
-	return nil
-}
-
-// execIndexArray handles opindexarray - index that requires array type.
-func (env *schemaEnv) execIndexArray(c *codeOp) error {
-	// Similar to execIndex but enforces array type
-	return env.execIndex(c)
-}
-
-// execIter handles opiter - iterate array or object values.
-func (env *schemaEnv) execIter(c *codeOp) error {
-	if env.stack.empty() {
-		return fmt.Errorf("stack underflow on iter")
-	}
-
-	val := env.stack.popSchema()
-	baseType := getType(val)
-
-	var itemSchema *oas3.Schema
-
-	switch baseType {
-	case "array":
-		// Iterate array items
-		if val.Items != nil && val.Items.Left != nil {
-			itemSchema = val.Items.Left
-		} else {
-			itemSchema = Top()
-		}
-
-	case "object":
-		// Iterate object values - union of all property schemas
-		itemSchema = unionAllObjectValues(val, env.opts)
-
-	case "":
-		// Unknown type - could be either
-		itemSchema = Top()
-
-	default:
-		// Non-iterable returns nothing
-		itemSchema = Bottom()
-	}
-
-	env.stack.pushSchema(itemSchema)
-	return nil
-}
-
-// execObject handles opobject - construct object from key-value pairs.
-func (env *schemaEnv) execObject(c *codeOp) error {
-	n := c.value.(int) // Number of key-value pairs
-
-	props := make(map[string]*oas3.Schema)
-	required := make([]string, 0, n)
-
-	for i := 0; i < n; i++ {
-		if env.stack.len() < 2 {
-			return fmt.Errorf("stack underflow on object construction (need %d pairs, stack has %d)", n, env.stack.len()/2)
-		}
-
-		val := env.stack.popSchema()
-		key := env.stack.popSchema()
-
-		// Check if key is constant string
-		if getType(key) == "string" && key.Enum != nil && len(key.Enum) > 0 {
-			// Extract constant string from enum
-			keyNode := key.Enum[0]
-			if keyNode.Kind == yaml.ScalarNode {
-				keyStr := keyNode.Value
-				props[keyStr] = val
-				// In jq object construction, keys are always present
-				required = append(required, keyStr)
-			}
-		} else {
-			// Dynamic key - not fully supported yet
-			if env.strict {
-				return fmt.Errorf("strict mode: dynamic object keys in object constructor are not supported")
-			}
-			env.addWarning("dynamic object key not fully supported")
-		}
-	}
-	obj := BuildObject(props, required)
-	env.stack.pushSchema(obj)
-	return nil
-}
-
-// ============================================================================
-// HELPERS
-// ============================================================================
-
 // addWarning adds a warning message to the execution result.
 func (env *schemaEnv) addWarning(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
@@ -1150,13 +806,13 @@ func (env *schemaEnv) execObjectMulti(state *execState, c *codeOp) ([]*execState
 
 		if env.opts.EnableWarnings {
 			keyStr := "<?>"
-			if getType(key) == "string" && key.Enum != nil && len(key.Enum) > 0 && key.Enum[0].Kind == yaml.ScalarNode {
+			if getType(key) == "string" && len(key.Enum) > 0 && key.Enum[0].Kind == yaml.ScalarNode {
 				keyStr = key.Enum[0].Value
 			}
 			env.addWarning("opObject: pair %d: key=%s, valType=%s", i, keyStr, getType(val))
 		}
 
-		if getType(key) == "string" && key.Enum != nil && len(key.Enum) > 0 {
+		if getType(key) == "string" && len(key.Enum) > 0 {
 			keyNode := key.Enum[0]
 			if keyNode.Kind == yaml.ScalarNode {
 				// Guard against nil values (would create invalid JSONSchema wrappers)
@@ -1264,11 +920,11 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 	// This preserves the path structure for delpaths/getpath/setpath
 	var unionedItems *oas3.Schema
 	valType := getType(val)
-	hasTuplePrefixItems := val != nil && val.PrefixItems != nil && len(val.PrefixItems) > 0
+	hasTuplePrefixItems := val != nil && len(val.PrefixItems) > 0
 
 	if valType == "array" && hasTuplePrefixItems {
 		// This is a path tuple - don't union, but collect multiple paths
-		priorIsTuple := getType(priorItems) == "array" && priorItems.PrefixItems != nil && len(priorItems.PrefixItems) > 0
+		priorIsTuple := getType(priorItems) == "array" && len(priorItems.PrefixItems) > 0
 
 		if priorItems == Bottom() || getType(priorItems) == "" {
 			// First path - use directly
@@ -1342,7 +998,7 @@ func (env *schemaEnv) execJumpIfNot(state *execState, c *codeOp) ([]*execState, 
 	// unless we can definitely determine truthiness
 
 	isDefinitelyFalse := (val != nil && getType(val) == "boolean" &&
-		val.Enum != nil && len(val.Enum) == 1 &&
+		len(val.Enum) == 1 &&
 		val.Enum[0].Value == "false")
 
 	isDefinitelyNull := (val != nil && getType(val) == "null")
@@ -1508,77 +1164,6 @@ func (env *schemaEnv) valueToSchema(v any) *oas3.Schema {
 		return Top()
 	}
 }
-
-// execCall handles function calls (opcall).
-func (env *schemaEnv) execCall(c *codeOp) error {
-	// The value can be different things:
-	// - [3]any{func, argCount, name} for simple builtins
-	// - int for user-defined functions
-	// - string for simple builtins
-
-	switch v := c.value.(type) {
-	case [3]any:
-		// Builtin function call
-		// v[0] = function pointer (ignore for symbolic)
-		// v[1] = arg count
-		// v[2] = function name
-
-		argCount := 0
-		if ac, ok := v[1].(int); ok {
-			argCount = ac
-		}
-
-		funcName := ""
-		if fn, ok := v[2].(string); ok {
-			funcName = fn
-		}
-
-		// Pop arguments and input from stack
-		args := make([]*oas3.Schema, argCount)
-		for i := argCount - 1; i >= 0; i-- {
-			if env.stack.empty() {
-				return fmt.Errorf("stack underflow on call args")
-			}
-			args[i] = env.stack.popSchema()
-		}
-
-		// Pop input
-		if env.stack.empty() {
-			return fmt.Errorf("stack underflow on call input")
-		}
-		input := env.stack.popSchema()
-
-		// Call builtin
-		results, err := env.callBuiltin(funcName, input, args)
-		if err != nil {
-			// Builtin not implemented - widen to Top
-			env.addWarning("builtin %s not implemented: %v", funcName, err)
-			env.stack.pushSchema(Top())
-			return nil
-		}
-
-		// Push result (union if multiple)
-		if len(results) == 0 {
-			env.stack.pushSchema(Bottom())
-		} else if len(results) == 1 {
-			env.stack.pushSchema(results[0])
-		} else {
-			env.stack.pushSchema(Union(results, env.opts))
-		}
-
-		return nil
-
-	default:
-		// User-defined function or unknown
-		env.addWarning("user-defined function call not yet supported")
-		if !env.stack.empty() {
-			env.stack.popSchema()
-		}
-		env.stack.pushSchema(Top())
-		return nil
-	}
-}
-
 // unionAllObjectValues creates union of all property and additionalProperty schemas.
 func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	schemas := make([]*oas3.Schema, 0)

@@ -82,8 +82,8 @@ var builtinRegistry = map[string]builtinFunc{
 	"endswith":       builtinEndswith,
 	"ltrimstr":       builtinLtrimstr,
 	"rtrimstr":       builtinRtrimstr,
-	"ascii_downcase": builtinAsciiDowncase,
-	"ascii_upcase":   builtinAsciiUpcase,
+	"ascii_downcase": builtinASCIIDowncase,
+	"ascii_upcase":   builtinASCIIUpcase,
 
 	// Math operations
 	"floor": builtinFloor,
@@ -240,7 +240,7 @@ func builtinHas(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 
 	// Check if the key is a constant string
 	keyArg := args[0]
-	if getType(keyArg) == "string" && keyArg.Enum != nil && len(keyArg.Enum) > 0 {
+	if getType(keyArg) == "string" && len(keyArg.Enum) > 0 {
 		keyStr := keyArg.Enum[0].Value
 
 		// Check if property exists in schema
@@ -587,8 +587,8 @@ func builtinRtrimstr(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([
 	return []*oas3.Schema{StringType()}, nil
 }
 
-// builtinAsciiDowncase converts string to lowercase
-func builtinAsciiDowncase(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+// builtinASCIIDowncase converts string to lowercase
+func builtinASCIIDowncase(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
 	if !MightBeString(input) {
 		// Conservative: return string type (don't prune path completely)
 		return []*oas3.Schema{StringType()}, nil
@@ -600,7 +600,7 @@ func builtinAsciiDowncase(input *oas3.Schema, args []*oas3.Schema, env *schemaEn
 	}
 
 	// Enum preservation
-	if input.Enum != nil && len(input.Enum) > 0 && len(input.Enum) <= env.opts.EnumLimit {
+	if len(input.Enum) > 0 && len(input.Enum) <= env.opts.EnumLimit {
 		newEnum := make([]*yaml.Node, len(input.Enum))
 		for i, node := range input.Enum {
 			if node.Kind == yaml.ScalarNode {
@@ -621,8 +621,8 @@ func builtinAsciiDowncase(input *oas3.Schema, args []*oas3.Schema, env *schemaEn
 	return []*oas3.Schema{StringType()}, nil
 }
 
-// builtinAsciiUpcase converts string to uppercase
-func builtinAsciiUpcase(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+// builtinASCIIUpcase converts string to uppercase
+func builtinASCIIUpcase(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
 	if !MightBeString(input) {
 		// Conservative: return string type
 		return []*oas3.Schema{StringType()}, nil
@@ -634,7 +634,7 @@ func builtinAsciiUpcase(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv)
 	}
 
 	// Enum preservation
-	if input.Enum != nil && len(input.Enum) > 0 && len(input.Enum) <= env.opts.EnumLimit {
+	if len(input.Enum) > 0 && len(input.Enum) <= env.opts.EnumLimit {
 		newEnum := make([]*yaml.Node, len(input.Enum))
 		for i, node := range input.Enum {
 			if node.Kind == yaml.ScalarNode {
@@ -816,7 +816,7 @@ func builtinGroupBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 	itemType := Top()
 	if input.Items != nil && input.Items.Left != nil {
 		itemType = input.Items.Left
-	} else if input.PrefixItems != nil && len(input.PrefixItems) > 0 {
+	} else if len(input.PrefixItems) > 0 {
 		// For tuples, union all items
 		items := make([]*oas3.Schema, 0, len(input.PrefixItems))
 		for _, item := range input.PrefixItems {
@@ -1236,11 +1236,6 @@ func (env *schemaEnv) callBuiltin(name string, input *oas3.Schema, args []*oas3.
 }
 
 // isBuiltin checks if a name is a known builtin.
-func isBuiltin(name string) bool {
-	_, exists := builtinRegistry[name]
-	return exists
-}
-
 // ============================================================================
 // COMPARISON BUILTINS (for predicates in select, etc.)
 // ============================================================================
@@ -1409,100 +1404,6 @@ func compareValues(l, r any) int {
 // parseFloat parses a string to float64.
 func parseFloat(s string) (float64, error) {
 	return strconv.ParseFloat(s, 64)
-}
-
-// ============================================================================
-// LOGICAL BUILTINS
-// ============================================================================
-
-// builtinAnd implements logical AND.
-func builtinAnd(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
-		return []*oas3.Schema{BoolType()}, nil
-	}
-
-	// Check if definitely true/false
-	inputTruthy := isTruthy(input)
-	argTruthy := isTruthy(args[0])
-
-	if inputTruthy != nil && argTruthy != nil {
-		// Both definite
-		return []*oas3.Schema{ConstBool(*inputTruthy && *argTruthy)}, nil
-	}
-	if inputTruthy != nil && !*inputTruthy {
-		return []*oas3.Schema{ConstBool(false)}, nil // false AND x = false
-	}
-	if argTruthy != nil && !*argTruthy {
-		return []*oas3.Schema{ConstBool(false)}, nil // x AND false = false
-	}
-
-	return []*oas3.Schema{BoolType()}, nil
-}
-
-// builtinOr implements logical OR.
-func builtinOr(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
-		return []*oas3.Schema{BoolType()}, nil
-	}
-
-	inputTruthy := isTruthy(input)
-	argTruthy := isTruthy(args[0])
-
-	if inputTruthy != nil && argTruthy != nil {
-		return []*oas3.Schema{ConstBool(*inputTruthy || *argTruthy)}, nil
-	}
-	if inputTruthy != nil && *inputTruthy {
-		return []*oas3.Schema{ConstBool(true)}, nil // true OR x = true
-	}
-	if argTruthy != nil && *argTruthy {
-		return []*oas3.Schema{ConstBool(true)}, nil // x OR true = true
-	}
-
-	return []*oas3.Schema{BoolType()}, nil
-}
-
-// builtinNot implements logical NOT.
-func builtinNot(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	truthy := isTruthy(input)
-	if truthy != nil {
-		return []*oas3.Schema{ConstBool(!*truthy)}, nil
-	}
-	return []*oas3.Schema{BoolType()}, nil
-}
-
-// isTruthy determines if a schema is definitely truthy/falsy.
-// Returns nil if uncertain.
-func isTruthy(schema *oas3.Schema) *bool {
-	if schema == nil {
-		f := false
-		return &f // null is falsy
-	}
-
-	// Check for const boolean
-	if val, ok := extractConstValue(schema); ok {
-		if b, ok := val.(bool); ok {
-			return &b
-		}
-	}
-
-	// Check for const false/null
-	typ := getType(schema)
-	if typ == "boolean" && schema.Enum != nil && len(schema.Enum) == 1 {
-		if schema.Enum[0].Value == "false" {
-			f := false
-			return &f
-		}
-		if schema.Enum[0].Value == "true" {
-			t := true
-			return &t
-		}
-	}
-	if typ == "null" {
-		f := false
-		return &f
-	}
-
-	return nil // Unknown
 }
 
 // ============================================================================
