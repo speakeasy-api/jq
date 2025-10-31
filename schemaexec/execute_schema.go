@@ -28,6 +28,11 @@ type schemaEnv struct {
 	// Tracks why a Top schema was created during execution.
 	// Keyed by the exact Top() schema pointer identity.
 	topCauses map[*oas3.Schema]string
+
+	// Cache of per-ref-node resolved clones within a single execution.
+	// Keyed by the JSONSchema ($ref holder) node pointer. Prevents repeated
+	// cloning and preserves identity for mutations during execution.
+	refNodeCache map[*oas3.JSONSchema[oas3.Referenceable]]*oas3.Schema
 }
 
 // NewTopWithCause creates a Top schema and records the reason why it was created.
@@ -116,14 +121,15 @@ func newSchemaEnv(ctx context.Context, opts SchemaExecOptions) *schemaEnv {
 	execID := fmt.Sprintf("e%d", time.Now().UnixNano()%1000000)
 
 	return &schemaEnv{
-		ctx:      ctx,
-		opts:     opts,
-		stack:    newSchemaStack(),
-		warnings: make([]string, 0),
-		scopes:   scopes,
-		logger:   logger,
-		execID:   execID,
-		strict:   opts.StrictMode,
+		ctx:          ctx,
+		opts:         opts,
+		stack:        newSchemaStack(),
+		warnings:     make([]string, 0),
+		scopes:       scopes,
+		logger:       logger,
+		execID:       execID,
+		strict:       opts.StrictMode,
+		refNodeCache: make(map[*oas3.JSONSchema[oas3.Referenceable]]*oas3.Schema),
 	}
 }
 
@@ -606,6 +612,42 @@ func isSliceIndex(v any) bool {
 	return false
 }
 
+// isObjectLikeSchema checks if a schema has object-like structure even without explicit type
+// Heuristic shape check for schemas where Type is not set but structural hints are present
+// (common with $ref placeholders or schemas that omit type)
+func isObjectLikeSchema(s *oas3.Schema) bool {
+	if s == nil {
+		return false
+	}
+	// Properties present → object-like
+	if s.Properties != nil && s.Properties.Len() > 0 {
+		return true
+	}
+	// Presence of additionalProperties or required also implies object shape
+	if s.AdditionalProperties != nil {
+		return true
+	}
+	if len(s.Required) > 0 {
+		return true
+	}
+	return false
+}
+
+// isArrayLikeSchema checks if a schema has array-like structure even without explicit type
+func isArrayLikeSchema(s *oas3.Schema) bool {
+	if s == nil {
+		return false
+	}
+	// Items or prefixItems → array-like
+	if s.Items != nil {
+		return true
+	}
+	if s.PrefixItems != nil && len(s.PrefixItems) > 0 {
+		return true
+	}
+	return false
+}
+
 // getArrayElement returns the schema for arr[index].
 // Handles prefixItems, items, and unknown indices.
 func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oas3.Schema {
@@ -700,22 +742,27 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 	var result *oas3.Schema
 
 	baseType := getType(base)
-	switch baseType {
-	case "object":
+	// Use heuristic shape checks when explicit Type is missing
+	asObject := baseType == "object" || (baseType == "" && isObjectLikeSchema(base))
+	asArray := baseType == "array" || (baseType == "" && isArrayLikeSchema(base))
+
+	switch {
+	case asObject:
 		if key, ok := indexKey.(string); ok {
-			result = GetProperty(base, key, env.opts)
+			result = env.getPropertyLazy(base, key)
 		} else {
+			// Non-string key on object – conservative Top
 			result = Top()
 		}
-	case "array":
+	case asArray:
 		// Array slicing: .[start:end] returns same array type
 		if isSliceIndex(indexKey) {
 			result = base
 		} else {
-			result = getArrayElement(base, indexKey, env.opts)
+			result = env.getArrayElementLazy(base, indexKey)
 		}
 	default:
-		// Non-object type. If we are attempting property access (string key), annotate the Top with cause.
+		// Non-object/non-array. If attempting property access (string key), annotate Top for diagnostics.
 		if _, ok := indexKey.(string); ok {
 			cause := "property access on non-object type"
 			if baseType != "" {
@@ -757,22 +804,61 @@ func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, 
 
 	switch baseType {
 	case "array":
+		// Preserve explicit empty-array literal semantics:
+		// buildArrayFromLiteral([]) → Items.Left == nil and MaxItems==0 → no iteration
+		if val.Items != nil && val.Items.Left == nil && val.MaxItems != nil && *val.MaxItems == 0 {
+			return []*execState{}, nil
+		}
+
 		if val.Items != nil {
-			// Items field is set
-			if val.Items.Left != nil {
-				// Items.Left is set to actual schema
-				itemSchema = val.Items.Left
+			if s := env.derefJSONSchema(val.Items); s != nil {
+				itemSchema = s
+			} else if val.PrefixItems != nil && len(val.PrefixItems) > 0 {
+				// Fall back to union of tuple element schemas
+				elems := make([]*oas3.Schema, 0, len(val.PrefixItems))
+				for _, pi := range val.PrefixItems {
+					if e := env.derefJSONSchema(pi); e != nil {
+						elems = append(elems, e)
+					}
+				}
+				if len(elems) == 0 {
+					if env.strict {
+						return nil, fmt.Errorf("strict mode: unresolved array prefixItems for iteration")
+					}
+					itemSchema = Top()
+				} else {
+					itemSchema = Union(elems, env.opts)
+				}
 			} else {
-				// Items.Left is nil, meaning Bottom (empty array with 0 elements)
-				// Iterating an empty array produces no values, terminate this execution path
-				return []*execState{}, nil
+				// Unresolved items and no tuple fallback
+				if env.strict {
+					return nil, fmt.Errorf("strict mode: unresolved array items for iteration")
+				}
+				itemSchema = Top()
+			}
+		} else if val.PrefixItems != nil && len(val.PrefixItems) > 0 {
+			// Tuple-only array
+			elems := make([]*oas3.Schema, 0, len(val.PrefixItems))
+			for _, pi := range val.PrefixItems {
+				if e := env.derefJSONSchema(pi); e != nil {
+					elems = append(elems, e)
+				}
+			}
+			if len(elems) == 0 {
+				if env.strict {
+					return nil, fmt.Errorf("strict mode: unresolved array prefixItems for iteration")
+				}
+				itemSchema = Top()
+			} else {
+				itemSchema = Union(elems, env.opts)
 			}
 		} else {
-			// Items field not set at all - unconstrained array, items can be any type
+			// No items nor prefixItems → unconstrained array, items can be any type
 			itemSchema = Top()
 		}
+
 	case "object":
-		itemSchema = unionAllObjectValues(val, env.opts)
+		itemSchema = env.unionAllObjectValuesLazy(val)
 	default:
 		itemSchema = Bottom()
 	}
@@ -1301,6 +1387,226 @@ func buildPathSchemaFromSegments(segments []PathSegment) *oas3.Schema {
 
 	// Return tuple array (array with specific prefixItems)
 	return BuildArray(Top(), prefixItems)
+}
+
+// getPropertyLazy accesses a property from an object schema with lazy $ref resolution.
+func (env *schemaEnv) getPropertyLazy(base *oas3.Schema, key string) *oas3.Schema {
+	if base == nil {
+		return Bottom()
+	}
+
+	// Direct properties
+	if base.Properties != nil {
+		if propJSON, ok := base.Properties.Get(key); ok {
+			if s := env.derefJSONSchema(propJSON); s != nil {
+				return s
+			}
+			// Unresolved property $ref or missing inline
+			if env.strict {
+				env.addWarning("strict mode: unresolved property %q", key)
+			}
+			return Top()
+		}
+	}
+
+	// Fallback to additionalProperties if present
+	if base.AdditionalProperties != nil {
+		if s := env.derefJSONSchema(base.AdditionalProperties); s != nil {
+			return s
+		}
+		// Unresolved additionalProperties $ref
+		if env.strict {
+			env.addWarning("strict mode: unresolved additionalProperties for key %q", key)
+		}
+		return Top()
+	}
+
+	// Not found - consistent with GetProperty: return null
+	return ConstNull()
+}
+
+// getArrayElementLazy returns the schema for arr[index] with lazy $ref resolution.
+func (env *schemaEnv) getArrayElementLazy(arr *oas3.Schema, indexKey any) *oas3.Schema {
+	if arr == nil {
+		return Bottom()
+	}
+
+	// Constant integer index
+	if idx, ok := indexKey.(int); ok {
+		// Tuple (prefixItems) index
+		if arr.PrefixItems != nil && idx >= 0 && idx < len(arr.PrefixItems) {
+			if s := env.derefJSONSchema(arr.PrefixItems[idx]); s != nil {
+				return s
+			}
+			// Unresolved tuple item
+			if env.strict {
+				env.addWarning("strict mode: unresolved prefixItems[%d]", idx)
+			}
+			return Top()
+		}
+		// Items schema for indices beyond prefixItems
+		if arr.Items != nil {
+			if s := env.derefJSONSchema(arr.Items); s != nil {
+				return s
+			}
+			// Unresolved items $ref
+			if env.strict {
+				env.addWarning("strict mode: unresolved items for index %d", idx)
+			}
+			return Top()
+		}
+		// No schema for this index
+		return Top()
+	}
+
+	// Symbolic/unknown index → union all possible element schemas
+	var schemas []*oas3.Schema
+
+	// All tuple items
+	if arr.PrefixItems != nil {
+		for _, pi := range arr.PrefixItems {
+			if s := env.derefJSONSchema(pi); s != nil {
+				schemas = append(schemas, s)
+			}
+		}
+	}
+
+	// Items schema
+	if arr.Items != nil {
+		if s := env.derefJSONSchema(arr.Items); s != nil {
+			schemas = append(schemas, s)
+		}
+	}
+
+	if len(schemas) == 0 {
+		return Top()
+	}
+	return Union(schemas, env.opts)
+}
+
+// unionAllObjectValuesLazy creates union of all property and additionalProperty schemas with lazy $ref resolution.
+func (env *schemaEnv) unionAllObjectValuesLazy(obj *oas3.Schema) *oas3.Schema {
+	var schemas []*oas3.Schema
+
+	// All property values (deref each)
+	if obj != nil && obj.Properties != nil {
+		for _, v := range obj.Properties.All() {
+			if s := env.derefJSONSchema(v); s != nil {
+				schemas = append(schemas, s)
+			}
+		}
+	}
+
+	// additionalProperties (deref)
+	if obj != nil && obj.AdditionalProperties != nil {
+		if s := env.derefJSONSchema(obj.AdditionalProperties); s != nil {
+			schemas = append(schemas, s)
+		}
+	}
+
+	if len(schemas) == 0 {
+		return Top()
+	}
+	return Union(schemas, env.opts)
+}
+
+// derefJSONSchema resolves a single JSONSchema node to an underlying *oas3.Schema.
+// Entry point that enforces a depth guard using options.MaxRefDepth.
+func (env *schemaEnv) derefJSONSchema(js *oas3.JSONSchema[oas3.Referenceable]) *oas3.Schema {
+	return env.derefJSONSchemaDepth(js, 0)
+}
+
+// derefJSONSchemaDepth resolves a single JSONSchema node to an underlying *oas3.Schema,
+// using the env.opts.ResolveRef callback when the node is a $ref.
+// - Prefers Left (inline schema) when present.
+// - Applies per-node caching to preserve identity and avoid re-cloning.
+// - Guards recursion with MaxRefDepth.
+// - Returns nil when unresolved; callers decide whether to widen to Top or error in strict mode.
+func (env *schemaEnv) derefJSONSchemaDepth(js *oas3.JSONSchema[oas3.Referenceable], depth int) *oas3.Schema {
+	if js == nil {
+		return nil
+	}
+
+	// If the schema is already inline (non-reference), prefer it directly.
+	// Note: Some libraries may keep Left even when IsReference == true (OAS 3.1 + siblings).
+	// We still prefer Left because local overrides should win.
+	if js.Left != nil && !js.IsReference() {
+		return js.Left
+	}
+	if js.Left != nil && js.IsReference() {
+		// Prefer local overrides (Left) when present even if it carries a $ref marker.
+		return js.Left
+	}
+
+	// If not a reference and no inline schema, nothing to resolve.
+	if !js.IsReference() {
+		return js.Left
+	}
+
+	// Depth guard to avoid cycles/pathologies
+	maxDepth := env.opts.MaxRefDepth
+	if maxDepth <= 0 {
+		maxDepth = 16 // fallback safety if options unset
+	}
+	if depth >= maxDepth {
+		if env.strict {
+			env.addWarning("strict mode: max $ref depth (%d) exceeded for %q", maxDepth, js.GetReference().String())
+		} else {
+			env.addWarning("max $ref depth (%d) exceeded for %q", maxDepth, js.GetReference().String())
+		}
+		return nil
+	}
+
+	// Cache lookup keyed by the ref holder node pointer
+	if env.refNodeCache != nil {
+		if cached, ok := env.refNodeCache[js]; ok && cached != nil {
+			return cached
+		}
+	}
+
+	// No resolver configured
+	if env.opts.ResolveRef == nil {
+		// Let callers decide widening/error behavior; record a warning for visibility.
+		env.addWarning("no ResolveRef callback provided; cannot dereference %q", js.GetReference().String())
+		return nil
+	}
+
+	refStr := js.GetReference().String()
+	targetNode, ok := env.opts.ResolveRef(refStr)
+	if !ok || targetNode == nil {
+		env.addWarning("failed to resolve $ref %q via ResolveRef", refStr)
+		return nil
+	}
+
+	// Resolve the target:
+	// Preferred: concrete inline schema (non-reference). Otherwise, recurse one level deeper.
+	var resolved *oas3.Schema
+	switch {
+	case targetNode.Left != nil && !targetNode.IsReference():
+		if env.opts.CopyOnDeref {
+			resolved = cloneSchema(targetNode.Left)
+		} else {
+			resolved = targetNode.Left
+		}
+	default:
+		// Recurse for nested or chained $ref
+		resolved = env.derefJSONSchemaDepth(targetNode, depth+1)
+		// If recursion failed but the target exposes Left anyway, fall back to Left.
+		if resolved == nil && targetNode.Left != nil {
+			if env.opts.CopyOnDeref {
+				resolved = cloneSchema(targetNode.Left)
+			} else {
+				resolved = targetNode.Left
+			}
+		}
+	}
+
+	// Populate cache for this node pointer (per-execution, per-site)
+	if env.refNodeCache != nil && env.opts.EnableRefCache && resolved != nil {
+		env.refNodeCache[js] = resolved
+	}
+
+	return resolved
 }
 
 // Simple closure tracking (maps schema pointer to PC)

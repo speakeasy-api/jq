@@ -62,7 +62,7 @@ func SymbolicExecuteJQ(oasYAML string) (string, error) {
 	// Process transformations in reverse order (depth-first children before parents)
 	for i := len(schemasToTransform) - 1; i >= 0; i-- {
 		st := schemasToTransform[i]
-		if err := transformSchema(st.schema, st.location); err != nil {
+		if err := transformSchema(st.schema, st.location, doc); err != nil {
 			transformErrors = append(transformErrors, fmt.Sprintf("%s: %v", st.location, err))
 		}
 	}
@@ -86,7 +86,7 @@ func SymbolicExecuteJQ(oasYAML string) (string, error) {
 }
 
 // transformSchema applies the JQ transformation to a schema with the extension
-func transformSchema(schema *oas3.JSONSchema[oas3.Referenceable], location string) error {
+func transformSchema(schema *oas3.JSONSchema[oas3.Referenceable], location string, doc *openapi.OpenAPI) error {
 	ext := schema.GetExtensions()
 	if ext == nil {
 		return nil
@@ -119,8 +119,12 @@ func transformSchema(schema *oas3.JSONSchema[oas3.Referenceable], location strin
 		return fmt.Errorf("schema is a reference or boolean, cannot transform")
 	}
 
+	// Configure lazy $ref resolver for symbolic execution
+	opts := schemaexec.DefaultOptions()
+	opts.ResolveRef = makeResolveRef(doc)
+
 	// Symbolically execute the JQ on the schema to get the output schema
-	result, err := schemaexec.RunSchema(context.Background(), query, schemaValue)
+	result, err := schemaexec.RunSchema(context.Background(), query, schemaValue, opts)
 	if err != nil {
 		return fmt.Errorf("symbolic execution failed: %w", err)
 	}
@@ -245,6 +249,23 @@ func cloneDocument(ctx context.Context, yamlStr string) (*openapi.OpenAPI, error
 	return doc, nil
 }
 
+// makeResolveRef builds a ResolveRef callback for schemaexec, supporting "#/components/schemas/..." refs.
+func makeResolveRef(doc *openapi.OpenAPI) func(string) (*oas3.JSONSchema[oas3.Referenceable], bool) {
+	return func(ref string) (*oas3.JSONSchema[oas3.Referenceable], bool) {
+		if doc == nil || doc.Components == nil || doc.Components.Schemas == nil {
+			return nil, false
+		}
+		const prefix = "#/components/schemas/"
+		if strings.HasPrefix(ref, prefix) {
+			name := strings.TrimPrefix(ref, prefix)
+			if js, ok := doc.Components.Schemas.Get(name); ok && js != nil {
+				return js, true
+			}
+		}
+		return nil, false
+	}
+}
+
 // applyTransformationsToDoc applies transformations with the given extension name
 func applyTransformationsToDoc(ctx context.Context, doc *openapi.OpenAPI, extensionName string, strict bool) (bool, []string) {
 	var transformErrors []string
@@ -281,7 +302,7 @@ func applyTransformationsToDoc(ctx context.Context, doc *openapi.OpenAPI, extens
 	// Process transformations in reverse order
 	for i := len(schemasToTransform) - 1; i >= 0; i-- {
 		st := schemasToTransform[i]
-		if err := transformSchemaWithExtension(st.schema, st.location, extensionName, strict); err != nil {
+		if err := transformSchemaWithExtension(st.schema, st.location, extensionName, strict, doc); err != nil {
 			transformErrors = append(transformErrors, fmt.Sprintf("%s: %v", st.location, err))
 		}
 	}
@@ -290,7 +311,7 @@ func applyTransformationsToDoc(ctx context.Context, doc *openapi.OpenAPI, extens
 }
 
 // transformSchemaWithExtension applies transformation using the specified extension
-func transformSchemaWithExtension(schema *oas3.JSONSchema[oas3.Referenceable], location string, extensionName string, strict bool) error {
+func transformSchemaWithExtension(schema *oas3.JSONSchema[oas3.Referenceable], location string, extensionName string, strict bool, doc *openapi.OpenAPI) error {
 	ext := schema.GetExtensions()
 	if ext == nil {
 		return nil
@@ -322,9 +343,12 @@ func transformSchemaWithExtension(schema *oas3.JSONSchema[oas3.Referenceable], l
 		return fmt.Errorf("schema is a reference or boolean, cannot transform")
 	}
 
-	// Symbolically execute the JQ
+	// Configure lazy $ref resolver for symbolic execution
 	opts := schemaexec.DefaultOptions()
 	opts.StrictMode = strict
+	opts.ResolveRef = makeResolveRef(doc)
+
+	// Symbolically execute the JQ
 	result, err := schemaexec.RunSchema(context.Background(), query, schemaValue, opts)
 	if err != nil {
 		return fmt.Errorf("symbolic execution failed: %w", err)

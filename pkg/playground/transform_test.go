@@ -1090,11 +1090,11 @@ components:
 // $ref Handling Tests
 // These tests verify that $ref nodes are correctly handled:
 // - RETAIN $ref when unaffected by JQ (just moved around)
-// - INLINE $ref when affected by JQ (properties accessed/modified)
+// - Lazily resolve $ref targets when affected by JQ (properties accessed/modified) and materialize only the accessed projection
 // ============================================================================
 
-// TEST 1: Inline $ref via nested property access ($data-like pattern)
-func TestSymbolicExecuteJQ_RefInline_DataPropertyAccess(t *testing.T) {
+// TEST 1: Lazily resolve via nested property access ($data-like pattern) and project properties
+func TestSymbolicExecuteJQ_RefResolve_DataPropertyAccess(t *testing.T) {
 	oasYAML := `openapi: 3.1.0
 info:
   title: RefInline1
@@ -1230,8 +1230,8 @@ components:
 	t.Logf("Result:\n%s", result)
 }
 
-// TEST 3: Inline array item $ref via map access
-func TestSymbolicExecuteJQ_RefInline_ArrayItemPropertyAccess(t *testing.T) {
+// TEST 3: Lazily resolve array item schema via map access (on-demand deref), projecting item properties
+func TestSymbolicExecuteJQ_RefResolve_ArrayItemPropertyAccess(t *testing.T) {
 	oasYAML := `openapi: 3.1.0
 info:
   title: RefInline2
@@ -1362,8 +1362,8 @@ components:
 	t.Logf("Result:\n%s", result)
 }
 
-// TEST 5: Inline through nested $ref chain
-func TestSymbolicExecuteJQ_RefInline_NestedRefChain(t *testing.T) {
+// TEST 5: Traverse a nested $ref chain lazily and project the accessed property
+func TestSymbolicExecuteJQ_RefResolve_NestedRefChain(t *testing.T) {
 	oasYAML := `openapi: 3.1.0
 info:
   title: RefInline3
@@ -1423,5 +1423,147 @@ components:
 		t.Error("PostWithAuthor should have 'authorEmail' property")
 	}
 
-	t.Logf("Nested $ref chain inlined successfully:\n%s", result)
+	t.Logf("Nested $ref chain resolved successfully:\n%s", result)
+}
+
+// TEST 6: KeyValuePairs with literal (non-$ref) ConfigData schema (inline definition) — baseline for comparison with the $ref variant
+func TestSymbolicExecuteJQ_KeyValuePairs_Inline(t *testing.T) {
+	oasYAML := `openapi: 3.1.0
+info:
+  title: KeyValuePairsInline
+  version: 1.0.0
+components:
+  schemas:
+    KeyValuePairs:
+      x-speakeasy-transform-from-api:
+        jq: '.configs | map({key: .name, value: .value}) | from_entries'
+      description: A schema for an array of name/value configuration pairs.
+      type: object
+      properties:
+        configs:
+          type: array
+          description: A list of configuration items.
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                description: The name of the configuration key.
+              value:
+                type: string
+                nullable: true
+                description: The value of the configuration key.
+            required:
+              - name
+      required:
+        - configs
+`
+
+	result, err := SymbolicExecuteJQ(oasYAML)
+	if err != nil {
+		t.Fatalf("SymbolicExecuteJQ failed: %v", err)
+	}
+
+	// The result should be an object with additionalProperties
+	// The transform converts array of {name, value} into {key: value} object
+	if !strings.Contains(result, "additionalProperties") {
+		t.Error("Expected 'additionalProperties' in transformed schema")
+	}
+
+	t.Logf("Inline KeyValuePairs result:\n%s", result)
+}
+
+// TEST 7: KeyValuePairs with $ref to ConfigData schema (should work the same)
+func TestSymbolicExecuteJQ_KeyValuePairs_WithRef(t *testing.T) {
+	oasYAML := `openapi: 3.1.0
+info:
+  title: KeyValuePairsWithRef
+  version: 1.0.0
+components:
+  schemas:
+    ConfigData:
+      example:
+        name: "name"
+        value: "value"
+      properties:
+        name:
+          type: string
+        value:
+          nullable: true
+          type: string
+      required:
+        - name
+        - value
+    KeyValuePairs:
+      description: A schema for an array of name/value configuration pairs.
+      type: object
+      properties:
+        configs:
+          type: array
+          description: A list of configuration items.
+          items:
+            $ref: '#/components/schemas/ConfigData'
+      required:
+        - configs
+      x-speakeasy-transform-from-api:
+        jq: '.configs | map({key: .name, value: .value}) | from_entries'
+`
+
+	result, err := SymbolicExecuteJQ(oasYAML)
+	if err != nil {
+		t.Fatalf("SymbolicExecuteJQ failed: %v", err)
+	}
+
+	// The result should be an object with additionalProperties
+	// The transform converts array of {name, value} into {key: value} object
+	// This should work exactly like the inline version
+	if !strings.Contains(result, "additionalProperties") {
+		t.Error("Expected 'additionalProperties' in transformed schema")
+	}
+
+	t.Logf("KeyValuePairs with $ref result:\n%s", result)
+}
+
+// TEST 8: Debug test to inspect $ref resolution
+func TestSymbolicExecuteJQ_DebugRefResolution(t *testing.T) {
+	oasYAML := `openapi: 3.1.0
+info:
+  title: DebugRef
+  version: 1.0.0
+components:
+  schemas:
+    ConfigData:
+      type: object
+      properties:
+        name:
+          type: string
+        value:
+          nullable: true
+          type: string
+      required:
+        - name
+        - value
+    TestSchema:
+      description: Debug test for $ref resolution.
+      type: object
+      x-speakeasy-transform-from-api:
+        jq: '.configs[0].name'
+      properties:
+        configs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConfigData'
+`
+
+	result, err := SymbolicExecuteJQ(oasYAML)
+	if err != nil {
+		t.Fatalf("SymbolicExecuteJQ failed: %v", err)
+	}
+
+	// The result should be a string (the name property)
+	if !strings.Contains(result, "type: string") {
+		t.Error("Expected 'type: string' in transformed schema")
+	}
+
+	t.Logf("Debug ref resolution result:\n%s", result)
 }

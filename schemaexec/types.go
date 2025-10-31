@@ -34,6 +34,14 @@ type SchemaExecOptions struct {
 	LogMaxProps          int    // Max object properties to show in logs (default: 5)
 	LogStackPreviewDepth int    // Max stack depth to preview in logs (default: 3)
 	LogSchemaDeltas      bool   // If true, include schema deltas in debug logs (default: true)
+
+	// Lazy $ref resolution (optional)
+	// ResolveRef should return the JSONSchema node targeted by the given ref string
+	// (e.g., "#/components/schemas/Foo"). If unset, refs are not resolved.
+	ResolveRef     func(ref string) (*oas3.JSONSchema[oas3.Referenceable], bool)
+	MaxRefDepth    int  // Maximum dereference depth (default: 16)
+	CopyOnDeref    bool // Clone resolved schemas to avoid mutating shared component defs (default: true)
+	EnableRefCache bool // Cache dereferenced clones per-ref-node within a single execution (default: true)
 }
 
 // SchemaExecResult contains the output schema and diagnostic information.
@@ -57,5 +65,11 @@ func DefaultOptions() SchemaExecOptions {
 		LogMaxProps:          5,
 		LogStackPreviewDepth: 3,
 		LogSchemaDeltas:      true,
+
+		// Lazy $ref resolution defaults
+		ResolveRef:     nil, // supplied by caller (e.g., playground) when available
+		MaxRefDepth:    16,
+		CopyOnDeref:    true,
+		EnableRefCache: true,
 	}
 }

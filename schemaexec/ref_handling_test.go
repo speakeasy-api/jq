@@ -8,11 +8,11 @@ import (
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 )
 
-// TestRefHandling_InlineOnPropertyAccess verifies that $refs are inlined when properties are accessed
-func TestRefHandling_InlineOnPropertyAccess(t *testing.T) {
+// TestRefHandling_OnDemandResolution verifies that $refs are lazily resolved and projected when properties are accessed
+func TestRefHandling_OnDemandResolution(t *testing.T) {
 	// Schema with a property that references another schema
 	// Transform accesses properties inside the reference: .data.id
-	// In actual use, 'data' would be a $ref that gets resolved by the OpenAPI parser
+	// In the full OAS flow, 'data' is typically a $ref that schemaexec resolves lazily on property access
 	dataSchema := BuildObject(map[string]*oas3.Schema{
 		"id":   StringType(),
 		"name": StringType(),
@@ -49,7 +49,7 @@ func TestRefHandling_InlineOnPropertyAccess(t *testing.T) {
 		t.Errorf("Expected id to be string, got %v", getType(idProp))
 	}
 
-	t.Logf("Successfully inlined $ref and extracted property: id")
+	t.Logf("Successfully resolved $ref on-demand and extracted property: id")
 }
 
 // TestRefHandling_RetainOnMove verifies that $refs are retained when just moved without access
@@ -149,7 +149,7 @@ func TestRefHandling_ArrayItems(t *testing.T) {
 		}
 	}
 
-	t.Logf("Successfully inlined array item $ref and extracted property")
+	t.Logf("Successfully resolved array item $ref on-demand and extracted property")
 }
 
 // TestRefHandling_NestedRefChain verifies traversal through nested $refs
