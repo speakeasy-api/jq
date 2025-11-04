@@ -127,6 +127,23 @@ func newSchemaEnv(ctx context.Context, opts SchemaExecOptions) *schemaEnv {
 	}
 }
 
+// derefJSONSchema attempts to dereference a JSONSchema wrapper to get the actual Schema.
+// GetResolvedSchema() handles both inline schemas and pre-resolved $ref references.
+// Returns (schema, true) if successful, (nil, false) if unresolved or invalid.
+func derefJSONSchema(js *oas3.JSONSchema[oas3.Referenceable]) (*oas3.Schema, bool) {
+	if js == nil {
+		return nil, false
+	}
+
+	if resolved := js.GetResolvedSchema(); resolved != nil {
+		if schema := resolved.GetLeft(); schema != nil {
+			return schema, true
+		}
+	}
+
+	return nil, false
+}
+
 // execute runs the bytecode on the input schema and returns the result.
 // Uses multi-state execution to handle jq's backtracking semantics.
 func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResult, error) {
@@ -613,14 +630,16 @@ func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oa
 	if idx, ok := indexKey.(int); ok {
 		// Check prefixItems for tuple access
 		if arr.PrefixItems != nil && idx >= 0 && idx < len(arr.PrefixItems) {
-			if arr.PrefixItems[idx].Left != nil {
-				return arr.PrefixItems[idx].Left
+			if schema, ok := derefJSONSchema(arr.PrefixItems[idx]); ok {
+				return schema
 			}
 		}
 
 		// Fall through to items for indices beyond prefixItems
-		if arr.Items != nil && arr.Items.Left != nil {
-			return arr.Items.Left
+		if arr.Items != nil {
+			if schema, ok := derefJSONSchema(arr.Items); ok {
+				return schema
+			}
 		}
 
 		// No schema for this index
@@ -633,15 +652,23 @@ func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oa
 	// Add all prefixItems
 	if arr.PrefixItems != nil {
 		for _, item := range arr.PrefixItems {
-			if item.Left != nil {
-				schemas = append(schemas, item.Left)
+			if schema, ok := derefJSONSchema(item); ok {
+				schemas = append(schemas, schema)
+			} else {
+				// Unresolved reference in tuple element - widen conservatively
+				schemas = append(schemas, Top())
 			}
 		}
 	}
 
 	// Add items schema
-	if arr.Items != nil && arr.Items.Left != nil {
-		schemas = append(schemas, arr.Items.Left)
+	if arr.Items != nil {
+		if schema, ok := derefJSONSchema(arr.Items); ok {
+			schemas = append(schemas, schema)
+		} else {
+			// Unresolved reference in items - widen conservatively
+			schemas = append(schemas, Top())
+		}
 	}
 
 	if len(schemas) == 0 {
@@ -757,15 +784,23 @@ func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, 
 
 	switch baseType {
 	case "array":
+		// Check for empty array sentinel first, regardless of Items being set
+		// Empty arrays are represented with MaxItems=0 and Items may be nil
+		if val.MaxItems != nil && *val.MaxItems == 0 {
+			// Empty array sentinel: produce no iteration values
+			return []*execState{}, nil
+		}
+
 		if val.Items != nil {
-			// Items field is set
-			if val.Items.Left != nil {
-				// Items.Left is set to actual schema
-				itemSchema = val.Items.Left
+			// Try to dereference items schema (handles both inline and $ref)
+			if schema, ok := derefJSONSchema(val.Items); ok {
+				itemSchema = schema
 			} else {
-				// Items.Left is nil, meaning Bottom (empty array with 0 elements)
-				// Iterating an empty array produces no values, terminate this execution path
-				return []*execState{}, nil
+				// Unresolved reference - widen conservatively with cause
+				itemSchema = env.NewTopWithCause("iter: failed to resolve array.items (GetResolvedSchema().Left==nil)")
+				if env.opts.EnableWarnings {
+					env.addWarning("iter: failed to resolve array.items schema; widening to Top")
+				}
 			}
 		} else {
 			// Items field not set at all - unconstrained array, items can be any type
@@ -902,12 +937,18 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 			canonicalArr = existing
 		} else {
 			// Shouldn't happen if we just tagged it, but handle gracefully
-			canonicalArr = ArrayType(Bottom())
+			// Create an empty array without items set (will be set when first element is appended)
+			canonicalArr = &oas3.Schema{
+				Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
+			}
 			state.accum[accumKey] = canonicalArr
 		}
 	} else {
 		// No target found - create standalone
-		canonicalArr = ArrayType(Bottom())
+		// Create an empty array without items set (will be set when first element is appended)
+		canonicalArr = &oas3.Schema{
+			Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
+		}
 	}
 
 	// Get prior items
@@ -1176,15 +1217,23 @@ func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 	// Add all property values
 	if obj.Properties != nil {
 		for _, v := range obj.Properties.All() {
-			if v.Left != nil {
-				schemas = append(schemas, v.Left)
+			if schema, ok := derefJSONSchema(v); ok {
+				schemas = append(schemas, schema)
+			} else {
+				// Unresolved reference in property - widen conservatively
+				schemas = append(schemas, Top())
 			}
 		}
 	}
 
 	// Add additionalProperties
-	if obj.AdditionalProperties != nil && obj.AdditionalProperties.Left != nil {
-		schemas = append(schemas, obj.AdditionalProperties.Left)
+	if obj.AdditionalProperties != nil {
+		if schema, ok := derefJSONSchema(obj.AdditionalProperties); ok {
+			schemas = append(schemas, schema)
+		} else {
+			// Unresolved reference in additionalProperties - widen conservatively
+			schemas = append(schemas, Top())
+		}
 	}
 
 	// TODO: Add patternProperties
@@ -1212,12 +1261,15 @@ func buildObjectFromLiteral(m map[string]any) *oas3.Schema {
 // buildArrayFromLiteral creates a schema from an array literal.
 func buildArrayFromLiteral(arr []any) *oas3.Schema {
 	if len(arr) == 0 {
-		// Empty array constant: Use Bottom() as items to signify "no elements".
-		// Items.Left = nil allows iteration to detect and skip empty arrays.
-		// Also set maxItems=0 for schema validation clarity.
-		emptyArray := ArrayType(Bottom())
+		// Empty array constant: Set MaxItems=0 with Items unset (nil).
+		// This avoids creating an invalid JSONSchema wrapper with neither Left nor Right.
+		// Iteration logic detects emptiness via MaxItems=0.
+		emptyArray := &oas3.Schema{
+			Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
+		}
 		maxItems := int64(0)
 		emptyArray.MaxItems = &maxItems
+		// Leave Items nil to avoid invalid EitherValue wrapper
 		return emptyArray
 	}
 

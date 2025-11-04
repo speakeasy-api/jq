@@ -15,9 +15,10 @@ import (
 
 // SymbolicExecuteJQ validates an OpenAPI spec and performs symbolic execution
 func SymbolicExecuteJQ(oasYAML string) (string, error) {
+	ctx := context.Background()
 	// Parse the OpenAPI spec
 	reader := strings.NewReader(oasYAML)
-	doc, validationErrs, err := openapi.Unmarshal(context.Background(), reader)
+	doc, validationErrs, err := openapi.Unmarshal(ctx, reader)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse OpenAPI document: %w", err)
 	}
@@ -28,8 +29,12 @@ func SymbolicExecuteJQ(oasYAML string) (string, error) {
 		return "", fmt.Errorf("OpenAPI validation failed: %v", validationErrs[0])
 	}
 
+	// Resolve all $refs
+	if _, err := doc.ResolveAllReferences(ctx, openapi.ResolveAllOptions{}); err != nil {
+		return "", fmt.Errorf("failed to resolve $refs: %w", err)
+	}
+
 	// Transform schemas with x-speakeasy-transform-from-api using Walk API
-	ctx := context.Background()
 	var transformErrors []string
 
 	// Collect all schemas that need transformation (depth-first via iteration order)
@@ -180,6 +185,10 @@ func SymbolicExecuteJQPipeline(oasYAML string, strict bool) (*PipelineResult, er
 	if len(validationErrs) > 0 {
 		return nil, fmt.Errorf("OpenAPI validation failed: %v", validationErrs[0])
 	}
+	// Resolve all $refs
+	if _, err := doc1.ResolveAllReferences(ctx, openapi.ResolveAllOptions{}); err != nil {
+		return nil, fmt.Errorf("failed to resolve $refs: %w", err)
+	}
 
 	// Marshal panel1 (original)
 	var buf1 strings.Builder
@@ -241,6 +250,10 @@ func cloneDocument(ctx context.Context, yamlStr string) (*openapi.OpenAPI, error
 	doc, _, err := openapi.Unmarshal(ctx, reader)
 	if err != nil {
 		return nil, err
+	}
+	// Resolve all $refs in the cloned document
+	if _, err := doc.ResolveAllReferences(ctx, openapi.ResolveAllOptions{}); err != nil {
+		return nil, fmt.Errorf("failed to resolve $refs: %w", err)
 	}
 	return doc, nil
 }
@@ -450,4 +463,3 @@ func ensurePropertiesInitialized(schema *oas3.Schema) {
 		}
 	}
 }
-

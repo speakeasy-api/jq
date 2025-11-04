@@ -158,33 +158,22 @@ func GetProperty(obj *oas3.Schema, key string, opts SchemaExecOptions) *oas3.Sch
 	// Check properties
 	if obj.Properties != nil {
 		if propSchema, ok := obj.Properties.Get(key); ok {
-			// Check if required
-			isRequired := false
-			for _, req := range obj.Required {
-				if req == key {
-					isRequired = true
-					break
-				}
+			// Dereference the property schema (handles both inline and $ref)
+			if schema, ok := derefJSONSchema(propSchema); ok {
+				return schema
 			}
-
-			// If not required, might be null
-			if !isRequired {
-				// For Phase 1, just return the property schema
-				// Phase 2 will properly union with null
-				if propSchema.Left != nil {
-					return propSchema.Left
-				}
-			}
-
-			if propSchema.Left != nil {
-				return propSchema.Left
-			}
+			// Unresolved reference - widen conservatively
+			return Top()
 		}
 	}
 
 	// Check additionalProperties
-	if obj.AdditionalProperties != nil && obj.AdditionalProperties.Left != nil {
-		return obj.AdditionalProperties.Left
+	if obj.AdditionalProperties != nil {
+		if schema, ok := derefJSONSchema(obj.AdditionalProperties); ok {
+			return schema
+		}
+		// Unresolved reference in additionalProperties - widen conservatively
+		return Top()
 	}
 
 	// Not found - return null
