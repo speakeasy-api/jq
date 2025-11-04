@@ -1389,34 +1389,32 @@ func buildPathSchemaFromSegments(segments []PathSegment) *oas3.Schema {
 	return BuildArray(Top(), prefixItems)
 }
 
-// getPropertyLazy accesses a property from an object schema with lazy $ref resolution.
+// getPropertyLazy returns a property schema without dereferencing to preserve $refs.
+// Dereferencing is deferred until accessing fields within the property schema.
 func (env *schemaEnv) getPropertyLazy(base *oas3.Schema, key string) *oas3.Schema {
 	if base == nil {
 		return Bottom()
 	}
 
-	// Direct properties
 	if base.Properties != nil {
 		if propJSON, ok := base.Properties.Get(key); ok {
-			if s := env.derefJSONSchema(propJSON); s != nil {
-				return s
+			// Preserve $refs by returning the inline schema; defer deref to nested access.
+			if propJSON.Left != nil {
+				return propJSON.Left
 			}
-			// Unresolved property $ref or missing inline
 			if env.strict {
-				env.addWarning("strict mode: unresolved property %q", key)
+				env.addWarning("strict mode: property %q has no inline schema", key)
 			}
 			return Top()
 		}
 	}
 
-	// Fallback to additionalProperties if present
 	if base.AdditionalProperties != nil {
-		if s := env.derefJSONSchema(base.AdditionalProperties); s != nil {
-			return s
+		if base.AdditionalProperties.Left != nil {
+			return base.AdditionalProperties.Left
 		}
-		// Unresolved additionalProperties $ref
 		if env.strict {
-			env.addWarning("strict mode: unresolved additionalProperties for key %q", key)
+			env.addWarning("strict mode: additionalProperties has no inline schema for key %q", key)
 		}
 		return Top()
 	}
@@ -1528,22 +1526,18 @@ func (env *schemaEnv) derefJSONSchemaDepth(js *oas3.JSONSchema[oas3.Referenceabl
 	}
 
 	// If the schema is already inline (non-reference), prefer it directly.
-	// Note: Some libraries may keep Left even when IsReference == true (OAS 3.1 + siblings).
-	// We still prefer Left because local overrides should win.
 	if js.Left != nil && !js.IsReference() {
 		return js.Left
 	}
-	if js.Left != nil && js.IsReference() {
-		// Prefer local overrides (Left) when present even if it carries a $ref marker.
-		return js.Left
-	}
 
-	// If not a reference and no inline schema, nothing to resolve.
+	// For $ref nodes, do not return js.Left even if non-nil. Some libraries populate Left as a stub; resolve first to materialize the target type.
 	if !js.IsReference() {
 		return js.Left
 	}
 
-	// Depth guard to avoid cycles/pathologies
+	// Capture inline overrides for fallback; not merged with resolved target.
+	leftOverrides := js.Left
+
 	maxDepth := env.opts.MaxRefDepth
 	if maxDepth <= 0 {
 		maxDepth = 16 // fallback safety if options unset
@@ -1600,6 +1594,17 @@ func (env *schemaEnv) derefJSONSchemaDepth(js *oas3.JSONSchema[oas3.Referenceabl
 			}
 		}
 	}
+
+	// If resolution failed, fall back to inline overrides.
+	if resolved == nil && leftOverrides != nil {
+		if env.opts.CopyOnDeref {
+			resolved = cloneSchema(leftOverrides)
+		} else {
+			resolved = leftOverrides
+		}
+	}
+
+	// Siblings from leftOverrides are not merged; the resolved target schema takes precedence.
 
 	// Populate cache for this node pointer (per-execution, per-site)
 	if env.refNodeCache != nil && env.opts.EnableRefCache && resolved != nil {

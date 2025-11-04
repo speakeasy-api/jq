@@ -119,11 +119,10 @@ func transformSchema(schema *oas3.JSONSchema[oas3.Referenceable], location strin
 		return fmt.Errorf("schema is a reference or boolean, cannot transform")
 	}
 
-	// Configure lazy $ref resolver for symbolic execution
 	opts := schemaexec.DefaultOptions()
 	opts.ResolveRef = makeResolveRef(doc)
+	opts.CopyOnDeref = true // Clone on deref to avoid pointer aliasing and $ref re-emission.
 
-	// Symbolically execute the JQ on the schema to get the output schema
 	result, err := schemaexec.RunSchema(context.Background(), query, schemaValue, opts)
 	if err != nil {
 		return fmt.Errorf("symbolic execution failed: %w", err)
@@ -343,12 +342,11 @@ func transformSchemaWithExtension(schema *oas3.JSONSchema[oas3.Referenceable], l
 		return fmt.Errorf("schema is a reference or boolean, cannot transform")
 	}
 
-	// Configure lazy $ref resolver for symbolic execution
 	opts := schemaexec.DefaultOptions()
 	opts.StrictMode = strict
 	opts.ResolveRef = makeResolveRef(doc)
+	opts.CopyOnDeref = true // Clone on deref to avoid pointer aliasing and $ref re-emission.
 
-	// Symbolically execute the JQ
 	result, err := schemaexec.RunSchema(context.Background(), query, schemaValue, opts)
 	if err != nil {
 		return fmt.Errorf("symbolic execution failed: %w", err)

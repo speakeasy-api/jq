@@ -1567,3 +1567,121 @@ components:
 
 	t.Logf("Debug ref resolution result:\n%s", result)
 }
+
+// TEST 9: TagList with primitive $ref (string schema) in array items
+// This test explicitly validates that primitive $refs are resolved during transformation
+func TestSymbolicExecuteJQ_PrimitiveRef_ArrayItems(t *testing.T) {
+	oasYAML := `openapi: 3.1.0
+info:
+  title: PrimitiveRefTest
+  version: 1.0.0
+components:
+  schemas:
+    TagList:
+      type: object
+      description: Enriched tag list with computed slug and length.
+      x-speakeasy-transform-from-api:
+        jq: >
+          {
+            tags: (.tags // []) | map({
+              value: .,
+              slug: (. | ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("(^-|-$)"; "")),
+              length: (. | length)
+            }),
+            primarySlug: (
+              (.tags[0] // null)
+              | if . == null then null
+                else (. | ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("(^-|-$)"; ""))
+                end
+            )
+          }
+      x-speakeasy-transform-to-api:
+        jq: >
+          {
+            tags: (.tags // []) | map(.value)
+          }
+      properties:
+        tags:
+          type: array
+          items:
+            $ref: "#/components/schemas/TheThing"
+    TheThing:
+      type: string
+`
+
+	expectedResult := `openapi: 3.1.0
+info:
+  title: PrimitiveRefTest
+  version: 1.0.0
+components:
+  schemas:
+    TagList:
+      type: object
+      x-speakeasy-transform-from-api:
+        jq: >
+          {
+
+            tags: (.tags // []) | map({
+              value: .,
+              slug: (. | ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("(^-|-$)"; "")),
+              length: (. | length)
+            }),
+            primarySlug: (
+              (.tags[0] // null)
+              | if . == null then null
+                else (. | ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("(^-|-$)"; ""))
+                end
+            )
+          }
+
+      x-speakeasy-transform-to-api:
+        jq: >
+          {
+
+            tags: (.tags // []) | map(.value)
+          }
+
+      properties:
+        tags:
+          type: array
+          items:
+            type: object
+            properties:
+              length:
+                type: number
+                minimum: 0
+              slug:
+                type: string
+              value:
+                type: string
+            required:
+              - length
+              - slug
+              - value
+        primarySlug:
+          type: string
+          nullable: true
+      required:
+        - primarySlug
+        - tags
+    TheThing:
+      type: string
+`
+
+	result, err := SymbolicExecuteJQ(oasYAML)
+	if err != nil {
+		t.Fatalf("SymbolicExecuteJQ failed: %v", err)
+	}
+
+	// The key assertion: value should be "type: string", NOT "$ref: '#/components/schemas/TheThing'"
+	if strings.Contains(result, "$ref") && strings.Contains(result, "TheThing") {
+		t.Error("FAILURE: Primitive $ref was not resolved during transformation! Expected 'value: type: string' but got $ref")
+	}
+
+	// Validate the complete expected structure
+	if result != expectedResult {
+		t.Errorf("Result does not match expected output.\n\nExpected:\n%s\n\nGot:\n%s", expectedResult, result)
+	}
+
+	t.Logf("Primitive $ref in array items result:\n%s", result)
+}
