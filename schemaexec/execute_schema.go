@@ -4,6 +4,10 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	gojq "github.com/speakeasy-api/jq"
@@ -197,8 +201,26 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		default:
 		}
 
+		// Merge the execution frontier periodically to prevent exponential branch explosion.
+		// Merge frequently (threshold: 8) to control state count even with string builtins
+		const mergeThreshold = 8
+		if len(worklist.states) >= mergeThreshold {
+			frontier := make([]*execState, 0, len(worklist.states))
+			for !worklist.isEmpty() {
+				frontier = append(frontier, worklist.pop())
+			}
+			frontier = env.mergeFrontierByPC(frontier)
+			for _, s := range frontier {
+				worklist.push(s)
+			}
+		}
+
 		// Get next state
 		state := worklist.pop()
+		if state == nil {
+			// Worklist empty (shouldn't happen but guard against it)
+			break
+		}
 
 		// Check if we've seen this state (memoization)
 		// TODO: Memoization currently disabled because fingerprint doesn't recursively
@@ -366,7 +388,11 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		return env.execObjectMulti(next, c)
 
 	case opScope:
-		next.pushFrame()
+		// Only push frame for function call scopes, not filter-local scopes
+		// This prevents scope depth variance from fragmenting partition shapes
+		if len(next.callstack) > 0 {
+			next.pushFrame()
+		}
 		return []*execState{next}, nil
 
 	case opStore:
@@ -1603,4 +1629,330 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 	}
 
 	return schema
+}
+
+// ============================================================================
+// State Merging for Branch Explosion Control
+// ============================================================================
+
+// shouldMergeAtPC returns true if we should perform state merging at this PC.
+// We merge at natural join points (opIter, opForkLabel) and hot PCs (threshold >= 2).
+func (env *schemaEnv) shouldMergeAtPC(pc int, groupSize int) bool {
+	if pc < 0 || pc >= len(env.codes) {
+		return false
+	}
+	op := env.codes[pc].op
+	// Always merge at natural reconvergence points
+	if op == opIter || op == opForkLabel || op == opForkTryEnd {
+		return true
+	}
+	// Also merge at hot join points (lowered threshold from 4 to 2)
+	return groupSize >= 2
+}
+
+// mergeFrontierByPC merges states at hot loop headers (opIter) to prevent
+// exponential branch explosion from multiple conditionals.
+func (env *schemaEnv) mergeFrontierByPC(in []*execState) []*execState {
+	if len(in) <= 1 {
+		return in
+	}
+
+	// Group by PC
+	byPC := make(map[int][]*execState)
+	for _, s := range in {
+		byPC[s.pc] = append(byPC[s.pc], s)
+	}
+
+	out := make([]*execState, 0, len(in))
+	for pc, group := range byPC {
+		// Only merge at hot PCs (opIter or high fan-in)
+		if !env.shouldMergeAtPC(pc, len(group)) {
+			out = append(out, group...)
+			continue
+		}
+
+		// Partition by shape
+		// At hot merge points, we relax scope-key matching to allow more aggressive merging
+		relaxScopeKeys := env.codes[pc].op != opIter || len(group) >= 8
+		partitions := partitionByShape(group, relaxScopeKeys)
+
+		for _, partition := range partitions {
+			if len(partition) == 1 {
+				out = append(out, partition[0])
+				continue
+			}
+
+			// Fast-path for large partitions: skip O(n²) subsumption and just fold with LUB
+			const mergeCap = 16
+			if len(partition) > mergeCap {
+				// Linear-time merge: fold all states using join (LUB)
+				merged := partition[0]
+				for i := 1; i < len(partition); i++ {
+					merged = joinState(merged, partition[i])
+				}
+				out = append(out, merged)
+				continue
+			}
+
+			// For smaller partitions: subsumption checking to remove redundant states
+			kept := make([]*execState, 0, len(partition))
+			for _, candidate := range partition {
+				subsumed := false
+				for _, other := range partition {
+					if candidate == other {
+						continue
+					}
+					if subsumesState(other, candidate) {
+						subsumed = true
+						break
+					}
+				}
+				if !subsumed {
+					kept = append(kept, candidate)
+				}
+			}
+
+			// Join remaining states pairwise until convergence
+			for len(kept) > 1 {
+				a := kept[0]
+				b := kept[1]
+				merged := joinState(a, b)
+				kept = append([]*execState{merged}, kept[2:]...)
+			}
+
+			out = append(out, kept...)
+		}
+	}
+
+	return out
+}
+
+// subsumesState checks if state 'dom' subsumes state 'sub' (dom ⊒ sub).
+// This means dom's abstract values are at least as general as sub's.
+func subsumesState(dom, sub *execState) bool {
+	if dom.pc != sub.pc {
+		return false
+	}
+	if len(dom.stack) != len(sub.stack) {
+		return false
+	}
+	if len(dom.scopes) != len(sub.scopes) {
+		return false
+	}
+
+	// Check stack subsumption
+	for i := range dom.stack {
+		if !schemaSubsumes(dom.stack[i].Schema, sub.stack[i].Schema) {
+			return false
+		}
+	}
+
+	// Check scope subsumption
+	// dom subsumes sub if for every variable in sub, dom has that variable
+	// and dom's schema subsumes sub's schema for that variable.
+	// dom may have additional variables that sub doesn't have.
+	for i := range dom.scopes {
+		domScope := dom.scopes[i]
+		subScope := sub.scopes[i]
+
+		// Check that all of sub's variables are subsumed by dom's
+		for k, subVal := range subScope {
+			domVal, domHas := domScope[k]
+			if !domHas {
+				// dom doesn't have this variable, so it can't subsume sub
+				return false
+			}
+			if !schemaSubsumes(domVal, subVal) {
+				return false
+			}
+		}
+		// Note: dom may have extra variables, but that's ok for subsumption
+	}
+
+	return true
+}
+
+// schemaSubsumes checks if schema 'dom' subsumes 'sub' (dom ⊒ sub).
+// We use the property: Union(dom, sub) == dom implies sub ⊑ dom.
+func schemaSubsumes(dom, sub *oas3.Schema) bool {
+	if dom == sub {
+		return true
+	}
+	if dom == nil || sub == nil {
+		return dom == sub
+	}
+
+	joined := Union([]*oas3.Schema{dom, sub}, SchemaExecOptions{})
+	return schemaEqual(joined, dom)
+}
+
+// schemaEqual performs deep equality check on schemas.
+func schemaEqual(a, b *oas3.Schema) bool {
+	if a == b {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+
+	// Use reflect for deep comparison
+	return reflect.DeepEqual(a, b)
+}
+
+// joinState merges two states using lattice join (LUB).
+// When scope keys differ, union them and treat missing keys as if they were present
+// with the value from the other state (join with implicit "undefined" = keep existing).
+func joinState(a, b *execState) *execState {
+	if a.pc != b.pc {
+		panic("joinState: PC mismatch")
+	}
+	if len(a.stack) != len(b.stack) {
+		panic("joinState: stack length mismatch")
+	}
+	if len(a.scopes) != len(b.scopes) {
+		panic("joinState: scope length mismatch")
+	}
+
+	merged := &execState{
+		pc:        a.pc,
+		stack:     make([]SValue, len(a.stack)),
+		scopes:    make([]map[string]*oas3.Schema, len(a.scopes)),
+		depth:     maxInt(a.depth, b.depth),
+		callstack: a.callstack, // Assume same callstack in partition
+		id:        a.id,
+		parentID:  a.parentID,
+		lineage:   a.lineage,
+		// Preserve shared fields from first state
+		accum:         a.accum,
+		schemaToAlloc: a.schemaToAlloc,
+		allocCounter:  a.allocCounter,
+	}
+
+	// Join stack values
+	for i := range a.stack {
+		merged.stack[i] = SValue{Schema: joinTwoSchemas(a.stack[i].Schema, b.stack[i].Schema)}
+	}
+
+	// Join scopes (union keys, join shared values)
+	for i := range a.scopes {
+		mergedScope := make(map[string]*oas3.Schema)
+		aScope := a.scopes[i]
+		bScope := b.scopes[i]
+
+		// Add all keys from both scopes
+		allKeys := make(map[string]bool)
+		for k := range aScope {
+			allKeys[k] = true
+		}
+		for k := range bScope {
+			allKeys[k] = true
+		}
+
+		// Join each key
+		for k := range allKeys {
+			aVal, aHas := aScope[k]
+			bVal, bHas := bScope[k]
+
+			if aHas && bHas {
+				// Both have it: join
+				mergedScope[k] = joinTwoSchemas(aVal, bVal)
+			} else if aHas {
+				// Only a has it: keep a's value
+				mergedScope[k] = aVal
+			} else {
+				// Only b has it: keep b's value
+				mergedScope[k] = bVal
+			}
+		}
+
+		merged.scopes[i] = mergedScope
+	}
+
+	return merged
+}
+
+// joinTwoSchemas performs schema-level join (LUB) using Union.
+func joinTwoSchemas(a, b *oas3.Schema) *oas3.Schema {
+	return Union([]*oas3.Schema{a, b}, SchemaExecOptions{})
+}
+
+// partitionByShape groups states with compatible layouts.
+// If relaxScopeKeys is true, ignore scope variable names in the shape key
+// to allow more aggressive merging at hot join points.
+func partitionByShape(states []*execState, relaxScopeKeys bool) [][]*execState {
+	groups := make(map[string][]*execState)
+	for _, s := range states {
+		key := shapeKey(s, relaxScopeKeys)
+		groups[key] = append(groups[key], s)
+	}
+
+	result := make([][]*execState, 0, len(groups))
+	for _, group := range groups {
+		result = append(result, group)
+	}
+	return result
+}
+
+// shapeKey generates a deterministic key encoding the state's structural shape.
+// If relaxScopeKeys is true, only include scope frame counts, not variable names.
+func shapeKey(s *execState, relaxScopeKeys bool) string {
+	var buf strings.Builder
+
+	// Stack length
+	buf.WriteString("stack:")
+	buf.WriteString(strconv.Itoa(len(s.stack)))
+	buf.WriteString(";")
+
+	// Scope frame count and keys (conditionally)
+	buf.WriteString("scopes:")
+	buf.WriteString(strconv.Itoa(len(s.scopes)))
+	buf.WriteString(";")
+
+	if !relaxScopeKeys {
+		// Include variable names for precise partitioning
+		for i, scope := range s.scopes {
+			keys := make([]string, 0, len(scope))
+			for k := range scope {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			buf.WriteString("scope")
+			buf.WriteString(strconv.Itoa(i))
+			buf.WriteString(":[")
+			buf.WriteString(strings.Join(keys, ","))
+			buf.WriteString("];")
+		}
+	} else {
+		// Just include counts for relaxed merging
+		for i, scope := range s.scopes {
+			buf.WriteString("scope")
+			buf.WriteString(strconv.Itoa(i))
+			buf.WriteString(":count=")
+			buf.WriteString(strconv.Itoa(len(scope)))
+			buf.WriteString(";")
+		}
+	}
+
+	// Callstack
+	buf.WriteString("callstack:")
+	buf.WriteString(intSliceKey(s.callstack))
+
+	return buf.String()
+}
+
+// intSliceKey generates a string key for an int slice.
+func intSliceKey(ints []int) string {
+	strs := make([]string, len(ints))
+	for i, v := range ints {
+		strs[i] = strconv.Itoa(v)
+	}
+	return "[" + strings.Join(strs, ",") + "]"
+}
+
+// maxInt returns the maximum of two integers.
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

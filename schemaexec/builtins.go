@@ -18,12 +18,12 @@ type builtinFunc func(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 // builtinRegistry maps function names to their schema transformation implementations.
 var builtinRegistry = map[string]builtinFunc{
 	// Introspection
-	"type":   builtinType,
-	"length": builtinLength,
-	"keys":   builtinKeys,
+	"type":          builtinType,
+	"length":        builtinLength,
+	"keys":          builtinKeys,
 	"keys_unsorted": builtinKeys,
-	"values": builtinValues,
-	"has":    builtinHas,
+	"values":        builtinValues,
+	"has":           builtinHas,
 
 	// Type conversions
 	"tonumber": builtinToNumber,
@@ -49,11 +49,11 @@ var builtinRegistry = map[string]builtinFunc{
 	"map":    nil, // Special: compiler macro
 
 	// Comparison operations (for predicates in select, etc.)
-	"_equal":   builtinEqual, // ==
-	"_notequal": builtinNotEqual, // !=
-	"_less":    builtinLess, // <
-	"_greater": builtinGreater, // >
-	"_lesseq":  builtinLessEq, // <=
+	"_equal":     builtinEqual,     // ==
+	"_notequal":  builtinNotEqual,  // !=
+	"_less":      builtinLess,      // <
+	"_greater":   builtinGreater,   // >
+	"_lesseq":    builtinLessEq,    // <=
 	"_greatereq": builtinGreaterEq, // >=
 
 	// Logical operations - these are inline-expanded by compiler, not builtins!
@@ -102,21 +102,25 @@ var builtinRegistry = map[string]builtinFunc{
 	"_max_by":    builtinMinMaxBy,
 
 	// Array manipulation
-	"flatten": builtinFlatten,
-	"indices": builtinIndices,
-	"index":   builtinIndex,
-	"rindex":  builtinRindex,
+	"flatten":  builtinFlatten,
+	"indices":  builtinIndices,
+	"index":    builtinIndex,
+	"rindex":   builtinRindex,
 	"contains": builtinContains,
 	"inside":   builtinInside,
 
 	// Regex
 	"test":   builtinTest,
 	"_match": builtinMatch,
+	"sub":    builtinSub,
+
+	// Indexing
+	"_index": builtinIndexOp,
 
 	// Internal
 	"_break":     builtinBreak,
 	"_allocator": builtinAllocator,
-	"_setpath":   builtinSetpath, // Reuse public version
+	"_setpath":   builtinSetpath,  // Reuse public version
 	"_delpaths":  builtinDelpaths, // Reuse public version
 }
 
@@ -1040,6 +1044,124 @@ func builtinMatch(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*o
 
 	// Return match object | null (conservative - can't evaluate regex)
 	return []*oas3.Schema{Union([]*oas3.Schema{matchObj, ConstNull()}, env.opts)}, nil
+}
+
+// builtinSub implements sub(pattern; replacement; flags?) - regex replacement (first match)
+func builtinSub(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if !MightBeString(input) {
+		return []*oas3.Schema{Bottom()}, nil
+	}
+
+	if len(args) < 2 {
+		return []*oas3.Schema{StringType()}, nil
+	}
+
+	// Const folding: if input, pattern, and replacement are all const
+	if inputStr, ok := extractConstString(input); ok {
+		if patternStr, ok := extractConstString(args[0]); ok {
+			if replStr, ok := extractConstString(args[1]); ok {
+				re, err := regexp.Compile(patternStr)
+				if err != nil {
+					// Invalid regex - return string (conservative)
+					return []*oas3.Schema{StringType()}, nil
+				}
+				result := re.ReplaceAllString(inputStr, replStr)
+				return []*oas3.Schema{ConstString(result)}, nil
+			}
+		}
+	}
+
+	// Conservative abstract semantics: return string
+	return []*oas3.Schema{StringType()}, nil
+}
+
+// builtinIndexOp implements _index(index) for array/string indexing with slicing support
+func builtinIndexOp(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) == 0 {
+		return []*oas3.Schema{Top()}, nil
+	}
+
+	indexArg := args[0]
+
+	// Check if this is a slice operation (index is an object with "start" and/or "end")
+	if MightBeObject(indexArg) {
+		// Slice operation: array[start:end] or string[start:end]
+		if MightBeArray(input) {
+			var elemType *oas3.Schema
+			if input.Items != nil && input.Items.Left != nil {
+				elemType = input.Items.Left
+			} else {
+				elemType = Top()
+			}
+			return []*oas3.Schema{ArrayType(elemType)}, nil
+		}
+		if MightBeString(input) {
+			return []*oas3.Schema{StringType()}, nil
+		}
+		return []*oas3.Schema{ConstNull()}, nil
+	}
+
+	// Single index operation
+	// Array indexing
+	if MightBeArray(input) {
+		var elemType *oas3.Schema
+		if input.Items != nil && input.Items.Left != nil {
+			elemType = input.Items.Left
+		} else if input.PrefixItems != nil && len(input.PrefixItems) > 0 {
+			// Tuple array - try to get specific element if index is const
+			if idxVal, ok := extractConstValue(indexArg); ok {
+				if idxFloat, ok := idxVal.(float64); ok {
+					i := int(idxFloat)
+					if i >= 0 && i < len(input.PrefixItems) && input.PrefixItems[i].Left != nil {
+						// Found exact element
+						return []*oas3.Schema{input.PrefixItems[i].Left}, nil
+					}
+				}
+			}
+			// Fall back to union of all tuple elements
+			elemSchemas := make([]*oas3.Schema, 0, len(input.PrefixItems))
+			for _, item := range input.PrefixItems {
+				if item.Left != nil {
+					elemSchemas = append(elemSchemas, item.Left)
+				}
+			}
+			if len(elemSchemas) > 0 {
+				elemType = Union(elemSchemas, env.opts)
+			} else {
+				elemType = Top()
+			}
+		} else {
+			elemType = Top()
+		}
+
+		// Return element type | null (null for out-of-bounds)
+		return []*oas3.Schema{Union([]*oas3.Schema{elemType, ConstNull()}, env.opts)}, nil
+	}
+
+	// String indexing - returns single character string or null
+	if MightBeString(input) {
+		// Const folding: if both input and index are const
+		if inputStr, ok := extractConstString(input); ok {
+			if idxVal, ok := extractConstValue(indexArg); ok {
+				if idxFloat, ok := idxVal.(float64); ok {
+					i := int(idxFloat)
+					if i >= 0 && i < len(inputStr) {
+						return []*oas3.Schema{ConstString(string(inputStr[i]))}, nil
+					}
+					// Out of bounds
+					return []*oas3.Schema{ConstNull()}, nil
+				}
+			}
+		}
+
+		// Conservative: return string (single char) | null
+		result := StringType()
+		// Single character string
+		return []*oas3.Schema{Union([]*oas3.Schema{result, ConstNull()}, env.opts)}, nil
+	}
+
+	// Neither array nor string
+	return []*oas3.Schema{Union([]*oas3.Schema{Top(), ConstNull()}, env.opts)}, nil
 }
 
 // ============================================================================

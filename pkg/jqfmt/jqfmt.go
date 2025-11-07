@@ -93,6 +93,11 @@ func strToQuery(jqStr string) (Query, error) {
 	}
 	json.Unmarshal([]byte(jqAstJSON), &jqAstQ)
 
+	// Validate the AST structure to catch any nil pointers early
+	if err := jqAstQ.Validate("$"); err != nil {
+		return jqAstQ, fmt.Errorf("invalid AST structure: %w", err)
+	}
+
 	return jqAstQ, nil
 }
 

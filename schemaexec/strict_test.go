@@ -300,3 +300,52 @@ func TestStrictMode_TopInAnyOf(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// TestBranchExplosion_StateMerging tests that state merging prevents exponential
+// branch explosion from multiple conditionals before a reduce operation.
+func TestBranchExplosion_StateMerging(t *testing.T) {
+	// This query has multiple conditionals that would create 2^N states,
+	// followed by a reduce operation. Without state merging, this would
+	// exceed iteration limits.
+	query, err := gojq.Parse(`
+		. as $in
+		| (if $in.a then "yes" else "no" end) as $val_a
+		| (if $in.b then "yes" else "no" end) as $val_b
+		| (if $in.c then "yes" else "no" end) as $val_c
+		| (if $in.d then "yes" else "no" end) as $val_d
+		| (if $in.e then "yes" else "no" end) as $val_e
+		| [$val_a, $val_b, $val_c, $val_d, $val_e] | map({name: ., value: .}) | reduce .[] as $item ({}; . + {($item.name): $item.value})
+	`)
+	if err != nil {
+		t.Fatalf("failed to parse query: %v", err)
+	}
+
+	// Input has 5 optional boolean fields
+	input := BuildObject(map[string]*oas3.Schema{
+		"a": BoolType(),
+		"b": BoolType(),
+		"c": BoolType(),
+		"d": BoolType(),
+		"e": BoolType(),
+	}, nil)
+
+	opts := DefaultOptions()
+	opts.StrictMode = false // Permissive mode to allow dynamic keys
+
+	// This should complete without hitting iteration limits
+	result, err := RunSchema(context.Background(), query, input, opts)
+	if err != nil {
+		t.Fatalf("branch explosion test failed: %v", err)
+	}
+
+	if result.Schema == nil {
+		t.Fatal("expected non-nil result schema")
+	}
+
+	// Result should be an object (the reduce output)
+	if getType(result.Schema) != "object" {
+		t.Errorf("expected object type, got %s", getType(result.Schema))
+	}
+
+	t.Logf("✓ Branch explosion test passed with state merging")
+}

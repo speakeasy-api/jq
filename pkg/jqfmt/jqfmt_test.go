@@ -301,6 +301,79 @@ func TestFormat(t *testing.T) {
 	}
 }
 
+func TestComplexReduce(t *testing.T) {
+	// Test the complex reduce query that was causing nil pointer dereference
+	complexQuery := `(
+    . as $in
+    | ($in.source_kafka_cluster // null) as $src
+    | ($in.destination_kafka_cluster // null) as $dest
+    | ($in.local_kafka_cluster // null) as $local
+    | ($in.remote_kafka_cluster // null) as $remote
+    | (if $src then $src elif $dest then $dest elif $remote then $remote else null end) as $remoteBlock
+    | (if $remoteBlock then ($remoteBlock.bootstrap_endpoint // $remoteBlock.rest_endpoint // null) else null end) as $ep
+    | (
+        if $ep == null then null
+        elif ($ep | test("://")) then ($ep | split("://")[1] | split("/")[0] | sub(":443$"; ":9092") | if test(":\\d+$") then . else . + ":9092" end)
+        else ($ep | split("/")[0] | sub(":443$"; ":9092") | if test(":\\d+$") then . else . + ":9092" end)
+        end
+        ) as $bootstrap
+    | ($in.config // {}) as $usercfg
+    | (
+        if $in.link_mode then $in.link_mode
+        elif ($local and $remote) then "BIDIRECTIONAL"
+        elif $src then "DESTINATION"
+        elif $dest then "SOURCE"
+        else null
+        end
+        ) as $lm
+    | (if $in.connection_mode then $in.connection_mode else "OUTBOUND" end) as $cm
+    | (
+        (
+            ($usercfg | to_entries | map({name: .key, value: (.value | tostring)}))
+            + (if $bootstrap then [{name: "bootstrap.servers", value: $bootstrap}] else [] end)
+            + (
+                if $remoteBlock.credentials then
+                [
+                    {name: "sasl.mechanism", value: "PLAIN"},
+                    {name: "security.protocol", value: "SASL_SSL"},
+                    {name: "sasl.jaas.config", value: ("org.apache.kafka.common.security.plain.PlainLoginModule required username='" + ($remoteBlock.credentials.key // "") + "' password='" + ($remoteBlock.credentials.secret // "") + "';")}
+                ]
+                else []
+                end
+            )
+            + (
+                if $local.credentials then
+                [
+                    {name: "local.sasl.mechanism", value: "PLAIN"},
+                    {name: "local.security.protocol", value: "SASL_SSL"},
+                    {name: "local.sasl.jaas.config", value: ("org.apache.kafka.common.security.plain.PlainLoginModule required username='" + ($local.credentials.key // "") + "' password='" + ($local.credentials.secret // "") + "';")}
+                ]
+                else []
+                end
+            )
+            + (if $lm then [{name: "link.mode", value: $lm}] else [] end)
+            + (if $cm then [{name: "connection.mode", value: $cm}] else [] end)
+        ) | reduce .[] as $c ({}; .[$c.name] = $c.value)
+            | to_entries
+            | sort_by(.key)
+            | map({name: .key, value: .value})
+        ) as $configs
+    | (
+        {}
+        | if $src then . + {source_cluster_id: $src.id} else . end
+        | if $dest then . + {destination_cluster_id: $dest.id} else . end
+        | if ($local and $remote) then . + {remote_cluster_id: $remote.id} else . end
+        | if $in.cluster_link_id then . + {cluster_link_id: $in.cluster_link_id} else . end
+        | . + {configs: $configs}
+        )
+    )`
+
+	_, err := DoThing(complexQuery, JqFmtCfg{})
+	if err != nil {
+		t.Fatalf("DoThing() with complex reduce query failed: %v", err)
+	}
+}
+
 func TestValidateConfig(t *testing.T) {
 	tests := []struct {
 		name    string

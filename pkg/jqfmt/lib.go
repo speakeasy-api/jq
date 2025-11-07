@@ -44,6 +44,35 @@ func (e *Query) String() string {
 	return s.String()
 }
 
+func (e *Query) Validate(path string) error {
+	if e == nil {
+		return fmt.Errorf("%s: Query is nil", path)
+	}
+	if e.Term != nil {
+		if err := e.Term.Validate(path + ".term"); err != nil {
+			return err
+		}
+	}
+	if e.Left != nil {
+		if err := e.Left.Validate(path + ".left"); err != nil {
+			return err
+		}
+	}
+	if e.Right != nil {
+		if err := e.Right.Validate(path + ".right"); err != nil {
+			return err
+		}
+	}
+	for i, fd := range e.FuncDefs {
+		if fd.Body != nil {
+			if err := fd.Body.Validate(fmt.Sprintf("%s.funcdefs[%d].body", path, i)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func nodeIdt(nodeToIdt, reason string) {
 	nodeIdts[nodeToIdt] = append(nodeIdts[nodeToIdt], reason)
 }
@@ -292,7 +321,40 @@ func (e *Term) String() string {
 	return s.String()
 }
 
+func (e *Term) Validate(path string) error {
+	if e == nil {
+		return fmt.Errorf("%s: Term is nil", path)
+	}
+	switch e.Type {
+	case gojq.TermTypeReduce:
+		if e.Reduce == nil {
+			return fmt.Errorf("%s: Reduce is nil for TermTypeReduce", path)
+		}
+		if err := e.Reduce.Validate(path + ".reduce"); err != nil {
+			return err
+		}
+	case gojq.TermTypeForeach:
+		if e.Foreach == nil {
+			return fmt.Errorf("%s: Foreach is nil for TermTypeForeach", path)
+		}
+		if err := e.Foreach.Validate(path + ".foreach"); err != nil {
+			return err
+		}
+	case gojq.TermTypeQuery:
+		if e.Query != nil {
+			if err := e.Query.Validate(path + ".query"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (e *Term) writeTo(s *strings.Builder) {
+	if e == nil {
+		s.WriteString("<invalid term>")
+		return
+	}
 	switch e.Type {
 	case gojq.TermTypeIdentity:
 		s.WriteByte('.')
@@ -930,7 +992,39 @@ func (e *Reduce) String() string {
 	return s.String()
 }
 
+func (e *Reduce) Validate(path string) error {
+	if e == nil {
+		return fmt.Errorf("%s: Reduce is nil", path)
+	}
+	if e.Term == nil {
+		return fmt.Errorf("%s.term: missing", path)
+	}
+	if e.Pattern == nil {
+		return fmt.Errorf("%s.pattern: missing", path)
+	}
+	if e.Start == nil {
+		return fmt.Errorf("%s.start: missing", path)
+	}
+	if e.Update == nil {
+		return fmt.Errorf("%s.update: missing", path)
+	}
+	if err := e.Term.Validate(path + ".term"); err != nil {
+		return err
+	}
+	if err := e.Start.Validate(path + ".start"); err != nil {
+		return err
+	}
+	if err := e.Update.Validate(path + ".update"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (e *Reduce) writeTo(s *strings.Builder) {
+	if e == nil || e.Term == nil || e.Pattern == nil || e.Start == nil || e.Update == nil {
+		s.WriteString("<invalid reduce>")
+		return
+	}
 	s.WriteString("reduce ")
 	e.Term.writeTo(s)
 	s.WriteString(" as ")
@@ -963,7 +1057,44 @@ func (e *Foreach) String() string {
 	return s.String()
 }
 
+func (e *Foreach) Validate(path string) error {
+	if e == nil {
+		return fmt.Errorf("%s: Foreach is nil", path)
+	}
+	if e.Term == nil {
+		return fmt.Errorf("%s.term: missing", path)
+	}
+	if e.Pattern == nil {
+		return fmt.Errorf("%s.pattern: missing", path)
+	}
+	if e.Start == nil {
+		return fmt.Errorf("%s.start: missing", path)
+	}
+	if e.Update == nil {
+		return fmt.Errorf("%s.update: missing", path)
+	}
+	if err := e.Term.Validate(path + ".term"); err != nil {
+		return err
+	}
+	if err := e.Start.Validate(path + ".start"); err != nil {
+		return err
+	}
+	if err := e.Update.Validate(path + ".update"); err != nil {
+		return err
+	}
+	if e.Extract != nil {
+		if err := e.Extract.Validate(path + ".extract"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (e *Foreach) writeTo(s *strings.Builder) {
+	if e == nil || e.Term == nil || e.Pattern == nil || e.Start == nil || e.Update == nil {
+		s.WriteString("<invalid foreach>")
+		return
+	}
 	s.WriteString("foreach ")
 	e.Term.writeTo(s)
 	s.WriteString(" as ")
