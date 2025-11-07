@@ -132,20 +132,453 @@ func newSchemaEnv(ctx context.Context, opts SchemaExecOptions) *schemaEnv {
 }
 
 // derefJSONSchema attempts to dereference a JSONSchema wrapper to get the actual Schema.
-// GetResolvedSchema() handles both inline schemas and pre-resolved $ref references.
+// Tries GetResolvedSchema() first for $ref cases, then falls back to inline Left schemas.
 // Returns (schema, true) if successful, (nil, false) if unresolved or invalid.
 func derefJSONSchema(js *oas3.JSONSchema[oas3.Referenceable]) (*oas3.Schema, bool) {
 	if js == nil {
 		return nil, false
 	}
 
+	// 1) Try GetResolvedSchema() first (handles $refs after ResolveAllReferences).
 	if resolved := js.GetResolvedSchema(); resolved != nil {
 		if schema := resolved.GetLeft(); schema != nil {
-			return schema, true
+			collapsed, err := collapseAllOf(schema)
+			if err != nil {
+				return schema, true
+			}
+			collapsed, err = collapseAnyOf(collapsed)
+			if err != nil {
+				return collapsed, true
+			}
+			return collapsed, true
 		}
 	}
 
+	// 2) Fall back to inline Left if GetResolvedSchema didn't work.
+	// This handles schemas created by wrapping with NewJSONSchemaFromSchema.
+	if js.Left != nil {
+		s := js.Left
+		// Collapse allOf then anyOf
+		collapsed, err := collapseAllOf(s)
+		if err != nil {
+			return s, true
+		}
+		collapsed, err = collapseAnyOf(collapsed)
+		if err != nil {
+			return collapsed, true
+		}
+		return collapsed, true
+	}
+
+	// Unresolved or unknown wrapper
 	return nil, false
+}
+
+// MergeMode determines how schemas are merged
+type MergeMode int
+
+const (
+	// MergeConjunctive represents allOf semantics (intersection)
+	// - Properties: union of keys, recursively merge overlapping
+	// - Required: union (field required in ANY subschema)
+	// - Types: intersection (must be compatible)
+	MergeConjunctive MergeMode = iota
+
+	// MergeDisjunctive represents anyOf semantics (union/LUB)
+	// - Properties: union of keys, union overlapping property schemas
+	// - Required: intersection (field required in ALL subschemas)
+	// - Types: union (more permissive)
+	MergeDisjunctive
+)
+
+// collapseAllOf recursively collapses allOf constraints in a schema by deep merging.
+// Returns the collapsed schema or an error if schemas are incompatible.
+func collapseAllOf(schema *oas3.Schema) (*oas3.Schema, error) {
+	if schema == nil {
+		return nil, nil
+	}
+
+	// If no allOf, process nested schemas and return
+	if len(schema.AllOf) == 0 {
+		// Recursively collapse nested schemas
+		collapsed, err := collapseNestedSchemas(schema)
+		if err != nil {
+			return nil, err
+		}
+		return collapsed, nil
+	}
+
+	// Extract and dereference all allOf subschemas
+	subschemas := make([]*oas3.Schema, 0, len(schema.AllOf))
+	for _, schemaOrRef := range schema.AllOf {
+		if schemaOrRef.Left != nil {
+			// Recursively collapse the subschema
+			collapsed, err := collapseAllOf(schemaOrRef.Left)
+			if err != nil {
+				return nil, err
+			}
+			subschemas = append(subschemas, collapsed)
+		}
+	}
+
+	// Handle empty allOf (should not happen but be safe)
+	if len(subschemas) == 0 {
+		// Empty allOf means unconstrained (Top)
+		base := cloneSchema(schema)
+		base.AllOf = nil
+		return collapseNestedSchemas(base)
+	}
+
+	// Handle single allOf subschema (identity case)
+	if len(subschemas) == 1 {
+		// Merge the single subschema with the parent schema (if any parent constraints exist)
+		base := cloneSchema(schema)
+		base.AllOf = nil
+		merged, err := mergeSchemas(base, subschemas[0])
+		if err != nil {
+			return nil, err
+		}
+		return collapseNestedSchemas(merged)
+	}
+
+	// Merge all subschemas together
+	base := cloneSchema(schema)
+	base.AllOf = nil
+
+	result := base
+	for _, sub := range subschemas {
+		merged, err := mergeSchemas(result, sub)
+		if err != nil {
+			return nil, err
+		}
+		result = merged
+	}
+
+	return collapseNestedSchemas(result)
+}
+
+// collapseAnyOf recursively collapses anyOf constraints in a schema by disjunctive merging.
+// Returns the collapsed schema or Bottom if anyOf is empty.
+// Keeps anyOf structure if branches have incompatible types.
+func collapseAnyOf(schema *oas3.Schema) (*oas3.Schema, error) {
+	if schema == nil {
+		return nil, nil
+	}
+
+	// If no anyOf, process nested schemas and return
+	if len(schema.AnyOf) == 0 {
+		// Recursively collapse nested schemas
+		collapsed, err := collapseNestedSchemas(schema)
+		if err != nil {
+			return nil, err
+		}
+		return collapsed, nil
+	}
+
+	// Extract and collapse all anyOf subschemas
+	subschemas := make([]*oas3.Schema, 0, len(schema.AnyOf))
+	for _, schemaOrRef := range schema.AnyOf {
+		if schemaOrRef.Left != nil {
+			// First collapse allOf within this branch, then anyOf
+			collapsed, err := collapseAllOf(schemaOrRef.Left)
+			if err != nil {
+				return nil, err
+			}
+			collapsed, err = collapseAnyOf(collapsed)
+			if err != nil {
+				return nil, err
+			}
+			subschemas = append(subschemas, collapsed)
+		}
+	}
+
+	// Handle empty anyOf - unsatisfiable schema (Bottom)
+	if len(subschemas) == 0 {
+		return Bottom(), nil
+	}
+
+	// Distribute base constraints into each branch
+	base := cloneSchema(schema)
+	base.AnyOf = nil
+
+	branches := make([]*oas3.Schema, 0, len(subschemas))
+	for _, sub := range subschemas {
+		// Merge base with this branch using allOf semantics
+		merged, err := mergeSchemas(base, sub)
+		if err != nil {
+			return nil, err
+		}
+		branches = append(branches, merged)
+	}
+
+	// Check if any branch is Top - if so, result is Top
+	for _, branch := range branches {
+		if isTopSchema(branch) {
+			return Top(), nil
+		}
+	}
+
+	// Handle single anyOf subschema (identity case after base merge)
+	if len(branches) == 1 {
+		return collapseNestedSchemas(branches[0])
+	}
+
+	// Try to flatten anyOf if all branches share the same type
+	commonType := getType(branches[0])
+	allSameType := commonType != ""
+	for i := 1; i < len(branches); i++ {
+		t := getType(branches[i])
+		if t != commonType {
+			allSameType = false
+			break
+		}
+	}
+
+	if !allSameType {
+		// Cannot flatten - keep anyOf structure with normalized branches
+		result := cloneSchema(schema)
+		result.AnyOf = make([]*oas3.JSONSchema[oas3.Referenceable], len(branches))
+		for i, branch := range branches {
+			result.AnyOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branch)
+		}
+		return result, nil
+	}
+
+	// All branches have the same type - attempt disjunctive merge
+	result := branches[0]
+	for i := 1; i < len(branches); i++ {
+		merged, err := mergeSchemasMode(result, branches[i], MergeDisjunctive)
+		if err != nil {
+			return nil, err
+		}
+		result = merged
+	}
+
+	return collapseNestedSchemas(result)
+}
+
+// collapseNestedSchemas recursively collapses allOf in nested schemas (properties, items, etc.)
+func collapseNestedSchemas(schema *oas3.Schema) (*oas3.Schema, error) {
+	if schema == nil {
+		return nil, nil
+	}
+
+	result := cloneSchema(schema)
+
+	// Collapse properties
+	if result.Properties != nil && result.Properties.Len() > 0 {
+		newProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+		for key, prop := range result.Properties.All() {
+			if prop != nil && prop.Left != nil {
+				collapsed, err := collapseAllOf(prop.Left)
+				if err != nil {
+					return nil, err
+				}
+				collapsed, err = collapseAnyOf(collapsed)
+				if err != nil {
+					return nil, err
+				}
+				newProps.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](collapsed))
+			} else {
+				newProps.Set(key, prop)
+			}
+		}
+		result.Properties = newProps
+	}
+
+	// Collapse array items
+	if result.Items != nil && result.Items.Left != nil {
+		collapsed, err := collapseAllOf(result.Items.Left)
+		if err != nil {
+			return nil, err
+		}
+		collapsed, err = collapseAnyOf(collapsed)
+		if err != nil {
+			return nil, err
+		}
+		result.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](collapsed)
+	}
+
+	// Collapse additionalProperties
+	if result.AdditionalProperties != nil && result.AdditionalProperties.Left != nil {
+		collapsed, err := collapseAllOf(result.AdditionalProperties.Left)
+		if err != nil {
+			return nil, err
+		}
+		collapsed, err = collapseAnyOf(collapsed)
+		if err != nil {
+			return nil, err
+		}
+		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](collapsed)
+	}
+
+	// Collapse anyOf branches
+	if len(result.AnyOf) > 0 {
+		newAnyOf := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(result.AnyOf))
+		for _, branch := range result.AnyOf {
+			if branch.Left != nil {
+				collapsed, err := collapseAllOf(branch.Left)
+				if err != nil {
+					return nil, err
+				}
+				collapsed, err = collapseAnyOf(collapsed)
+				if err != nil {
+					return nil, err
+				}
+				newAnyOf = append(newAnyOf, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](collapsed))
+			}
+		}
+		result.AnyOf = newAnyOf
+	}
+
+	// TODO: Collapse oneOf, not if needed
+
+	return result, nil
+}
+
+// mergeSchemasMode deep merges two schemas according to the specified mode.
+// Returns an error if the schemas have incompatible constraints.
+func mergeSchemasMode(s1, s2 *oas3.Schema, mode MergeMode) (*oas3.Schema, error) {
+	// Handle nil cases
+	if s1 == nil && s2 == nil {
+		return nil, nil
+	}
+	if s1 == nil {
+		return cloneSchema(s2), nil
+	}
+	if s2 == nil {
+		return cloneSchema(s1), nil
+	}
+
+	result := cloneSchema(s1)
+
+	// Merge type
+	if s2.Type != nil {
+		if result.Type == nil {
+			result.Type = s2.Type
+		} else {
+			// Both have types
+			t1 := getType(result)
+			t2 := getType(s2)
+
+			if mode == MergeConjunctive {
+				// allOf: types must be compatible (intersection)
+				if t1 != "" && t2 != "" && t1 != t2 {
+					return nil, fmt.Errorf("incompatible types: %s and %s", t1, t2)
+				}
+				// Keep the more specific type (non-empty)
+				if t1 == "" {
+					result.Type = s2.Type
+				}
+			} else {
+				// anyOf: types are unioned (more permissive)
+				// If types differ, we can't represent type union in a single schema
+				// The caller should keep anyOf structure for mixed types
+				if t1 != "" && t2 != "" && t1 != t2 {
+					// Mixed types - cannot flatten to single schema
+					// Return an indicator that this should stay as anyOf
+					result.Type = nil // Clear type to indicate multi-type
+				} else if t1 == "" {
+					result.Type = s2.Type
+				}
+			}
+		}
+	}
+
+	// Merge properties (union of keys, recursively merge overlapping)
+	if s2.Properties != nil && s2.Properties.Len() > 0 {
+		if result.Properties == nil {
+			result.Properties = sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+		}
+
+		for key, prop2 := range s2.Properties.All() {
+			if prop1, exists := result.Properties.Get(key); exists {
+				// Merge the two property schemas
+				if prop1 != nil && prop1.Left != nil && prop2 != nil && prop2.Left != nil {
+					merged, err := mergeSchemasMode(prop1.Left, prop2.Left, mode)
+					if err != nil {
+						return nil, fmt.Errorf("incompatible property %q: %w", key, err)
+					}
+					result.Properties.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](merged))
+				} else if prop2 != nil {
+					result.Properties.Set(key, prop2)
+				}
+			} else {
+				// New property from s2
+				result.Properties.Set(key, prop2)
+			}
+		}
+	}
+
+	// Merge required fields based on mode
+	if mode == MergeConjunctive {
+		// allOf: union of required fields (field required in ANY subschema)
+		if len(s2.Required) > 0 {
+			requiredSet := make(map[string]bool)
+			for _, r := range result.Required {
+				requiredSet[r] = true
+			}
+			for _, r := range s2.Required {
+				if !requiredSet[r] {
+					result.Required = append(result.Required, r)
+					requiredSet[r] = true
+				}
+			}
+			// Sort for determinism
+			sort.Strings(result.Required)
+		}
+	} else {
+		// anyOf: intersection of required fields (field required in ALL subschemas)
+		if len(result.Required) > 0 && len(s2.Required) > 0 {
+			s1Set := make(map[string]bool)
+			for _, r := range result.Required {
+				s1Set[r] = true
+			}
+			s2Set := make(map[string]bool)
+			for _, r := range s2.Required {
+				s2Set[r] = true
+			}
+			// Keep only fields that are in both sets
+			intersection := make([]string, 0)
+			for r := range s1Set {
+				if s2Set[r] {
+					intersection = append(intersection, r)
+				}
+			}
+			sort.Strings(intersection)
+			result.Required = intersection
+		} else {
+			// If either has no required fields, intersection is empty
+			result.Required = nil
+		}
+	}
+
+	// Merge array items
+	if s2.Items != nil && s2.Items.Left != nil {
+		if result.Items == nil || result.Items.Left == nil {
+			result.Items = s2.Items
+		} else {
+			// Merge the item schemas
+			merged, err := mergeSchemasMode(result.Items.Left, s2.Items.Left, mode)
+			if err != nil {
+				return nil, fmt.Errorf("incompatible array items: %w", err)
+			}
+			result.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](merged)
+		}
+	}
+
+	// TODO: Merge other constraints (minLength, maxLength, minimum, maximum, etc.)
+	// TODO: Merge enum (intersection)
+	// TODO: Merge additionalProperties
+	// TODO: Handle incompatible constraints
+
+	return result, nil
+}
+
+// mergeSchemas is a convenience wrapper for allOf-style merging (conjunctive).
+// Kept for backward compatibility with existing code.
+func mergeSchemas(s1, s2 *oas3.Schema) (*oas3.Schema, error) {
+	return mergeSchemasMode(s1, s2, MergeConjunctive)
 }
 
 // execute runs the bytecode on the input schema and returns the result.
