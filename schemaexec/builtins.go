@@ -1478,11 +1478,8 @@ func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 // This is used for patterns like .[$variable] = value where the key isn't known at compile time.
 // It updates additionalProperties to union with the new value type.
 func setDynamicProperty(obj *oas3.Schema, value *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
-	fmt.Printf("DEBUG setDynamicProperty: CALLED with value type=%s, obj type=%s\n", getType(value), getType(obj))
-
 	if obj == nil {
 		// No input object - create one with additionalProperties
-		fmt.Printf("DEBUG setDynamicProperty: creating new object with additionalProperties\n")
 		result := &oas3.Schema{
 			Type:                 oas3.NewTypeFromString(oas3.SchemaTypeObject),
 			AdditionalProperties: oas3.NewJSONSchemaFromSchema[oas3.Referenceable](value),
@@ -1493,8 +1490,6 @@ func setDynamicProperty(obj *oas3.Schema, value *oas3.Schema, opts SchemaExecOpt
 	// Prefer in-place update so reduce keeps the same accumulator pointer
 	// This ensures the reduce accumulator variable gets the AP update
 	result := obj
-	objPtr := fmt.Sprintf("%p", obj)
-	fmt.Printf("DEBUG setDynamicProperty: modifying IN-PLACE ptr=%s\n", objPtr)
 
 	// Get existing additionalProperties
 	var existingAP *oas3.Schema
@@ -1505,15 +1500,12 @@ func setDynamicProperty(obj *oas3.Schema, value *oas3.Schema, opts SchemaExecOpt
 	// Union existing additionalProperties with new value type
 	var newAP *oas3.Schema
 	if existingAP != nil {
-		fmt.Printf("DEBUG setDynamicProperty: unioning existing AP (type=%s) with new value\n", getType(existingAP))
 		newAP = Union([]*oas3.Schema{existingAP, value}, opts)
 	} else {
-		fmt.Printf("DEBUG setDynamicProperty: no existing AP, using value directly\n")
 		newAP = value
 	}
 
 	result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newAP)
-	fmt.Printf("DEBUG setDynamicProperty: MUTATED IN-PLACE ptr=%s, now has AP type=%s\n", objPtr, getType(newAP))
 	return result
 }
 
@@ -2226,7 +2218,6 @@ func concatArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema 
 	}
 
 	if aIsEmpty && bIsEmpty {
-		fmt.Printf("DEBUG concatArraySchemas: both empty, returning empty array\n")
 		return ArrayType(Bottom()) // Empty array
 	}
 

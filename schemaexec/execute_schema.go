@@ -1507,22 +1507,6 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 	case opStore:
 		key := fmt.Sprintf("%v", c.value)
 
-		// DEBUG: Peek before pop for [44 2]
-		if len(next.stack) > 0 {
-			if len(key) >= 3 && key[:3] == "[44" {
-				top := next.stack[len(next.stack)-1].Schema
-				isArr := top != nil && getType(top) == "array"
-				var isEmpty, hasItems, tagged bool
-				if isArr {
-					isEmpty = top.MaxItems != nil && *top.MaxItems == 0
-					hasItems = top.Items != nil && top.Items.Left != nil
-					tagged = next.schemaToAlloc[top] != ""
-				}
-				fmt.Printf("DEBUG pre-opStore %s: topIsArray=%v empty=%v hasItems=%v tagged=%v\n",
-					key, isArr, isEmpty, hasItems, tagged)
-			}
-		}
-
 		if len(next.stack) > 0 {
 			val := next.pop()
 
@@ -1530,25 +1514,8 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			// This ensures variables always have the mutated canonical, not stale references
 			finalVal := val
 			if getType(val) == "array" {
-				// DEBUG: Log for [44 2] regardless of tagging
-				if key == "[44 2]" {
-					valEmpty := val.MaxItems != nil && *val.MaxItems == 0
-					valHasItems := val.Items != nil && val.Items.Left != nil
-					fmt.Printf("DEBUG opStore [44 2]: val is array - valEmpty=%v, valHasItems=%v, valPtr=%p\n",
-						valEmpty, valHasItems, val)
-				}
-
 				if accumKey, tagged := next.schemaToAlloc[val]; tagged {
-					if key == "[44 2]" {
-						fmt.Printf("DEBUG opStore [44 2]: array IS TAGGED with accumKey=%s\n", accumKey)
-					}
 					if canonical, exists := next.accum[accumKey]; exists {
-						if key == "[44 2]" {
-							canonEmpty := canonical.MaxItems != nil && *canonical.MaxItems == 0
-							canonHasItems := canonical.Items != nil && canonical.Items.Left != nil
-							fmt.Printf("DEBUG opStore [44 2]: canonical found - canonEmpty=%v, canonHasItems=%v, samePtr=%v\n",
-								canonEmpty, canonHasItems, val == canonical)
-						}
 						if env.opts.EnableWarnings {
 							valEmpty := val.MaxItems != nil && *val.MaxItems == 0
 							canonEmpty := canonical.MaxItems != nil && *canonical.MaxItems == 0
@@ -1561,14 +1528,8 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 								key, accumKey, valEmpty, canonEmpty, canonHasItems, itemType)
 						}
 						finalVal = canonical  // Store canonical, not stale reference!
-					} else if key == "[44 2]" {
-						fmt.Printf("DEBUG opStore [44 2]: array tagged but NO CANONICAL in accum!\n")
 					}
-				} else if key == "[44 2]" {
-					fmt.Printf("DEBUG opStore [44 2]: array is NOT TAGGED in schemaToAlloc\n")
 				}
-			} else if key == "[44 2]" {
-				fmt.Printf("DEBUG opStore [44 2]: val is NOT an array, type=%s\n", getType(val))
 			}
 
 			next.storeVar(key, finalVal)
@@ -2449,30 +2410,6 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 	priorItems := Bottom()
 	if getType(canonicalArr) == "array" && canonicalArr.Items != nil && canonicalArr.Items.Left != nil {
 		priorItems = canonicalArr.Items.Left
-	}
-
-	// DEBUG: Detect the final configs map by element shape {name, value}
-	isConfigsElem := false
-	if getType(val) == "object" && val.Properties != nil {
-		_, hasName := val.Properties.Get("name")
-		_, hasValue := val.Properties.Get("value")
-		isConfigsElem = hasName && hasValue
-	}
-	if isConfigsElem {
-		fmt.Printf("DEBUG configs-append: pc=%d key=%q fromVar=%v\n", state.pc-1, key, fromVar)
-		if fromVar {
-			if arr, ok := state.loadVar(key); ok {
-				if ak, tagged := state.schemaToAlloc[arr]; tagged {
-					fmt.Printf("DEBUG configs-append: var=%s accumKey=%s\n", key, ak)
-				} else {
-					fmt.Printf("DEBUG configs-append: var=%s (UNTAGGED)\n", key)
-				}
-			} else {
-				fmt.Printf("DEBUG configs-append: var=%s (NOT FOUND)\n", key)
-			}
-		} else {
-			fmt.Printf("DEBUG configs-append: STACK-BACKED\n")
-		}
 	}
 
 	// DEBUG: Log accumulator state
@@ -3633,32 +3570,7 @@ func joinState(a, b *execState) *execState {
 	// The old single-key check incorrectly treated maps as "same" when key sets didn't overlap
 	differentAccumMaps := !accumMapsEqualByIdentity(a.accum, b.accum)
 
-	// DEBUG: Sample accum map pointers for first few joins
-	if len(a.accum) > 0 && len(b.accum) > 0 {
-		aPtr := fmt.Sprintf("%p", a.accum)
-		bPtr := fmt.Sprintf("%p", b.accum)
-		samePtr := (aPtr == bPtr)
-		// Get a sample key to check values
-		var sampleKey string
-		var av, bv *oas3.Schema
-		for k, v := range a.accum {
-			sampleKey = k
-			av = v
-			if bval, ok := b.accum[k]; ok {
-				bv = bval
-				break
-			}
-		}
-		samePtrVal := (av == bv)
-		fmt.Printf("DEBUG joinState: aPtr=%s bPtr=%s samePtr=%v equal=%v sampleKey=%s samePtrVal=%v\n",
-			aPtr[:12], bPtr[:12], samePtr, !differentAccumMaps, sampleKey, samePtrVal)
-	}
-
 	if differentAccumMaps {
-		aPtr := fmt.Sprintf("%p", a.accum)
-		bPtr := fmt.Sprintf("%p", b.accum)
-		fmt.Printf("WARNING joinState: states have DIFFERENT accum maps! a=%s (len=%d), b=%s (len=%d)\n",
-			aPtr, len(a.accum), bPtr, len(b.accum))
 
 		// Merge the accum maps by taking the union
 		// This handles the case where states from different forks have separate accumulators
@@ -3741,7 +3653,6 @@ func joinState(a, b *execState) *execState {
 					mergedAccum[k] = merged
 					// CRITICAL FIX: Re-tag the new canonical pointer so opStore can find it
 					mergedSchemaToAlloc[merged] = k
-					fmt.Printf("WARNING joinState: merged accum key %s - union of items, re-tagged ptr=%p\n", k, merged)
 				}
 			} else {
 				mergedAccum[k] = v
