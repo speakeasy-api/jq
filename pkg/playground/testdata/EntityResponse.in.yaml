@@ -8,11 +8,16 @@ required:
 properties:
   data:
     type: object
+    required:
+      - result
     properties:
       result:
+        minItems: 1
         type: array
         items:
           type: object
+          required:
+            - id
           properties:
             id:
               type: string

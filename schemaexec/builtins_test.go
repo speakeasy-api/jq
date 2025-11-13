@@ -261,3 +261,95 @@ func TestBuiltin_ArrayOperations(t *testing.T) {
 
 	t.Logf("✅ Array operations preserve type")
 }
+
+func TestBuiltin_ArraySubtraction(t *testing.T) {
+	// Test basic array subtraction
+	query, err := gojq.Parse(`. - ["xml", "yaml"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create an array schema with string items
+	input := ArrayType(StringType())
+
+	result, err := RunSchema(context.Background(), query, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Debug: log the result type
+	t.Logf("Result type: %s", getType(result.Schema))
+	t.Logf("Input MightBeArray: %v", MightBeArray(input))
+
+	// Should return array type
+	if getType(result.Schema) != "array" {
+		t.Errorf("array subtraction should return array, got %s", getType(result.Schema))
+	}
+
+	// Should have string items
+	if result.Schema.Items == nil || result.Schema.Items.Left == nil {
+		t.Error("result should have items schema")
+	} else if getType(result.Schema.Items.Left) != "string" {
+		t.Errorf("result items should be string, got %s", getType(result.Schema.Items.Left))
+	}
+
+	t.Logf("✅ Array subtraction preserves item type")
+}
+
+func TestBuiltin_ArraySubtraction_Numbers(t *testing.T) {
+	// Test array subtraction with numbers
+	query, err := gojq.Parse(`. - [2, 3]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create an array schema with number items
+	input := ArrayType(NumberType())
+
+	result, err := RunSchema(context.Background(), query, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should return array type
+	if getType(result.Schema) != "array" {
+		t.Errorf("array subtraction should return array, got %s", getType(result.Schema))
+	}
+
+	// Should have number items
+	if result.Schema.Items == nil || result.Schema.Items.Left == nil {
+		t.Error("result should have items schema")
+	} else {
+		itemType := getType(result.Schema.Items.Left)
+		if itemType != "number" && itemType != "integer" {
+			t.Errorf("result items should be number, got %s", itemType)
+		}
+	}
+
+	t.Logf("✅ Array subtraction with numbers works")
+}
+
+func TestBuiltin_NumericSubtraction(t *testing.T) {
+	// Ensure numeric subtraction still works
+	query, err := gojq.Parse("4 - .a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	input := BuildObject(map[string]*oas3.Schema{
+		"a": ConstInteger(3),
+	}, []string{"a"})
+
+	result, err := RunSchema(context.Background(), query, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should return number type
+	resultType := getType(result.Schema)
+	if resultType != "number" && resultType != "integer" {
+		t.Errorf("numeric subtraction should return number, got %s", resultType)
+	}
+
+	t.Logf("✅ Numeric subtraction still works")
+}

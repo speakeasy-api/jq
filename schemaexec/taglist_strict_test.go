@@ -56,13 +56,13 @@ func TestTagList_StrictMode_ActualFailure(t *testing.T) {
 		// Check if there are any Top schemas in the result
 		tagsProp := GetProperty(result.Schema, "tags", opts)
 		if tagsProp != nil && tagsProp.Items != nil {
-			if schema, ok := derefJSONSchema(tagsProp.Items); ok {
+			if schema, ok := derefJSONSchema(newCollapseContext(), tagsProp.Items); ok {
 				t.Logf("Tags items schema type: %v", getType(schema))
 
 				// Check for properties on the items
 				if schema.Properties != nil {
 					for k, v := range schema.Properties.All() {
-						if propSchema, ok := derefJSONSchema(v); ok {
+						if propSchema, ok := derefJSONSchema(newCollapseContext(), v); ok {
 							propType := getType(propSchema)
 							t.Logf("  Property %s: type=%v", k, propType)
 
@@ -123,13 +123,13 @@ func TestTagList_TraceExecution(t *testing.T) {
 			t.Logf("Result schema type: %v", getType(result.Schema))
 
 			if result.Schema.Items != nil {
-				if itemSchema, ok := derefJSONSchema(result.Schema.Items); ok {
+				if itemSchema, ok := derefJSONSchema(newCollapseContext(), result.Schema.Items); ok {
 					t.Logf("Items schema type: %v", getType(itemSchema))
 
 					// Check properties
 					if itemSchema.Properties != nil {
 						for k, v := range itemSchema.Properties.All() {
-							if propSchema, ok := derefJSONSchema(v); ok {
+							if propSchema, ok := derefJSONSchema(newCollapseContext(), v); ok {
 								propType := getType(propSchema)
 								t.Logf("  Property '%s': type=%v, isTop=%v", k, propType, isTop(propSchema))
 

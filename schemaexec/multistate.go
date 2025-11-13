@@ -1,15 +1,7 @@
 package schemaexec
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
-	"fmt"
-	"hash"
-	"sort"
-	"strings"
-
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
-	"gopkg.in/yaml.v3"
 )
 
 // execState represents a single execution state in the multi-state VM.
@@ -32,6 +24,119 @@ type execState struct {
 	id       int    // Unique state ID
 	parentID int    // Parent state ID (0 for root)
 	lineage  string // Lineage string (e.g., "0", "0.F", "0.F.C")
+
+	// Variable intent tracking (to solve orphaned-allocID issue)
+	varAllocHistory  map[string]map[string]struct{} // varKey -> set(allocID) ever assigned
+	varDesiredItemFP map[string]string              // varKey -> schemaFingerprint(items)
+	allocDesiredFP   map[string]string              // SHARED: allocID -> schemaFingerprint(items)
+	schemaFPIntent   map[*oas3.Schema]string        // Per-state: schema pointer → items fingerprint
+
+	// Theory 10: Hybrid Origin-Lattice
+	allocOrigin      map[string]*AllocOrigin       // SHARED: allocID -> origin (where it was created)
+	allocCardinality map[string]*ArrayCardinality  // SHARED: allocID -> cardinality bounds
+	dsu              *DSU                          // SHARED: Disjoint Set Union for allocID equivalence
+}
+
+// AllocOrigin tracks where an allocID was created in the AST/execution
+type AllocOrigin struct {
+	PC      int    // Program counter where allocation occurred
+	Context string // Semantic context (e.g., "reduce_accumulator", "map_accumulator")
+}
+
+// ArrayCardinality tracks bounds on array size for lattice-based merging
+type ArrayCardinality struct {
+	MinItems *int // Lower bound: 0 = maybe-empty, 1+ = must-be-non-empty
+	MaxItems *int // Upper bound: nil = unbounded
+}
+
+// Join performs lattice join (LUB) on two cardinality bounds
+// This is the mathematically sound merge operation for the cardinality lattice
+func (a *ArrayCardinality) Join(other *ArrayCardinality) *ArrayCardinality {
+	if a == nil && other == nil {
+		return nil
+	}
+	if a == nil {
+		return other
+	}
+	if other == nil {
+		return a
+	}
+
+	// Join MinItems: take minimum (most permissive lower bound)
+	var minItems *int
+	if a.MinItems == nil && other.MinItems == nil {
+		minItems = nil
+	} else if a.MinItems == nil {
+		minItems = other.MinItems
+	} else if other.MinItems == nil {
+		minItems = a.MinItems
+	} else {
+		min := *a.MinItems
+		if *other.MinItems < min {
+			min = *other.MinItems
+		}
+		minItems = &min
+	}
+
+	// Join MaxItems: take maximum (most permissive upper bound)
+	var maxItems *int
+	if a.MaxItems == nil || other.MaxItems == nil {
+		// nil means unbounded, which dominates any finite bound
+		maxItems = nil
+	} else {
+		max := *a.MaxItems
+		if *other.MaxItems > max {
+			max = *other.MaxItems
+		}
+		maxItems = &max
+	}
+
+	return &ArrayCardinality{
+		MinItems: minItems,
+		MaxItems: maxItems,
+	}
+}
+
+// DSU implements Disjoint Set Union (Union-Find) for allocID equivalence classes
+type DSU struct {
+	parent map[string]string // allocID -> parent allocID
+}
+
+// NewDSU creates a new Disjoint Set Union structure
+func NewDSU() *DSU {
+	return &DSU{
+		parent: make(map[string]string),
+	}
+}
+
+// Find returns the canonical allocID for an equivalence class (with path compression)
+func (d *DSU) Find(allocID string) string {
+	if allocID == "" {
+		return ""
+	}
+	if _, exists := d.parent[allocID]; !exists {
+		// First time seeing this allocID, it's its own parent
+		d.parent[allocID] = allocID
+		return allocID
+	}
+	// Path compression
+	if d.parent[allocID] != allocID {
+		d.parent[allocID] = d.Find(d.parent[allocID])
+	}
+	return d.parent[allocID]
+}
+
+// Union merges two equivalence classes
+func (d *DSU) Union(allocID1, allocID2 string) {
+	if allocID1 == "" || allocID2 == "" {
+		return
+	}
+	root1 := d.Find(allocID1)
+	root2 := d.Find(allocID2)
+	if root1 != root2 {
+		// Union by making root1 the parent of root2
+		d.parent[root2] = root1
+	}
 }
 
 // PathSegment represents one segment of a path expression
@@ -69,6 +174,24 @@ func (s *execState) clone() *execState {
 	pathCopy := make([]PathSegment, len(s.currentPath))
 	copy(pathCopy, s.currentPath)
 
+	// Clone intent/history maps (per-state tracking)
+	histCopy := make(map[string]map[string]struct{}, len(s.varAllocHistory))
+	for k, set := range s.varAllocHistory {
+		setCopy := make(map[string]struct{}, len(set))
+		for id := range set {
+			setCopy[id] = struct{}{}
+		}
+		histCopy[k] = setCopy
+	}
+	fpCopy := make(map[string]string, len(s.varDesiredItemFP))
+	for k, fp := range s.varDesiredItemFP {
+		fpCopy[k] = fp
+	}
+	schemaFPCopy := make(map[*oas3.Schema]string, len(s.schemaFPIntent))
+	for ptr, fp := range s.schemaFPIntent {
+		schemaFPCopy[ptr] = fp
+	}
+
 	return &execState{
 		pc:         s.pc,
 		stack:      stackCopy,
@@ -83,136 +206,66 @@ func (s *execState) clone() *execState {
 		id:            s.id,       // Clone inherits ID initially, will be reassigned
 		parentID:      s.parentID, // Clone inherits parent
 		lineage:       s.lineage,  // Clone inherits lineage, will be extended
+		varAllocHistory:  histCopy,
+		varDesiredItemFP: fpCopy,
+		allocDesiredFP:   s.allocDesiredFP, // SHARED
+		schemaFPIntent:   schemaFPCopy,
+		// Theory 10: Hybrid Origin-Lattice (SHARED)
+		allocOrigin:      s.allocOrigin,      // SHARED
+		allocCardinality: s.allocCardinality, // SHARED
+		dsu:              s.dsu,              // SHARED
+	}
+}
+
+// recordSchemaFP records intended items fingerprint for a schema pointer
+func (s *execState) recordSchemaFP(arr, items *oas3.Schema) {
+	if arr == nil || items == nil {
+		return
+	}
+	if s.schemaFPIntent == nil {
+		s.schemaFPIntent = make(map[*oas3.Schema]string)
+	}
+	s.schemaFPIntent[arr] = schemaFingerprint(items)
+}
+
+// recordVarAlloc records that a variable has been assigned an allocID
+func (s *execState) recordVarAlloc(key, allocID string) {
+	if key == "" || allocID == "" {
+		return
+	}
+	set, ok := s.varAllocHistory[key]
+	if !ok {
+		set = make(map[string]struct{}, 4)
+		s.varAllocHistory[key] = set
+	}
+	set[allocID] = struct{}{}
+}
+
+// recordDesiredFP records the intended items schema fingerprint for a variable and its allocID
+func (s *execState) recordDesiredFP(key string, items *oas3.Schema) {
+	if key == "" || items == nil {
+		return
+	}
+	fp := schemaFingerprint(items)
+	s.varDesiredItemFP[key] = fp
+	// Also record on the allocID for cross-variable propagation
+	// Check what allocID this variable currently uses
+	if v, ok := s.loadVar(key); ok {
+		if allocID, ok := s.schemaToAlloc[v]; ok && allocID != "" {
+			if s.allocDesiredFP == nil {
+				s.allocDesiredFP = make(map[string]string)
+			}
+			s.allocDesiredFP[allocID] = fp
+		}
 	}
 }
 
 // fingerprint computes a hash of this state for memoization.
-// Includes: pc, depth, full stack shape, and scope bindings
+// Uses proper schema fingerprinting to handle nested structures, enums, and circular references.
+// Includes: pc, depth, callstack, full stack with schema fingerprints, scope bindings with schema fingerprints, and path mode.
 func (s *execState) fingerprint() uint64 {
-	h := sha256.New()
-
-	// Hash PC
-	binary.Write(h, binary.LittleEndian, uint64(s.pc))
-
-	// Hash recursion depth
-	binary.Write(h, binary.LittleEndian, uint64(s.depth))
-
-	// Hash entire stack: depth + type and shape of each element
-	binary.Write(h, binary.LittleEndian, uint64(len(s.stack)))
-	for _, sv := range s.stack {
-		schema := sv.Schema
-		if schema == nil {
-			h.Write([]byte("nil"))
-			continue
-		}
-
-		// Hash type
-		h.Write([]byte(getType(schema)))
-
-		// Hash structural markers for better precision
-		if schema.Enum != nil {
-			hashEnumValues(h, schema.Enum)
-		}
-		if schema.Items != nil {
-			h.Write([]byte("arr"))
-		}
-		if schema.Properties != nil {
-			// Count properties
-			propCount := 0
-			for range schema.Properties.All() {
-				propCount++
-			}
-			binary.Write(h, binary.LittleEndian, uint64(propCount))
-		}
-		if schema.AnyOf != nil {
-			binary.Write(h, binary.LittleEndian, uint64(len(schema.AnyOf)))
-		}
-	}
-
-	// Hash scope frames: frame count, variables per frame
-	binary.Write(h, binary.LittleEndian, uint64(len(s.scopes)))
-	for _, frame := range s.scopes {
-		binary.Write(h, binary.LittleEndian, uint64(len(frame)))
-		// Hash each variable name and its type
-		for k, v := range frame {
-			h.Write([]byte(k))
-			h.Write([]byte(getType(v)))
-		}
-	}
-
-	// Return first 8 bytes as uint64
-	sum := h.Sum(nil)
-	return binary.LittleEndian.Uint64(sum[:8])
-}
-
-// canonicalizeYAMLNode converts a yaml.Node to a canonical string for fingerprinting.
-func canonicalizeYAMLNode(node *yaml.Node) string {
-	if node == nil {
-		return "null"
-	}
-
-	switch node.Kind {
-	case yaml.ScalarNode:
-		return "s:" + node.Value
-	case yaml.SequenceNode:
-		var b strings.Builder
-		b.WriteString("[")
-		for i, n := range node.Content {
-			if i > 0 {
-				b.WriteByte(',')
-			}
-			b.WriteString(canonicalizeYAMLNode(n))
-		}
-		b.WriteByte(']')
-		return b.String()
-	case yaml.MappingNode:
-		// Sort keys for deterministic encoding
-		pairs := make([]struct{ key, val string }, 0, len(node.Content)/2)
-		for i := 0; i < len(node.Content); i += 2 {
-			if i+1 < len(node.Content) {
-				key := canonicalizeYAMLNode(node.Content[i])
-				val := canonicalizeYAMLNode(node.Content[i+1])
-				pairs = append(pairs, struct{ key, val string }{key, val})
-			}
-		}
-		sort.Slice(pairs, func(i, j int) bool { return pairs[i].key < pairs[j].key })
-		var b strings.Builder
-		b.WriteString("{")
-		for i, p := range pairs {
-			if i > 0 {
-				b.WriteByte(',')
-			}
-			b.WriteString(p.key)
-			b.WriteByte(':')
-			b.WriteString(p.val)
-		}
-		b.WriteByte('}')
-		return b.String()
-	default:
-		return fmt.Sprintf("kind%d", node.Kind)
-	}
-}
-
-// hashEnumValues hashes enum values in a deterministic way.
-func hashEnumValues(h hash.Hash, enum []*yaml.Node) {
-	if len(enum) == 0 {
-		return
-	}
-	// Canonicalize each value, sort so order doesn't affect fingerprint
-	enc := make([]string, 0, len(enum))
-	for _, node := range enum {
-		enc = append(enc, canonicalizeYAMLNode(node))
-	}
-	sort.Strings(enc)
-
-	// Include length
-	binary.Write(h, binary.LittleEndian, uint64(len(enc)))
-
-	// Write all canonicalized values
-	for _, s := range enc {
-		h.Write([]byte(s))
-		h.Write([]byte{0}) // Separator
-	}
+	// Use the new fingerprinting helper from fingerprint.go
+	return fingerprintStateHelper(s, defaultFingerprinter)
 }
 
 // push pushes a schema onto the stack.
@@ -291,6 +344,14 @@ func newExecState(input *oas3.Schema) *execState {
 		id:            0,    // Initial state ID
 		parentID:      0,    // Root has no parent
 		lineage:       "0",  // Root lineage
+		varAllocHistory:  make(map[string]map[string]struct{}),
+		varDesiredItemFP: make(map[string]string),
+		allocDesiredFP:   make(map[string]string), // Shared
+		schemaFPIntent:   make(map[*oas3.Schema]string),
+		// Theory 10: Hybrid Origin-Lattice
+		allocOrigin:      make(map[string]*AllocOrigin),
+		allocCardinality: make(map[string]*ArrayCardinality),
+		dsu:              NewDSU(),
 	}
 	state.pushFrame() // Initial global frame
 	state.push(input) // Push input onto stack

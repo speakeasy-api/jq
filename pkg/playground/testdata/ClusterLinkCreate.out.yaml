@@ -1,0 +1,29 @@
+type: object
+description: Cluster link creation request
+required:
+  - configs
+properties:
+  source_cluster_id:
+    type: string
+    description: Cluster identifier
+    example: lkc-abc123
+  destination_cluster_id:
+    type: string
+    description: Cluster identifier
+    example: lkc-abc123
+  remote_cluster_id:
+    type: string
+    description: Cluster identifier
+    example: lkc-xyz789
+  configs:
+    type: array
+    items:
+      type: object
+      required:
+        - name
+        - value
+      properties:
+        name:
+          type: string
+        value:
+          type: string

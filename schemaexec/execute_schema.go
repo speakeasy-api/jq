@@ -133,8 +133,9 @@ func newSchemaEnv(ctx context.Context, opts SchemaExecOptions) *schemaEnv {
 
 // derefJSONSchema attempts to dereference a JSONSchema wrapper to get the actual Schema.
 // Tries GetResolvedSchema() first for $ref cases, then falls back to inline Left schemas.
+// Uses the provided normCtx for cycle-aware collapsing.
 // Returns (schema, true) if successful, (nil, false) if unresolved or invalid.
-func derefJSONSchema(js *oas3.JSONSchema[oas3.Referenceable]) (*oas3.Schema, bool) {
+func derefJSONSchema(ctx context.Context, js *oas3.JSONSchema[oas3.Referenceable]) (*oas3.Schema, bool) {
 	if js == nil {
 		return nil, false
 	}
@@ -142,11 +143,11 @@ func derefJSONSchema(js *oas3.JSONSchema[oas3.Referenceable]) (*oas3.Schema, boo
 	// 1) Try GetResolvedSchema() first (handles $refs after ResolveAllReferences).
 	if resolved := js.GetResolvedSchema(); resolved != nil {
 		if schema := resolved.GetLeft(); schema != nil {
-			collapsed, err := collapseAllOf(schema)
+			collapsed, err := collapseAllOfCtx(ctx, schema)
 			if err != nil {
 				return schema, true
 			}
-			collapsed, err = collapseAnyOf(collapsed)
+			collapsed, err = collapseAnyOfCtx(ctx, collapsed)
 			if err != nil {
 				return collapsed, true
 			}
@@ -158,12 +159,11 @@ func derefJSONSchema(js *oas3.JSONSchema[oas3.Referenceable]) (*oas3.Schema, boo
 	// This handles schemas created by wrapping with NewJSONSchemaFromSchema.
 	if js.Left != nil {
 		s := js.Left
-		// Collapse allOf then anyOf
-		collapsed, err := collapseAllOf(s)
+		collapsed, err := collapseAllOfCtx(ctx, s)
 		if err != nil {
 			return s, true
 		}
-		collapsed, err = collapseAnyOf(collapsed)
+		collapsed, err = collapseAnyOfCtx(ctx, collapsed)
 		if err != nil {
 			return collapsed, true
 		}
@@ -191,20 +191,95 @@ const (
 	MergeDisjunctive
 )
 
+// normCtx holds state for cycle-safe schema normalization (collapse operations)
+type normCtx struct {
+	inProgress map[*oas3.Schema]struct{}     // Cycle detection: schemas currently being processed
+	memo       map[*oas3.Schema]*oas3.Schema // Memoization for DAG sharing
+	depth      int                            // Current recursion depth
+	maxDepth   int                            // Maximum depth guard
+}
+
+func newNormCtx() *normCtx {
+	return &normCtx{
+		inProgress: make(map[*oas3.Schema]struct{}, 64),
+		memo:       make(map[*oas3.Schema]*oas3.Schema, 256),
+		depth:      0,
+		maxDepth:   10000, // Guard against pathological cases
+	}
+}
+
+// Context key for normCtx
+type normCtxKey struct{}
+
+// withNormCtx adds a normalization context to a context.Context
+func withNormCtx(ctx context.Context, nctx *normCtx) context.Context {
+	return context.WithValue(ctx, normCtxKey{}, nctx)
+}
+
+// getNormCtx retrieves the normalization context from a context.Context
+// Returns nil if not present
+func getNormCtx(ctx context.Context) *normCtx {
+	if ctx == nil {
+		return nil
+	}
+	nctx, _ := ctx.Value(normCtxKey{}).(*normCtx)
+	return nctx
+}
+
+// newCollapseContext creates a new context with normalization state for collapse operations
+func newCollapseContext() context.Context {
+	return withNormCtx(context.Background(), newNormCtx())
+}
+
 // collapseAllOf recursively collapses allOf constraints in a schema by deep merging.
 // Returns the collapsed schema or an error if schemas are incompatible.
 func collapseAllOf(schema *oas3.Schema) (*oas3.Schema, error) {
+	return collapseAllOfCtx(newCollapseContext(), schema)
+}
+
+// collapseAllOfCtx is the cycle-aware implementation of collapseAllOf
+func collapseAllOfCtx(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, error) {
+	nctx := getNormCtx(ctx)
+	if nctx == nil {
+		// No normalization context, create one
+		nctx = newNormCtx()
+		ctx = withNormCtx(ctx, nctx)
+	}
 	if schema == nil {
 		return nil, nil
 	}
 
+	// Check memo (DAG sharing)
+	if result, ok := nctx.memo[schema]; ok {
+		return result, nil
+	}
+
+	// Check for cycle (in-progress)
+	if _, inProgress := nctx.inProgress[schema]; inProgress {
+		// Cycle detected: return schema as-is to break recursion
+		return schema, nil
+	}
+
+	// Depth guard
+	nctx.depth++
+	if nctx.depth > nctx.maxDepth {
+		nctx.depth--
+		return schema, nil // Too deep, return as-is
+	}
+	defer func() { nctx.depth-- }()
+
+	// Mark in-progress
+	nctx.inProgress[schema] = struct{}{}
+	defer delete(nctx.inProgress, schema)
+
 	// If no allOf, process nested schemas and return
 	if len(schema.AllOf) == 0 {
 		// Recursively collapse nested schemas
-		collapsed, err := collapseNestedSchemas(schema)
+		collapsed, err := collapseNestedSchemasCtx(ctx, schema)
 		if err != nil {
 			return nil, err
 		}
+		nctx.memo[schema] = collapsed
 		return collapsed, nil
 	}
 
@@ -213,7 +288,7 @@ func collapseAllOf(schema *oas3.Schema) (*oas3.Schema, error) {
 	for _, schemaOrRef := range schema.AllOf {
 		if schemaOrRef.Left != nil {
 			// Recursively collapse the subschema
-			collapsed, err := collapseAllOf(schemaOrRef.Left)
+			collapsed, err := collapseAllOfCtx(ctx, schemaOrRef.Left)
 			if err != nil {
 				return nil, err
 			}
@@ -226,7 +301,12 @@ func collapseAllOf(schema *oas3.Schema) (*oas3.Schema, error) {
 		// Empty allOf means unconstrained (Top)
 		base := cloneSchema(schema)
 		base.AllOf = nil
-		return collapseNestedSchemas(base)
+		result, err := collapseNestedSchemasCtx(ctx, base)
+		if err != nil {
+			return nil, err
+		}
+		nctx.memo[schema] = result
+		return result, nil
 	}
 
 	// Handle single allOf subschema (identity case)
@@ -238,7 +318,12 @@ func collapseAllOf(schema *oas3.Schema) (*oas3.Schema, error) {
 		if err != nil {
 			return nil, err
 		}
-		return collapseNestedSchemas(merged)
+		result, err := collapseNestedSchemasCtx(ctx, merged)
+		if err != nil {
+			return nil, err
+		}
+		nctx.memo[schema] = result
+		return result, nil
 	}
 
 	// Merge all subschemas together
@@ -254,24 +339,63 @@ func collapseAllOf(schema *oas3.Schema) (*oas3.Schema, error) {
 		result = merged
 	}
 
-	return collapseNestedSchemas(result)
+	collapsed, err := collapseNestedSchemasCtx(ctx, result)
+	if err != nil {
+		return nil, err
+	}
+	nctx.memo[schema] = collapsed
+	return collapsed, nil
 }
 
 // collapseAnyOf recursively collapses anyOf constraints in a schema by disjunctive merging.
 // Returns the collapsed schema or Bottom if anyOf is empty.
 // Keeps anyOf structure if branches have incompatible types.
 func collapseAnyOf(schema *oas3.Schema) (*oas3.Schema, error) {
+	return collapseAnyOfCtx(newCollapseContext(), schema)
+}
+
+// collapseAnyOfCtx is the cycle-aware implementation of collapseAnyOf
+func collapseAnyOfCtx(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, error) {
+	nctx := getNormCtx(ctx)
+	if nctx == nil {
+		nctx = newNormCtx()
+		ctx = withNormCtx(ctx, nctx)
+	}
 	if schema == nil {
 		return nil, nil
 	}
 
+	// Check memo (DAG sharing)
+	if result, ok := nctx.memo[schema]; ok {
+		return result, nil
+	}
+
+	// Check for cycle (in-progress)
+	if _, inProgress := nctx.inProgress[schema]; inProgress {
+		// Cycle detected: return schema as-is to break recursion
+		return schema, nil
+	}
+
+	// Depth guard
+	nctx.depth++
+	if nctx.depth > nctx.maxDepth {
+		nctx.depth--
+		return schema, nil // Too deep, return as-is
+	}
+	defer func() { nctx.depth-- }()
+
+	// Mark in-progress
+	nctx.inProgress[schema] = struct{}{}
+	defer delete(nctx.inProgress, schema)
+
 	// If no anyOf, process nested schemas and return
 	if len(schema.AnyOf) == 0 {
 		// Recursively collapse nested schemas
-		collapsed, err := collapseNestedSchemas(schema)
+		collapsed, err := collapseNestedSchemasCtx(ctx, schema)
 		if err != nil {
 			return nil, err
 		}
+		nctx.memo[schema] = collapsed
 		return collapsed, nil
 	}
 
@@ -280,11 +404,11 @@ func collapseAnyOf(schema *oas3.Schema) (*oas3.Schema, error) {
 	for _, schemaOrRef := range schema.AnyOf {
 		if schemaOrRef.Left != nil {
 			// First collapse allOf within this branch, then anyOf
-			collapsed, err := collapseAllOf(schemaOrRef.Left)
+			collapsed, err := collapseAllOfCtx(ctx, schemaOrRef.Left)
 			if err != nil {
 				return nil, err
 			}
-			collapsed, err = collapseAnyOf(collapsed)
+			collapsed, err = collapseAnyOfCtx(ctx, collapsed)
 			if err != nil {
 				return nil, err
 			}
@@ -294,7 +418,9 @@ func collapseAnyOf(schema *oas3.Schema) (*oas3.Schema, error) {
 
 	// Handle empty anyOf - unsatisfiable schema (Bottom)
 	if len(subschemas) == 0 {
-		return Bottom(), nil
+		result := Bottom()
+		nctx.memo[schema] = result
+		return result, nil
 	}
 
 	// Distribute base constraints into each branch
@@ -314,13 +440,20 @@ func collapseAnyOf(schema *oas3.Schema) (*oas3.Schema, error) {
 	// Check if any branch is Top - if so, result is Top
 	for _, branch := range branches {
 		if isTopSchema(branch) {
-			return Top(), nil
+			result := Top()
+			nctx.memo[schema] = result
+			return result, nil
 		}
 	}
 
 	// Handle single anyOf subschema (identity case after base merge)
 	if len(branches) == 1 {
-		return collapseNestedSchemas(branches[0])
+		result, err := collapseNestedSchemasCtx(ctx, branches[0])
+		if err != nil {
+			return nil, err
+		}
+		nctx.memo[schema] = result
+		return result, nil
 	}
 
 	// Try to flatten anyOf if all branches share the same type
@@ -341,6 +474,7 @@ func collapseAnyOf(schema *oas3.Schema) (*oas3.Schema, error) {
 		for i, branch := range branches {
 			result.AnyOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branch)
 		}
+		nctx.memo[schema] = result
 		return result, nil
 	}
 
@@ -354,11 +488,21 @@ func collapseAnyOf(schema *oas3.Schema) (*oas3.Schema, error) {
 		result = merged
 	}
 
-	return collapseNestedSchemas(result)
+	collapsed, err := collapseNestedSchemasCtx(ctx, result)
+	if err != nil {
+		return nil, err
+	}
+	nctx.memo[schema] = collapsed
+	return collapsed, nil
 }
 
 // collapseNestedSchemas recursively collapses allOf in nested schemas (properties, items, etc.)
 func collapseNestedSchemas(schema *oas3.Schema) (*oas3.Schema, error) {
+	return collapseNestedSchemasCtx(newCollapseContext(), schema)
+}
+
+// collapseNestedSchemasCtx is the cycle-aware implementation of collapseNestedSchemas
+func collapseNestedSchemasCtx(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, error) {
 	if schema == nil {
 		return nil, nil
 	}
@@ -370,11 +514,11 @@ func collapseNestedSchemas(schema *oas3.Schema) (*oas3.Schema, error) {
 		newProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
 		for key, prop := range result.Properties.All() {
 			if prop != nil && prop.Left != nil {
-				collapsed, err := collapseAllOf(prop.Left)
+				collapsed, err := collapseAllOfCtx(ctx, prop.Left)
 				if err != nil {
 					return nil, err
 				}
-				collapsed, err = collapseAnyOf(collapsed)
+				collapsed, err = collapseAnyOfCtx(ctx, collapsed)
 				if err != nil {
 					return nil, err
 				}
@@ -388,11 +532,11 @@ func collapseNestedSchemas(schema *oas3.Schema) (*oas3.Schema, error) {
 
 	// Collapse array items
 	if result.Items != nil && result.Items.Left != nil {
-		collapsed, err := collapseAllOf(result.Items.Left)
+		collapsed, err := collapseAllOfCtx(ctx, result.Items.Left)
 		if err != nil {
 			return nil, err
 		}
-		collapsed, err = collapseAnyOf(collapsed)
+		collapsed, err = collapseAnyOfCtx(ctx, collapsed)
 		if err != nil {
 			return nil, err
 		}
@@ -401,11 +545,11 @@ func collapseNestedSchemas(schema *oas3.Schema) (*oas3.Schema, error) {
 
 	// Collapse additionalProperties
 	if result.AdditionalProperties != nil && result.AdditionalProperties.Left != nil {
-		collapsed, err := collapseAllOf(result.AdditionalProperties.Left)
+		collapsed, err := collapseAllOfCtx(ctx, result.AdditionalProperties.Left)
 		if err != nil {
 			return nil, err
 		}
-		collapsed, err = collapseAnyOf(collapsed)
+		collapsed, err = collapseAnyOfCtx(ctx, collapsed)
 		if err != nil {
 			return nil, err
 		}
@@ -417,11 +561,11 @@ func collapseNestedSchemas(schema *oas3.Schema) (*oas3.Schema, error) {
 		newAnyOf := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(result.AnyOf))
 		for _, branch := range result.AnyOf {
 			if branch.Left != nil {
-				collapsed, err := collapseAllOf(branch.Left)
+				collapsed, err := collapseAllOfCtx(ctx, branch.Left)
 				if err != nil {
 					return nil, err
 				}
-				collapsed, err = collapseAnyOf(collapsed)
+				collapsed, err = collapseAnyOfCtx(ctx, collapsed)
 				if err != nil {
 					return nil, err
 				}
@@ -447,6 +591,12 @@ func mergeSchemasMode(s1, s2 *oas3.Schema, mode MergeMode) (*oas3.Schema, error)
 		return cloneSchema(s2), nil
 	}
 	if s2 == nil {
+		return cloneSchema(s1), nil
+	}
+
+	// Fast-path: identical pointer (handles self-referential "next: self" case)
+	// This prevents infinite recursion when merging circular schemas
+	if s1 == s2 {
 		return cloneSchema(s1), nil
 	}
 
@@ -567,10 +717,67 @@ func mergeSchemasMode(s1, s2 *oas3.Schema, mode MergeMode) (*oas3.Schema, error)
 		}
 	}
 
-	// TODO: Merge other constraints (minLength, maxLength, minimum, maximum, etc.)
-	// TODO: Merge enum (intersection)
-	// TODO: Merge additionalProperties
-	// TODO: Handle incompatible constraints
+	// TODO: Merge numeric constraints (minimum, maximum, exclusiveMinimum, exclusiveMaximum)
+	//   - Conjunctive (allOf): Intersect intervals - take tighter bounds (max of minimums, min of maximums)
+	//   - Disjunctive (anyOf): Convex union if intervals overlap/touch; otherwise keep anyOf structure
+	//   - Handle exclusive bounds correctly (exclusive dominates inclusive at equal values)
+	//   - Return error for allOf if intersection is empty (e.g., min > max)
+
+	// TODO: Merge cardinality constraints (minLength, maxLength, minItems, maxItems, minProperties, maxProperties)
+	//   - Same logic as numeric constraints but with integer bounds (always inclusive)
+	//   - Conjunctive: max(mins), min(maxs)
+	//   - Disjunctive: Convex union only if ranges are adjacent or overlapping
+
+	// TODO: Merge enum constraints
+	//   - Conjunctive (allOf): Set intersection using deep JSON equality
+	//     - Empty intersection = unsatisfiable (return error)
+	//   - Disjunctive (anyOf): Set union with deduplication
+	//   - Handle const as single-element enum
+
+	// TODO: Merge multipleOf constraints
+	//   - Conjunctive (allOf): LCM using rational arithmetic (big.Rat to avoid float precision issues)
+	//     - Only commit back to float64 if exactly representable
+	//     - Otherwise keep allOf structure
+	//   - Disjunctive (anyOf): Only flatten if one divides the other exactly
+	//     - Otherwise keep anyOf structure to remain exact
+
+	// TODO: Merge additionalProperties constraints
+	//   - Conjunctive (allOf):
+	//     - false AND anything = false (most restrictive)
+	//     - true AND X = X
+	//     - schema AND schema = merge recursively using allOf mode
+	//     - CRITICAL: Without unevaluatedProperties, can only safely flatten when:
+	//       * No patternProperties in any branch
+	//       * All branches have AP=true or AP=absent
+	//       * Otherwise MUST keep allOf structure to preserve "additional" locality
+	//   - Disjunctive (anyOf):
+	//     - true OR anything = true (most permissive)
+	//     - false OR X = X
+	//     - schema OR schema = merge recursively using anyOf mode
+	//     - Default: Keep anyOf structure; flattening loses locality semantics
+
+	// TODO: Merge pattern constraints
+	//   - Conjunctive: Keep both patterns (don't combine into single regex due to complexity/performance)
+	//   - Disjunctive: Keep separate branches (alternation can cause catastrophic backtracking)
+	//   - Preserve structure in both modes
+
+	// TODO: Merge format constraints
+	//   - In JSON Schema 2020-12, format is annotation by default (not validation)
+	//   - Conjunctive: Keep both formats as annotations unless Format-Assertion is enabled
+	//   - Disjunctive: Keep per-branch; different formats cannot be represented in single schema
+
+	// TODO: Handle incompatible constraints and decide when to error vs. keep structure
+	//   - Conjunctive (allOf) - return error for:
+	//     * Empty numeric interval (min > max, including exclusive boundary conflicts)
+	//     * Empty cardinality range (minLength > maxLength, etc.)
+	//     * Empty enum intersection
+	//     * Conflicting const values
+	//     * Different formats when Format-Assertion is enabled
+	//   - Disjunctive (anyOf) - keep structure (don't error) for:
+	//     * Non-convex unions (disjoint or exclusive-touching intervals)
+	//     * multipleOf where neither divides the other
+	//     * Different patterns or formats
+	//     * Object schemas with different additionalProperties
 
 	return result, nil
 }
@@ -613,9 +820,12 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 	// Outputs accumulator
 	outputs := make([]*oas3.Schema, 0)
 
-	// Track accumulator for array construction results
+	// Track accumulator for array construction results (legacy single-map fallback)
 	var sharedAccum map[string]*oas3.Schema
 	var sharedSchemaToAlloc map[*oas3.Schema]string
+
+	// NEW: Track all terminal states to merge accumulators across all terminal paths
+	terminalStates := make([]*execState, 0, 32)
 
 	// Multi-state execution loop
 	maxIterations := env.opts.MaxDepth * 1000 // Safeguard against infinite loops
@@ -655,18 +865,8 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 			break
 		}
 
-		// Check if we've seen this state (memoization)
-		// TODO: Memoization currently disabled because fingerprint doesn't recursively
-		// hash nested property schemas, causing incorrect state deduplication
-		// when properties have different enum values (e.g., tier: "gold" vs "silver")
-		_ = worklist // Suppress unused warning
-		if false && env.opts.EnableMemo && worklist.hasSeen(state) {
-			fmt.Printf("DEBUG: Skipping memoized state at pc=%d\n", state.pc)
-			continue
-		}
-		if false && env.opts.EnableMemo {
-			worklist.markSeen(state)
-		}
+		// Check if we've seen this state (memoization) — currently disabled (see code comments)
+		_ = worklist
 
 		// Check depth limit
 		if state.depth > env.opts.MaxDepth {
@@ -683,6 +883,22 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 			// Terminal state - collect output
 			outputSchema := state.top()
 			if outputSchema != nil {
+				// DEBUG: Show stack state at terminal
+				if env.opts.EnableWarnings {
+					fmt.Printf("DEBUG Terminal state: stack length=%d, top ptr=%p, top type=%s\n",
+						len(state.stack), outputSchema, getType(outputSchema))
+					if getType(outputSchema) == "object" {
+						hasAP := outputSchema.AdditionalProperties != nil && outputSchema.AdditionalProperties.Left != nil
+						var apType string
+						if hasAP {
+							apType = getType(outputSchema.AdditionalProperties.Left)
+						}
+						fmt.Printf("DEBUG Terminal object: hasAP=%v, apType=%s\n", hasAP, apType)
+					}
+					for i, sv := range state.stack {
+						fmt.Printf("DEBUG Terminal stack[%d]: ptr=%p, type=%s\n", i, sv.Schema, getType(sv.Schema))
+					}
+				}
 				outputs = append(outputs, outputSchema)
 
 				// Log terminal state
@@ -693,11 +909,13 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 					"result":  schemaTypeSummary(outputSchema, 1),
 				}).Debugf("Terminal state reached")
 			}
-			// Save reference to shared maps (all states share the same maps)
+			// Save first map as legacy fallback
 			if sharedAccum == nil && state.accum != nil {
 				sharedAccum = state.accum
 				sharedSchemaToAlloc = state.schemaToAlloc
 			}
+			// NEW: collect every terminal state for accumulator merging
+			terminalStates = append(terminalStates, state)
 			continue
 		}
 
@@ -760,9 +978,40 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		result = Union(outputs, env.opts)
 	}
 
-	// Materialize arrays from accumulators AFTER Union
-	// This ensures arrays in merged objects are also resolved
-	if sharedAccum != nil && sharedSchemaToAlloc != nil {
+	// NEW: Materialize arrays using a MERGED accumulator built from ALL terminal states
+	if len(terminalStates) > 0 {
+		mergedAccum, mergedTags := env.mergeTerminalAccumulators(terminalStates)
+
+		// Compute allocID redirects to resolve multi-allocID fragmentation
+		redirect := env.computeAllocRedirect(terminalStates, mergedAccum)
+
+		// Diagnostics for allocator/map coverage
+		if env.opts.EnableWarnings {
+			distinctMaps := make(map[string]int)
+			for _, s := range terminalStates {
+				distinctMaps[fmt.Sprintf("%p", s.accum)]++
+			}
+			env.addWarning("terminal states=%d, distinct accum maps=%d", len(terminalStates), len(distinctMaps))
+
+			nonEmptyAlloc := 0
+			for k, arr := range mergedAccum {
+				if arr != nil && getType(arr) == "array" {
+					isEmpty := arr.MaxItems != nil && *arr.MaxItems == 0
+					hasItems := arr.Items != nil && arr.Items.Left != nil
+					if !isEmpty && hasItems {
+						nonEmptyAlloc++
+					}
+					if k == "[44 0]" { // will never match; alloc keys are "allocN", but keep a breadcrumb
+						env.addWarning("merged accum has literal key [44 0] (unexpected); hasItems=%v", hasItems)
+					}
+				}
+			}
+			env.addWarning("merged accum allocs=%d, non-empty allocs=%d", len(mergedAccum), nonEmptyAlloc)
+		}
+
+		result = env.materializeArrays(result, mergedAccum, mergedTags, redirect)
+	} else if sharedAccum != nil && sharedSchemaToAlloc != nil {
+		// Legacy fallback: single-map materialization (kept for safety)
 		result = env.materializeArrays(result, sharedAccum, sharedSchemaToAlloc)
 	}
 
@@ -785,6 +1034,433 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		Schema:   result,
 		Warnings: env.warnings,
 	}, nil
+}
+
+// mergeTwoAccumulatorSets merges two accumulator/tag sets, unioning array items when a key
+// is present in both accum maps and ensuring the resulting canonical arrays are (re)tagged.
+func mergeTwoAccumulatorSets(
+	accumA map[string]*oas3.Schema,
+	tagsA map[*oas3.Schema]string,
+	accumB map[string]*oas3.Schema,
+	tagsB map[*oas3.Schema]string,
+	opts SchemaExecOptions,
+) (map[string]*oas3.Schema, map[*oas3.Schema]string) {
+	// Fast-path: one side empty
+	if len(accumA) == 0 {
+		mergedAccum := make(map[string]*oas3.Schema, len(accumB))
+		for k, v := range accumB {
+			mergedAccum[k] = v
+		}
+		mergedTags := make(map[*oas3.Schema]string, len(tagsB))
+		for p, id := range tagsB {
+			mergedTags[p] = id
+		}
+		// ensure canonical pointers are tagged
+		for id, canon := range mergedAccum {
+			if _, ok := mergedTags[canon]; !ok {
+				mergedTags[canon] = id
+			}
+		}
+		return mergedAccum, mergedTags
+	}
+	if len(accumB) == 0 {
+		mergedAccum := make(map[string]*oas3.Schema, len(accumA))
+		for k, v := range accumA {
+			mergedAccum[k] = v
+		}
+		mergedTags := make(map[*oas3.Schema]string, len(tagsA))
+		for p, id := range tagsA {
+			mergedTags[p] = id
+		}
+		for id, canon := range mergedAccum {
+			if _, ok := mergedTags[canon]; !ok {
+				mergedTags[canon] = id
+			}
+		}
+		return mergedAccum, mergedTags
+	}
+
+	mergedAccum := make(map[string]*oas3.Schema, len(accumA)+len(accumB))
+	for k, v := range accumA {
+		mergedAccum[k] = v
+	}
+	// Union values for overlapping keys
+	for k, v := range accumB {
+		if existing, ok := mergedAccum[k]; ok {
+			// Union array items if both are arrays
+			if getType(existing) == "array" && getType(v) == "array" {
+				var existingItems, vItems *oas3.Schema
+				if existing.Items != nil && existing.Items.Left != nil {
+					existingItems = existing.Items.Left
+				} else {
+					existingItems = Bottom()
+				}
+				if v.Items != nil && v.Items.Left != nil {
+					vItems = v.Items.Left
+				} else {
+					vItems = Bottom()
+				}
+				// Union array items; only set Items if unioned is non-nil
+				unioned := Union([]*oas3.Schema{existingItems, vItems}, opts)
+				var merged *oas3.Schema
+				if unioned == nil {
+					// Both inputs had no items (Bottom) - preserve empty array constraint if both are empty
+					existingEmpty := existing.MaxItems != nil && *existing.MaxItems == 0
+					vEmpty := v.MaxItems != nil && *v.MaxItems == 0
+					if existingEmpty && vEmpty {
+						// Both are empty arrays - result is empty array
+						merged = ArrayType(nil) // This creates maxItems=0 with Items=nil
+					} else {
+						// Keep an unconstrained array; do not create an invalid Items wrapper
+						merged = &oas3.Schema{
+							Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
+						}
+					}
+				} else {
+					merged = &oas3.Schema{
+						Type:  oas3.NewTypeFromString(oas3.SchemaTypeArray),
+						Items: oas3.NewJSONSchemaFromSchema[oas3.Referenceable](unioned),
+					}
+				}
+				mergedAccum[k] = merged
+			}
+			// else: keep existing (arrays should be the only values here)
+		} else {
+			mergedAccum[k] = v
+		}
+	}
+
+	// Merge tags and ensure canonical pointers are tagged with their allocID
+	mergedTags := make(map[*oas3.Schema]string, len(tagsA)+len(tagsB)+len(mergedAccum))
+	for p, id := range tagsA {
+		mergedTags[p] = id
+	}
+	for p, id := range tagsB {
+		if _, ok := mergedTags[p]; !ok {
+			mergedTags[p] = id
+		}
+	}
+	for id, canon := range mergedAccum {
+		if _, ok := mergedTags[canon]; !ok {
+			mergedTags[canon] = id
+		}
+	}
+	return mergedAccum, mergedTags
+}
+
+// mergeTerminalAccumulators folds all terminal states’ accumulators/tags into a single map pair.
+func (env *schemaEnv) mergeTerminalAccumulators(states []*execState) (map[string]*oas3.Schema, map[*oas3.Schema]string) {
+	var mergedAccum map[string]*oas3.Schema
+	var mergedTags map[*oas3.Schema]string
+
+	// Optional diagnostics for a specific var key across terminals: "[44 0]"
+	if env.opts.EnableWarnings {
+		for _, s := range states {
+			// Search all frames for this variable (from top to bottom)
+			var val *oas3.Schema
+			for i := len(s.scopes) - 1; i >= 0; i-- {
+				if v, ok := s.scopes[i]["[44 0]"]; ok {
+					val = v
+					break
+				}
+			}
+			if val != nil && getType(val) == "array" {
+				isEmpty := val.MaxItems != nil && *val.MaxItems == 0
+				hasItems := val.Items != nil && val.Items.Left != nil
+				var itemType string
+				if hasItems {
+					itemType = getType(val.Items.Left)
+				}
+				tag, tagged := s.schemaToAlloc[val]
+				env.addWarning("mergeTermAcc: state s%d var='[44 0]' array empty=%v hasItems=%v itemType=%s tagged=%v allocTag=%s",
+					s.id, isEmpty, hasItems, itemType, tagged, tag)
+			}
+		}
+	}
+
+	for i, s := range states {
+		if i == 0 {
+			// seed from first state (shallow copies)
+			mergedAccum = make(map[string]*oas3.Schema, len(s.accum))
+			for k, v := range s.accum {
+				mergedAccum[k] = v
+			}
+			mergedTags = make(map[*oas3.Schema]string, len(s.schemaToAlloc))
+			for p, id := range s.schemaToAlloc {
+				mergedTags[p] = id
+			}
+			// ensure canon tagged
+			for id, canon := range mergedAccum {
+				if _, ok := mergedTags[canon]; !ok {
+					mergedTags[canon] = id
+				}
+			}
+			continue
+		}
+		mergedAccum, mergedTags = mergeTwoAccumulatorSets(mergedAccum, mergedTags, s.accum, s.schemaToAlloc, env.opts)
+	}
+
+	return mergedAccum, mergedTags
+}
+
+// computeAllocRedirect builds allocID->bestAllocID mappings using rank:
+// 2 = has concrete items, 1 = unconstrained array, 0 = empty array
+// Uses co-occurrence grouping to connect variables that appear together in states
+func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[string]*oas3.Schema) map[string]string {
+	// varKey -> set of allocIDs
+	varToAllocs := make(map[string]map[string]struct{})
+
+	// Union-find for variable grouping by co-occurrence
+	parent := make(map[string]string)
+	find := func(x string) string {
+		if _, ok := parent[x]; !ok {
+			parent[x] = x
+		}
+		for parent[x] != x {
+			parent[x] = parent[parent[x]]
+			x = parent[x]
+		}
+		return x
+	}
+	union := func(a, b string) {
+		ra, rb := find(a), find(b)
+		if ra != rb {
+			parent[rb] = ra
+		}
+	}
+
+	// Collect var->allocID and build co-occurrence groups
+	for _, s := range states {
+		// Gather all tagged array vars in this state
+		varsInState := make([]string, 0, 8)
+		for _, frame := range s.scopes {
+			for k, v := range frame {
+				if v == nil || getType(v) != "array" {
+					continue
+				}
+				if allocID, ok := s.schemaToAlloc[v]; ok && allocID != "" {
+					if _, ok := varToAllocs[k]; !ok {
+						varToAllocs[k] = make(map[string]struct{}, 4)
+					}
+					varToAllocs[k][allocID] = struct{}{}
+					// Init DSU parent
+					if _, ok := parent[k]; !ok {
+						parent[k] = k
+					}
+					varsInState = append(varsInState, k)
+				}
+			}
+		}
+		// Union all vars that co-occur in this state
+		for i := 0; i < len(varsInState); i++ {
+			for j := i + 1; j < len(varsInState); j++ {
+				union(varsInState[i], varsInState[j])
+			}
+		}
+	}
+
+	rank := func(arr *oas3.Schema) int {
+		if arr == nil || getType(arr) != "array" {
+			return -1
+		}
+		if arr.MaxItems != nil && *arr.MaxItems == 0 {
+			return 0 // empty
+		}
+		if arr.Items != nil && arr.Items.Left != nil {
+			return 2 // concrete items
+		}
+		if len(arr.PrefixItems) > 0 {
+			return 2
+		}
+		return 1 // unconstrained
+	}
+
+	// Build best-allocID-by-fingerprint table for intent-driven redirects
+	bestByFP := make(map[string]string, 64)
+	for id, arr := range mergedAccum {
+		if arr == nil {
+			continue
+		}
+		if rank(arr) == 2 && arr.Items != nil && arr.Items.Left != nil {
+			fp := schemaFingerprint(arr.Items.Left)
+			if _, ok := bestByFP[fp]; !ok {
+				bestByFP[fp] = id
+			}
+		}
+	}
+
+	redirect := make(map[string]string, 64)
+
+	// INTENT-DRIVEN REDIRECT: Use var history + desired FP to connect orphaned allocIDs
+	for _, s := range states {
+		for varKey, varFP := range s.varDesiredItemFP {
+			target, ok := bestByFP[varFP]
+			if !ok || target == "" {
+				if env.opts.EnableWarnings {
+					fmt.Printf("DEBUG computeAllocRedirect(intent): no rank-2 alloc for fp=%s... (var=%s)\n",
+						varFP[:min(16, len(varFP))], varKey)
+				}
+				continue
+			}
+			// Gather all allocIDs this var ever held
+			hist := s.varAllocHistory[varKey]
+			for allocID := range hist {
+				if allocID != target {
+					// Theory 10: Only redirect within the same DSU class
+					if len(states) > 0 && states[0].dsu != nil {
+						d := states[0].dsu
+						if d.Find(allocID) != d.Find(target) {
+							continue
+						}
+					}
+					redirect[allocID] = target
+					if env.opts.EnableWarnings {
+						fmt.Printf("DEBUG computeAllocRedirect(intent): var=%s fp=%s... redirect %s -> %s\n",
+							varKey, varFP[:min(16, len(varFP))], allocID, target)
+					}
+				}
+			}
+		}
+
+		// FALLBACK: If var has no intent, check if any of its allocIDs have allocDesiredFP
+		for varKey, hist := range s.varAllocHistory {
+			if _, hasVarIntent := s.varDesiredItemFP[varKey]; hasVarIntent {
+				continue // Already handled above
+			}
+			// Check if any allocID in history has a known FP
+			for allocID := range hist {
+				if fp, ok := s.allocDesiredFP[allocID]; ok {
+					if target, ok := bestByFP[fp]; ok && target != "" && allocID != target {
+						// Theory 10: Only redirect within the same DSU class
+						if len(states) > 0 && states[0].dsu != nil {
+							d := states[0].dsu
+							if d.Find(allocID) != d.Find(target) {
+								continue
+							}
+						}
+						redirect[allocID] = target
+						if env.opts.EnableWarnings {
+							fmt.Printf("DEBUG computeAllocRedirect(alloc-intent): var=%s alloc=%s fp=%s... redirect %s -> %s\n",
+								varKey, allocID, fp[:min(16, len(fp))], allocID, target)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Build co-occurrence groups (fallback for vars without intent)
+	for v := range varToAllocs {
+		if _, ok := parent[v]; !ok {
+			parent[v] = v
+		}
+	}
+	groups := make(map[string][]string)
+	for v := range parent {
+		r := find(v)
+		groups[r] = append(groups[r], v)
+	}
+
+	// For each co-occurrence group, pick group-best alloc by rank
+	for groupRoot, members := range groups {
+		// Gather all candidate allocIDs across group members
+		candidates := make([]string, 0, 16)
+		candidateSet := make(map[string]struct{})
+		for _, varKey := range members {
+			for allocID := range varToAllocs[varKey] {
+				if _, seen := candidateSet[allocID]; !seen {
+					candidates = append(candidates, allocID)
+					candidateSet[allocID] = struct{}{}
+				}
+			}
+		}
+		if len(candidates) == 0 {
+			continue
+		}
+
+		// Find best by rank
+		best := ""
+		bestRank := -1
+		rank2IDs := make([]string, 0, len(candidates))
+		for _, allocID := range candidates {
+			r := rank(mergedAccum[allocID])
+			if r > bestRank {
+				bestRank = r
+				best = allocID
+			}
+			if r == 2 {
+				rank2IDs = append(rank2IDs, allocID)
+			}
+		}
+		if best == "" {
+			continue
+		}
+
+		// If multiple rank-2, union their items into best
+		if len(rank2IDs) > 1 {
+			items := make([]*oas3.Schema, 0, len(rank2IDs))
+			for _, id := range rank2IDs {
+				if arr := mergedAccum[id]; arr != nil && arr.Items != nil && arr.Items.Left != nil {
+					items = append(items, arr.Items.Left)
+				}
+			}
+			if len(items) > 0 {
+				if u := Union(items, env.opts); u != nil {
+					mergedAccum[best] = &oas3.Schema{
+						Type:  oas3.NewTypeFromString(oas3.SchemaTypeArray),
+						Items: oas3.NewJSONSchemaFromSchema[oas3.Referenceable](u),
+					}
+				}
+			}
+		}
+
+		// Redirect every allocID in the group to the chosen best
+		for _, varKey := range members {
+			for allocID := range varToAllocs[varKey] {
+				if allocID != best {
+					// Theory 10: Only redirect within the same DSU class
+					if len(states) > 0 && states[0].dsu != nil {
+						d := states[0].dsu
+						if d.Find(allocID) != d.Find(best) {
+							continue
+						}
+					}
+					redirect[allocID] = best
+					if env.opts.EnableWarnings {
+						fmt.Printf("DEBUG computeAllocRedirect(group): var=%s redirecting %s -> %s (groupBestRank=%d, group=%s)\n",
+							varKey, allocID, best, bestRank, groupRoot)
+					}
+				}
+			}
+		}
+	}
+
+	// Theory 10: Overlay DSU canonicalization and ensure mergedAccum has class roots
+	if len(states) > 0 && states[0].dsu != nil {
+		d := states[0].dsu
+		for id := range mergedAccum {
+			root := d.Find(id)
+			if root == "" {
+				continue
+			}
+			if root != id {
+				fmt.Printf("TRACE DSU computeAllocRedirect: redirect %s -> %s (DSU root)\n", id, root)
+				redirect[id] = root
+			}
+			// Ensure we have an entry at the root and union siblings there
+			if root != id {
+				if rootArr, ok := mergedAccum[root]; ok && rootArr != mergedAccum[id] {
+					mergedAccum[root] = joinTwoSchemas(rootArr, mergedAccum[id])
+					fmt.Printf("TRACE DSU computeAllocRedirect: merged %s into root %s\n", id, root)
+				} else if _, ok := mergedAccum[root]; !ok {
+					mergedAccum[root] = mergedAccum[id]
+					fmt.Printf("TRACE DSU computeAllocRedirect: created root entry %s from %s\n", root, id)
+				}
+			}
+		}
+	}
+
+	return redirect
 }
 
 // executeOpMultiState executes an opcode on a state and returns successor states.
@@ -829,22 +1505,207 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		return []*execState{next}, nil
 
 	case opStore:
+		key := fmt.Sprintf("%v", c.value)
+
+		// DEBUG: Peek before pop for [44 2]
+		if len(next.stack) > 0 {
+			if len(key) >= 3 && key[:3] == "[44" {
+				top := next.stack[len(next.stack)-1].Schema
+				isArr := top != nil && getType(top) == "array"
+				var isEmpty, hasItems, tagged bool
+				if isArr {
+					isEmpty = top.MaxItems != nil && *top.MaxItems == 0
+					hasItems = top.Items != nil && top.Items.Left != nil
+					tagged = next.schemaToAlloc[top] != ""
+				}
+				fmt.Printf("DEBUG pre-opStore %s: topIsArray=%v empty=%v hasItems=%v tagged=%v\n",
+					key, isArr, isEmpty, hasItems, tagged)
+			}
+		}
+
 		if len(next.stack) > 0 {
 			val := next.pop()
-			key := fmt.Sprintf("%v", c.value)
-			next.storeVar(key, val)
+
+			// CRITICAL FIX: For arrays, check if there's a canonical version to store
+			// This ensures variables always have the mutated canonical, not stale references
+			finalVal := val
+			if getType(val) == "array" {
+				// DEBUG: Log for [44 2] regardless of tagging
+				if key == "[44 2]" {
+					valEmpty := val.MaxItems != nil && *val.MaxItems == 0
+					valHasItems := val.Items != nil && val.Items.Left != nil
+					fmt.Printf("DEBUG opStore [44 2]: val is array - valEmpty=%v, valHasItems=%v, valPtr=%p\n",
+						valEmpty, valHasItems, val)
+				}
+
+				if accumKey, tagged := next.schemaToAlloc[val]; tagged {
+					if key == "[44 2]" {
+						fmt.Printf("DEBUG opStore [44 2]: array IS TAGGED with accumKey=%s\n", accumKey)
+					}
+					if canonical, exists := next.accum[accumKey]; exists {
+						if key == "[44 2]" {
+							canonEmpty := canonical.MaxItems != nil && *canonical.MaxItems == 0
+							canonHasItems := canonical.Items != nil && canonical.Items.Left != nil
+							fmt.Printf("DEBUG opStore [44 2]: canonical found - canonEmpty=%v, canonHasItems=%v, samePtr=%v\n",
+								canonEmpty, canonHasItems, val == canonical)
+						}
+						if env.opts.EnableWarnings {
+							valEmpty := val.MaxItems != nil && *val.MaxItems == 0
+							canonEmpty := canonical.MaxItems != nil && *canonical.MaxItems == 0
+							canonHasItems := canonical.Items != nil && canonical.Items.Left != nil
+							var itemType string
+							if canonHasItems {
+								itemType = getType(canonical.Items.Left)
+							}
+							fmt.Printf("DEBUG opStore: var='%s', accumKey=%s - storing canonical instead of stale (valEmpty=%v, canonEmpty=%v, canonHasItems=%v, itemType=%s)\n",
+								key, accumKey, valEmpty, canonEmpty, canonHasItems, itemType)
+						}
+						finalVal = canonical  // Store canonical, not stale reference!
+					} else if key == "[44 2]" {
+						fmt.Printf("DEBUG opStore [44 2]: array tagged but NO CANONICAL in accum!\n")
+					}
+				} else if key == "[44 2]" {
+					fmt.Printf("DEBUG opStore [44 2]: array is NOT TAGGED in schemaToAlloc\n")
+				}
+			} else if key == "[44 2]" {
+				fmt.Printf("DEBUG opStore [44 2]: val is NOT an array, type=%s\n", getType(val))
+			}
+
+			next.storeVar(key, finalVal)
+
+			// DEBUG: Log variable storage for arrays
+			if getType(finalVal) == "array" && env.opts.EnableWarnings {
+				isEmpty := finalVal.MaxItems != nil && *finalVal.MaxItems == 0
+				hasItems := finalVal.Items != nil && finalVal.Items.Left != nil
+				var itemType string
+				if hasItems {
+					itemType = getType(finalVal.Items.Left)
+				}
+				accumPtr := fmt.Sprintf("%p", next.accum)
+				fmt.Printf("DEBUG opStore: STORED var='%s' - empty=%v, hasItems=%v, itemType=%s, accumPtr=%s\n",
+					key, isEmpty, hasItems, itemType, accumPtr)
+			}
+
 			// If storing an array, assign unique allocID and tag the schema
 			// KLEE-style: arrays carry their identity via schema pointer → allocID mapping
-			if getType(val) == "array" {
-				*next.allocCounter++
-				allocID := *next.allocCounter
-				accumKey := fmt.Sprintf("alloc%d", allocID)
-				// Initialize canonical array
-				if _, exists := next.accum[accumKey]; !exists {
-					next.accum[accumKey] = val
+			if getType(finalVal) == "array" {
+				// Check if already tagged (when storing canonical)
+				if _, alreadyTagged := next.schemaToAlloc[finalVal]; !alreadyTagged {
+					// Theory 10: Use origin-aware allocator (also seeds DSU parent)
+					accumKey := next.allocateArrayWithOrigin(next.pc-1, "opStore")
+					// Initialize canonical array
+					if _, exists := next.accum[accumKey]; !exists {
+						next.accum[accumKey] = finalVal
+					}
+					// Tag this schema with its allocID
+					next.schemaToAlloc[finalVal] = accumKey
+
+					// CRITICAL: Lift pointer-intent to alloc-intent when minting fresh allocID
+					// This connects arrays created by map/sort/etc to their intended items
+					if next.schemaFPIntent != nil {
+						if fp, ok := next.schemaFPIntent[finalVal]; ok && fp != "" {
+							if next.allocDesiredFP == nil {
+								next.allocDesiredFP = make(map[string]string)
+							}
+							next.allocDesiredFP[accumKey] = fp
+							next.recordVarAlloc(key, accumKey)
+							next.varDesiredItemFP[key] = fp
+							fmt.Printf("DEBUG opStore: lifted pointer-intent to new alloc %s for var=%s, fp=%s...\n",
+								accumKey, key, fp[:min(20, len(fp))])
+						}
+					}
 				}
-				// Tag this schema with its allocID
-				next.schemaToAlloc[val] = accumKey
+				// Record history and intent for variable intent tracking
+				if ak := next.schemaToAlloc[finalVal]; ak != "" {
+					next.recordVarAlloc(key, ak)
+					if canon := next.accum[ak]; canon != nil && canon.Items != nil && canon.Items.Left != nil {
+						next.recordDesiredFP(key, canon.Items.Left)
+					}
+					// CRITICAL: Also lift pointer-intent for already-tagged arrays
+					// This handles arrays that were created earlier and are now being stored to a new variable
+					if next.schemaFPIntent != nil {
+						if fp, ok := next.schemaFPIntent[finalVal]; ok && fp != "" {
+							if next.allocDesiredFP == nil {
+								next.allocDesiredFP = make(map[string]string)
+							}
+							// Update allocDesiredFP for this allocID if not already set
+							if _, hasAllocFP := next.allocDesiredFP[ak]; !hasAllocFP {
+								next.allocDesiredFP[ak] = fp
+								next.varDesiredItemFP[key] = fp
+								fmt.Printf("DEBUG opStore: lifted pointer-intent to existing alloc %s for var=%s, fp=%s...\n",
+									ak, key, fp[:min(20, len(fp))])
+							}
+						}
+					}
+				}
+
+				// Theory 10: Intra-state DSU union - unify current allocID with any prior allocIDs
+				// this variable had that share the same origin. Merge canonical arrays and cardinality.
+				if currID, ok := next.schemaToAlloc[finalVal]; ok && currID != "" {
+					if priorSet, ok := next.varAllocHistory[key]; ok {
+						currOrigin := next.allocOrigin[currID]
+						for priorID := range priorSet {
+							if priorID == currID {
+								continue
+							}
+							prevOrigin := next.allocOrigin[priorID]
+							if prevOrigin != nil && currOrigin != nil &&
+								prevOrigin.PC == currOrigin.PC && prevOrigin.Context == currOrigin.Context {
+								// Union classes
+								fmt.Printf("TRACE DSU opStore: var=%s union %s with %s (same origin PC=%d, ctx=%s)\n",
+									key, priorID, currID, currOrigin.PC, currOrigin.Context)
+								next.dsu.Union(priorID, currID)
+								root := next.dsu.Find(currID)
+
+								// Merge canonical arrays onto the root
+								arr1 := next.accum[priorID]
+								arr2 := next.accum[currID]
+								var merged *oas3.Schema
+								switch {
+								case arr1 == nil:
+									merged = arr2
+								case arr2 == nil:
+									merged = arr1
+								default:
+									merged = joinTwoSchemas(arr1, arr2)
+								}
+								if merged != nil {
+									next.accum[root] = merged
+									// Alias both ids to the merged canonical to be robust
+									next.accum[priorID] = merged
+									next.accum[currID] = merged
+									next.schemaToAlloc[merged] = root
+									// Store canonical back to the variable (preserve pointer identity)
+									next.storeVar(key, merged)
+									fmt.Printf("TRACE DSU opStore: merged arrays to root=%s\n", root)
+								}
+
+								// Lattice-join cardinality into the root key
+								if next.allocCardinality != nil {
+									c1 := next.allocCardinality[priorID]
+									c2 := next.allocCardinality[currID]
+									var joined *ArrayCardinality
+									switch {
+									case c1 == nil:
+										joined = c2
+									case c2 == nil:
+										joined = c1
+									default:
+										joined = c1.Join(c2)
+									}
+									next.allocCardinality[root] = joined
+									if joined != nil && joined.MinItems != nil {
+										fmt.Printf("TRACE DSU opStore: joined cardinality to root=%s MinItems=%d\n",
+											root, *joined.MinItems)
+									}
+								}
+
+								// Record variable now points to the root ID
+								next.recordVarAlloc(key, root)
+							}
+						}
+					}
+				}
 			}
 		}
 		return []*execState{next}, nil
@@ -853,7 +1714,50 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		key := fmt.Sprintf("%v", c.value)
 		// Load from normal variable frames (arrays are tagged with allocID)
 		if val, ok := next.loadVar(key); ok {
-			next.push(val)
+			// CRITICAL FIX: For arrays, check if there's a canonical version in accum
+			// Arrays get mutated in-place in state.accum during append operations,
+			// but the original schema stays in the variable frame. We need to return
+			// the mutated canonical version.
+			finalVal := val
+			if getType(val) == "array" {
+				if accumKey, tagged := next.schemaToAlloc[val]; tagged {
+					if canonical, exists := next.accum[accumKey]; exists {
+						canonHasItems := canonical.Items != nil && canonical.Items.Left != nil
+						if env.opts.EnableWarnings {
+							origEmpty := val.MaxItems != nil && *val.MaxItems == 0
+							canonEmpty := canonical.MaxItems != nil && *canonical.MaxItems == 0
+							var itemType string
+							if canonHasItems {
+								itemType = getType(canonical.Items.Left)
+							}
+							samePtr := val == canonical
+							accumPtr := fmt.Sprintf("%p", next.accum)
+							valPtr := fmt.Sprintf("%p", val)
+							canonPtr := fmt.Sprintf("%p", canonical)
+							fmt.Printf("DEBUG opLoad: var='%s', accumKey=%s - origEmpty=%v, canonEmpty=%v, hasItems=%v, itemType=%s, samePtr=%v, accumPtr=%s, valPtr=%s, canonPtr=%s\n",
+								key, accumKey, origEmpty, canonEmpty, canonHasItems, itemType, samePtr, accumPtr, valPtr, canonPtr)
+						}
+						// Use the canonical (mutated) version, not the original
+						finalVal = canonical
+						if env.opts.EnableWarnings && canonHasItems {
+							finalPtr := fmt.Sprintf("%p", finalVal)
+							fmt.Printf("DEBUG opLoad: PUSHING non-empty canonical to stack, ptr=%s\n", finalPtr)
+						}
+					} else if env.opts.EnableWarnings {
+						fmt.Printf("DEBUG opLoad: var='%s' tagged as %s but NOT in accum\n", key, accumKey)
+					}
+				} else if env.opts.EnableWarnings {
+					isEmpty := val.MaxItems != nil && *val.MaxItems == 0
+					hasItems := val.Items != nil && val.Items.Left != nil
+					var itemType string
+					if hasItems {
+						itemType = getType(val.Items.Left)
+					}
+					fmt.Printf("DEBUG opLoad: loading var='%s' (not tagged) - empty=%v, hasItems=%v, itemType=%s\n",
+						key, isEmpty, hasItems, itemType)
+				}
+			}
+			next.push(finalVal)
 		} else {
 			if env.strict {
 				return nil, fmt.Errorf("strict mode: variable %s not found at pc=%d (state=%d)", key, state.pc, next.id)
@@ -1089,14 +1993,14 @@ func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oa
 	if idx, ok := indexKey.(int); ok {
 		// Check prefixItems for tuple access
 		if arr.PrefixItems != nil && idx >= 0 && idx < len(arr.PrefixItems) {
-			if schema, ok := derefJSONSchema(arr.PrefixItems[idx]); ok {
+			if schema, ok := derefJSONSchema(newCollapseContext(), arr.PrefixItems[idx]); ok {
 				return schema
 			}
 		}
 
 		// Fall through to items for indices beyond prefixItems
 		if arr.Items != nil {
-			if schema, ok := derefJSONSchema(arr.Items); ok {
+			if schema, ok := derefJSONSchema(newCollapseContext(), arr.Items); ok {
 				return schema
 			}
 		}
@@ -1111,7 +2015,7 @@ func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oa
 	// Add all prefixItems
 	if arr.PrefixItems != nil {
 		for _, item := range arr.PrefixItems {
-			if schema, ok := derefJSONSchema(item); ok {
+			if schema, ok := derefJSONSchema(newCollapseContext(), item); ok {
 				schemas = append(schemas, schema)
 			} else {
 				// Unresolved reference in tuple element - widen conservatively
@@ -1122,7 +2026,7 @@ func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oa
 
 	// Add items schema
 	if arr.Items != nil {
-		if schema, ok := derefJSONSchema(arr.Items); ok {
+		if schema, ok := derefJSONSchema(newCollapseContext(), arr.Items); ok {
 			schemas = append(schemas, schema)
 		} else {
 			// Unresolved reference in items - widen conservatively
@@ -1189,7 +2093,8 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 	switch baseType {
 	case "object":
 		if key, ok := indexKey.(string); ok {
-			result = GetProperty(base, key, env.opts)
+			// Union-aware property lookup with jq semantics: missing → null
+			result = accessPropertyUnion(base, key, env.opts)
 		} else {
 			result = Top()
 		}
@@ -1234,6 +2139,18 @@ func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, 
 
 	// NORMAL MODE: Iterate and push item schema
 	val := state.pop()
+
+	// DEBUG: Log what array was popped for iteration
+	if env.opts.EnableWarnings && val != nil && getType(val) == "array" {
+		isEmpty := val.MaxItems != nil && *val.MaxItems == 0
+		hasItems := val.Items != nil && val.Items.Left != nil
+		var itemType string
+		if hasItems {
+			itemType = getType(val.Items.Left)
+		}
+		env.addWarning("ITER pop: empty=%v hasItems=%v itemType=%s", isEmpty, hasItems, itemType)
+	}
+
 	if val == nil {
 		return []*execState{state}, nil
 	}
@@ -1247,12 +2164,15 @@ func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, 
 		// Empty arrays are represented with MaxItems=0 and Items may be nil
 		if val.MaxItems != nil && *val.MaxItems == 0 {
 			// Empty array sentinel: produce no iteration values
+			if env.opts.EnableWarnings {
+				env.addWarning("ITER: empty array sentinel detected, producing no iterations")
+			}
 			return []*execState{}, nil
 		}
 
 		if val.Items != nil {
 			// Try to dereference items schema (handles both inline and $ref)
-			if schema, ok := derefJSONSchema(val.Items); ok {
+			if schema, ok := derefJSONSchema(newCollapseContext(), val.Items); ok {
 				itemSchema = schema
 			} else {
 				// Unresolved reference - widen conservatively with cause
@@ -1298,12 +2218,38 @@ func (env *schemaEnv) execObjectMulti(state *execState, c *codeOp) ([]*execState
 		val := state.pop()
 		key := state.pop()
 
+		// Ensure arrays placed into objects are the canonical arrays (items populated)
+		if getType(val) == "array" {
+			beforeEmpty := val.MaxItems != nil && *val.MaxItems == 0
+			beforeHasItems := val.Items != nil && val.Items.Left != nil
+			val = env.materializeArrays(val, state.accum, state.schemaToAlloc)
+			if env.opts.EnableWarnings {
+				afterEmpty := val.MaxItems != nil && *val.MaxItems == 0
+				afterHasItems := val.Items != nil && val.Items.Left != nil
+				fmt.Printf("DEBUG opObject: materialized array for property; before(empty=%v,hasItems=%v) → after(empty=%v,hasItems=%v)\n",
+					beforeEmpty, beforeHasItems, afterEmpty, afterHasItems)
+			}
+		}
+
 		if env.opts.EnableWarnings {
 			keyStr := "<?>"
 			if getType(key) == "string" && len(key.Enum) > 0 && key.Enum[0].Kind == yaml.ScalarNode {
 				keyStr = key.Enum[0].Value
 			}
 			env.addWarning("opObject: pair %d: key=%s, valType=%s", i, keyStr, getType(val))
+
+			// DEBUG: For configs key, log detailed array info including pointer
+			if keyStr == "configs" && getType(val) == "array" {
+				isEmpty := val.MaxItems != nil && *val.MaxItems == 0
+				hasItems := val.Items != nil && val.Items.Left != nil
+				var itemType string
+				if hasItems {
+					itemType = getType(val.Items.Left)
+				}
+				valPtr := fmt.Sprintf("%p", val)
+				fmt.Printf("DEBUG opObject: configs POPPED - empty=%v, hasItems=%v, itemType=%s, ptr=%s\n",
+					isEmpty, hasItems, itemType, valPtr)
+			}
 		}
 
 		if getType(key) == "string" && len(key.Enum) > 0 {
@@ -1332,6 +2278,64 @@ func (env *schemaEnv) execObjectMulti(state *execState, c *codeOp) ([]*execState
 // execAppendMulti handles array element appending in multi-state mode.
 // This is used for array construction: [.[] | f]
 // Each state has its own accumulator map. Merging happens via lattice join when paths converge.
+// allocateArrayWithOrigin creates a new allocID with origin tracking
+func (state *execState) allocateArrayWithOrigin(pc int, context string) string {
+	*state.allocCounter++
+	allocID := fmt.Sprintf("alloc%d", *state.allocCounter)
+
+	// Track origin for DSU equivalence
+	if state.allocOrigin == nil {
+		state.allocOrigin = make(map[string]*AllocOrigin)
+	}
+	state.allocOrigin[allocID] = &AllocOrigin{
+		PC:      pc,
+		Context: context,
+	}
+
+	// Initialize cardinality as empty (MinItems=0, MaxItems=0)
+	if state.allocCardinality == nil {
+		state.allocCardinality = make(map[string]*ArrayCardinality)
+	}
+	zero := 0
+	state.allocCardinality[allocID] = &ArrayCardinality{
+		MinItems: &zero,
+		MaxItems: &zero,
+	}
+
+	// Theory 10: Initialize DSU parent for this new allocID
+	if state.dsu == nil {
+		state.dsu = NewDSU()
+	}
+	state.dsu.Find(allocID) // seeds parent[allocID] = allocID
+
+	return allocID
+}
+
+// setArrayNonEmpty marks an array as non-empty (MinItems=1)
+func (state *execState) setArrayNonEmpty(allocID string) {
+	if allocID == "" {
+		return
+	}
+	if state.allocCardinality == nil {
+		state.allocCardinality = make(map[string]*ArrayCardinality)
+	}
+
+	// Get or create cardinality
+	card := state.allocCardinality[allocID]
+	if card == nil {
+		card = &ArrayCardinality{}
+		state.allocCardinality[allocID] = card
+	}
+
+	// Set MinItems=1 (array must be non-empty)
+	one := 1
+	card.MinItems = &one
+	// Remove MaxItems=0 constraint if present
+	if card.MaxItems != nil && *card.MaxItems == 0 {
+		card.MaxItems = nil
+	}
+}
+
 func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState, error) {
 	// Pop the value to append
 	if len(state.stack) < 1 {
@@ -1350,6 +2354,11 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 		key = fmt.Sprintf("%v", c.value)
 	}
 
+	// DEBUG: Log append key
+	if env.opts.EnableWarnings {
+		env.addWarning("APPEND key=%q (nil=%v)", key, c.value == nil)
+	}
+
 	// Get the array from the variable
 	var targetArray *oas3.Schema
 	fromVar := false
@@ -1363,16 +2372,42 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 	}
 
 	// FALLBACK: Stack-based accumulation (for del/path expressions)
-	// If no variable target, pop the array from the stack
+	// ENHANCED: If the array we popped matches any variable by pointer identity,
+	// treat it as variable-backed so we can update the variable frame with the canonical pointer.
 	if targetArray == nil && len(state.stack) > 0 {
 		candidate := state.pop()
 		if getType(candidate) == "array" {
-			targetArray = candidate
-			fromVar = false
+			// Try match by pointer to an existing variable
+			foundKey := ""
+			for i := len(state.scopes) - 1; i >= 0 && foundKey == ""; i-- {
+				for k, v := range state.scopes[i] {
+					if v == candidate {
+						foundKey = k
+						break
+					}
+				}
+			}
+
+			if foundKey != "" {
+				key = foundKey
+				targetArray = candidate
+				fromVar = true
+				if env.opts.EnableWarnings {
+					fmt.Printf("DEBUG execAppendMulti: resolved stack array to variable '%s' by pointer\n", key)
+				}
+			} else {
+				targetArray = candidate
+				fromVar = false
+			}
 		} else {
 			// Not an array; push it back
 			state.push(candidate)
 		}
+	}
+
+	// DEBUG: Log target decision
+	if env.opts.EnableWarnings {
+		env.addWarning("APPEND target fromVar=%v (has target=%v)", fromVar, targetArray != nil)
 	}
 
 	// Look up or assign allocID for this array
@@ -1381,9 +2416,8 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 		if ak, ok := state.schemaToAlloc[targetArray]; ok {
 			accumKey = ak
 		} else {
-			// Not tagged yet - assign new allocID
-			*state.allocCounter++
-			accumKey = fmt.Sprintf("alloc%d", *state.allocCounter)
+			// Not tagged yet - assign new allocID with origin tracking
+			accumKey = state.allocateArrayWithOrigin(state.pc, "append")
 			state.accum[accumKey] = targetArray
 			state.schemaToAlloc[targetArray] = accumKey
 		}
@@ -1414,6 +2448,40 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 	priorItems := Bottom()
 	if getType(canonicalArr) == "array" && canonicalArr.Items != nil && canonicalArr.Items.Left != nil {
 		priorItems = canonicalArr.Items.Left
+	}
+
+	// DEBUG: Detect the final configs map by element shape {name, value}
+	isConfigsElem := false
+	if getType(val) == "object" && val.Properties != nil {
+		_, hasName := val.Properties.Get("name")
+		_, hasValue := val.Properties.Get("value")
+		isConfigsElem = hasName && hasValue
+	}
+	if isConfigsElem {
+		fmt.Printf("DEBUG configs-append: pc=%d key=%q fromVar=%v\n", state.pc-1, key, fromVar)
+		if fromVar {
+			if arr, ok := state.loadVar(key); ok {
+				if ak, tagged := state.schemaToAlloc[arr]; tagged {
+					fmt.Printf("DEBUG configs-append: var=%s accumKey=%s\n", key, ak)
+				} else {
+					fmt.Printf("DEBUG configs-append: var=%s (UNTAGGED)\n", key)
+				}
+			} else {
+				fmt.Printf("DEBUG configs-append: var=%s (NOT FOUND)\n", key)
+			}
+		} else {
+			fmt.Printf("DEBUG configs-append: STACK-BACKED\n")
+		}
+	}
+
+	// DEBUG: Log accumulator state
+	if env.opts.EnableWarnings && accumKey != "" {
+		wasEmpty := canonicalArr.MaxItems != nil && *canonicalArr.MaxItems == 0
+		valType := getType(val)
+		accumPtr := fmt.Sprintf("%p", state.accum)
+		canonPtr := fmt.Sprintf("%p", canonicalArr)
+		fmt.Printf("DEBUG execAppendMulti: accumKey=%s, wasEmpty=%v, appending type=%s, accumPtr=%s, canonPtr=%s\n",
+			accumKey, wasEmpty, valType, accumPtr, canonPtr)
 	}
 
 	// For path tuples (arrays with prefixItems), don't union - collect multiple paths
@@ -1454,11 +2522,64 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 		if canonicalArr.MaxItems != nil && *canonicalArr.MaxItems == 0 {
 			canonicalArr.MaxItems = nil
 		}
+
+		// DEBUG: Log what we're setting as items
+		if env.opts.EnableWarnings && accumKey != "" {
+			unionedType := getType(unionedItems)
+			isNil := unionedItems == nil
+			fmt.Printf("DEBUG execAppendMulti: setting items on %s - unionedItems type=%s, isNil=%v\n",
+				accumKey, unionedType, isNil)
+		}
+
 		canonicalArr.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](unionedItems)
+
+		// Theory 10: Mark array as non-empty (MinItems=1) after appending
+		if accumKey != "" {
+			state.setArrayNonEmpty(accumKey)
+		}
+
+		// Record var and alloc intent when items become known
+		if fromVar && key != "" && unionedItems != nil {
+			state.recordDesiredFP(key, unionedItems)
+		}
+		// Also record allocID intent directly (for cross-variable propagation)
+		if accumKey != "" && unionedItems != nil {
+			if state.allocDesiredFP == nil {
+				state.allocDesiredFP = make(map[string]string)
+			}
+			fp := schemaFingerprint(unionedItems)
+			state.allocDesiredFP[accumKey] = fp
+			// Record pointer-intent for the canonical array
+			state.recordSchemaFP(canonicalArr, unionedItems)
+			fmt.Printf("DEBUG execAppendMulti: recorded allocDesiredFP[%s] = %s...\n",
+				accumKey, fp[:min(20, len(fp))])
+		}
+
+		// DEBUG: Verify the mutation actually took effect
+		if env.opts.EnableWarnings && accumKey != "" {
+			afterItems := canonicalArr.Items != nil && canonicalArr.Items.Left != nil
+			afterEmpty := canonicalArr.MaxItems != nil && *canonicalArr.MaxItems == 0
+			var afterItemType string
+			if afterItems {
+				afterItemType = getType(canonicalArr.Items.Left)
+			}
+			fmt.Printf("DEBUG execAppendMulti: AFTER mutation %s - empty=%v, hasItems=%v, itemType=%s\n",
+				accumKey, afterEmpty, afterItems, afterItemType)
+		}
 	}
 
-	// Push the canonical array back ONLY if we took it from the stack
-	// For variable-backed accumulation, the array stays in the variable
+	// CRITICAL FIX: Update the variable frame with the canonical pointer
+	// This ensures that when opLoad retrieves the variable, it gets the mutated canonical
+	if fromVar && key != "" && accumKey != "" {
+		state.storeVar(key, canonicalArr)
+		if env.opts.EnableWarnings {
+			fmt.Printf("DEBUG execAppendMulti: updated variable frame %s with canonical ptr=%p\n", key, canonicalArr)
+		}
+	}
+
+	// Only push for stack-backed accumulation (fromVar == false)
+	// For variable-backed accumulation (map/reduce), the compiler emits an explicit opLoad
+	// after the loop to get the final result on the stack. Pushing here would break stack discipline.
 	if !fromVar {
 		state.push(canonicalArr)
 	}
@@ -1523,6 +2644,16 @@ func (env *schemaEnv) execJumpIfNot(state *execState, c *codeOp) ([]*execState, 
 	// NOTE: Do NOT increment pc here - it's already been incremented by the framework
 	// before calling this handler (see executeOpMultiState line 224)
 
+	// Truthiness refinement: (T | null) → then: T, else: null
+	if val != nil {
+		if nn := stripNullUnion(val, env.opts); nn != nil && !schemaEqual(nn, val) {
+			// Then-branch: value is non-null
+			refineVarRefs(continueState, val, nn)
+			// Else-branch: value is null
+			refineVarRefs(jumpState, val, ConstNull())
+		}
+	}
+
 	return []*execState{continueState, jumpState}, nil
 }
 
@@ -1541,34 +2672,19 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 			funcName = fn
 		}
 
-		// Pop arguments FIRST (right-to-left), then input
-		args := make([]*oas3.Schema, argCount)
-		for i := argCount - 1; i >= 0; i-- {
-			if len(state.stack) == 0 {
-				return nil, fmt.Errorf("stack underflow on call args")
-			}
-			args[i] = state.pop()
-		}
-
-		// Pop input (from bottom of stack)
+		// Pop input FIRST (top of stack holds the saved input `v` that compileCallInternal just pushed)
 		if len(state.stack) == 0 {
 			return nil, fmt.Errorf("stack underflow on call input")
 		}
 		input := state.pop()
 
-		// SPECIAL CASE: Some builtins have inverted calling convention in jq bytecode
-		// The jq compiler pushes arguments in an inverted order for certain builtins
-		// For delpaths/getpath/setpath: input should be the object, not the paths array
-		// For split/join/startswith/endswith/ltrimstr/rtrimstr/index/indices:
-		//   input should be the string/array, not the separator/prefix/suffix/search value
-		// NOTE: test/_match/contains/inside do NOT need swapping (they use normal convention)
-		if (funcName == "delpaths" || funcName == "getpath" || funcName == "setpath" ||
-			funcName == "split" || funcName == "join" ||
-			funcName == "startswith" || funcName == "endswith" ||
-			funcName == "ltrimstr" || funcName == "rtrimstr" ||
-			funcName == "index" || funcName == "rindex" || funcName == "indices") && len(args) >= 1 {
-			// Swap input and first arg
-			input, args[0] = args[0], input
+		// Then pop args in left-to-right order (matching the push order from compiler)
+		args := make([]*oas3.Schema, argCount)
+		for i := 0; i < argCount; i++ {
+			if len(state.stack) == 0 {
+				return nil, fmt.Errorf("stack underflow on call args")
+			}
+			args[i] = state.pop()
 		}
 
 		// DEBUG: Trace builtin calls
@@ -1590,15 +2706,30 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 			return []*execState{state}, nil
 		}
 
+		// Rebind accumulator variables for setpath to ensure pointer identity is updated
+		if (funcName == "setpath" || funcName == "_setpath") && len(results) == 1 && results[0] != nil {
+			refineVarRefs(state, input, results[0])
+			if env.opts.EnableWarnings {
+				fmt.Printf("DEBUG execCallMulti: rebinding vars after %s (old ptr=%p, new ptr=%p)\n",
+					funcName, input, results[0])
+			}
+		}
+
 		// For single result, push and continue
 		if len(results) == 1 {
 			r := results[0]
 			if r == nil {
+				// Bottom/nil represents impossible execution path - terminate this state
+				// Don't widen to Top as that pollutes unions with unconstrained types
 				if env.strict {
-					return nil, fmt.Errorf("strict mode: builtin %s produced nil result", funcName)
+					return nil, fmt.Errorf("strict mode: builtin %s produced Bottom (nil) result", funcName)
 				}
-				env.addWarning("builtin %s returned nil; widening to Top", funcName)
-				r = Top()
+				// Return empty state list (terminate this execution path)
+				return []*execState{}, nil
+			}
+			// Record schema-level intent for arrays with items
+			if getType(r) == "array" && r.Items != nil && r.Items.Left != nil {
+				state.recordSchemaFP(r, r.Items.Left)
 			}
 			state.push(r)
 			return []*execState{state}, nil
@@ -1608,13 +2739,19 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 		// This handles builtins that can return different schemas
 		states := make([]*execState, 0, len(results))
 		for _, result := range results {
-			s := state.clone()
 			if result == nil {
+				// Bottom/nil represents impossible execution path - skip this branch
+				// Don't widen to Top as that pollutes unions with unconstrained types
 				if env.strict {
-					return nil, fmt.Errorf("strict mode: builtin %s produced nil result", funcName)
+					return nil, fmt.Errorf("strict mode: builtin %s produced Bottom (nil) result", funcName)
 				}
-				env.addWarning("builtin %s produced nil result; widening to Top", funcName)
-				result = Top()
+				// Skip this result (don't create a state for it)
+				continue
+			}
+			s := state.clone()
+			// Record schema-level intent for arrays with items
+			if getType(result) == "array" && result.Items != nil && result.Items.Left != nil {
+				s.recordSchemaFP(result, result.Items.Left)
 			}
 			s.push(result)
 			states = append(states, s)
@@ -1675,33 +2812,54 @@ func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 
 	// Add all property values
 	if obj.Properties != nil {
-		for _, v := range obj.Properties.All() {
-			if schema, ok := derefJSONSchema(v); ok {
+		for k, v := range obj.Properties.All() {
+			if schema, ok := derefJSONSchema(newCollapseContext(), v); ok {
 				schemas = append(schemas, schema)
+				if opts.EnableWarnings {
+					fmt.Printf("DEBUG unionAllObjectValues: property %s type=%s\n", k, getType(schema))
+				}
 			} else {
 				// Unresolved reference in property - widen conservatively
 				schemas = append(schemas, Top())
+				if opts.EnableWarnings {
+					fmt.Printf("DEBUG unionAllObjectValues: property %s UNRESOLVED -> Top\n", k)
+				}
 			}
 		}
 	}
 
 	// Add additionalProperties
 	if obj.AdditionalProperties != nil {
-		if schema, ok := derefJSONSchema(obj.AdditionalProperties); ok {
+		if schema, ok := derefJSONSchema(newCollapseContext(), obj.AdditionalProperties); ok {
 			schemas = append(schemas, schema)
+			if opts.EnableWarnings {
+				fmt.Printf("DEBUG unionAllObjectValues: additionalProperties type=%s, unconstrained=%v\n",
+					getType(schema), isUnconstrainedSchema(schema))
+			}
 		} else {
 			// Unresolved reference in additionalProperties - widen conservatively
 			schemas = append(schemas, Top())
+			if opts.EnableWarnings {
+				fmt.Printf("DEBUG unionAllObjectValues: additionalProperties UNRESOLVED -> Top\n")
+			}
 		}
 	}
 
 	// TODO: Add patternProperties
 
 	if len(schemas) == 0 {
+		if opts.EnableWarnings {
+			fmt.Printf("DEBUG unionAllObjectValues: no schemas found -> Top\n")
+		}
 		return Top() // Unknown object values
 	}
 
-	return Union(schemas, opts)
+	result := Union(schemas, opts)
+	if opts.EnableWarnings {
+		fmt.Printf("DEBUG unionAllObjectValues: union result type=%s, unconstrained=%v (from %d schemas)\n",
+			getType(result), isUnconstrainedSchema(result), len(schemas))
+	}
+	return result
 }
 
 // buildObjectFromLiteral creates a schema from a map literal.
@@ -1992,23 +3150,77 @@ func isBottomSchema(s *oas3.Schema) bool {
 }
 
 // materializeArrays recursively walks a schema and replaces arrays with
-// their final accumulated versions using schema pointer tagging
-func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*oas3.Schema, schemaToAlloc map[*oas3.Schema]string) *oas3.Schema {
+// their final accumulated versions using schema pointer tagging.
+// EXTENDED: now also traverses anyOf/oneOf/allOf and Array Items/PrefixItems.
+func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*oas3.Schema, schemaToAlloc map[*oas3.Schema]string, redirect ...map[string]string) *oas3.Schema {
 	if schema == nil {
 		return nil
+	}
+
+	// Apply allocID redirect if provided
+	var allocRedirect map[string]string
+	if len(redirect) > 0 {
+		allocRedirect = redirect[0]
 	}
 
 	// If this is an array, check if it's tagged OR if it IS a canonical array
 	if getType(schema) == "array" {
 		// First try: check if tagged
 		if allocID, ok := schemaToAlloc[schema]; ok {
-			if canonical, ok2 := accum[allocID]; ok2 {
+			// Apply redirect if this allocID should use a different one
+			finalAllocID := allocID
+			if allocRedirect != nil {
+				if redirectTo, ok := allocRedirect[allocID]; ok {
+					finalAllocID = redirectTo
+					if env.opts.EnableWarnings {
+						fmt.Printf("DEBUG materialize: redirecting %s -> %s for array lookup\n", allocID, redirectTo)
+					}
+				}
+			}
+			if canonical, ok2 := accum[finalAllocID]; ok2 {
 				if env.opts.EnableWarnings {
 					canonicalItems := ""
-					if canonical.Items != nil && canonical.Items.Left != nil {
+					canonHasItems := canonical.Items != nil && canonical.Items.Left != nil
+					isEmpty := canonical.MaxItems != nil && *canonical.MaxItems == 0
+					if canonHasItems {
 						canonicalItems = getType(canonical.Items.Left)
 					}
-					env.addWarning("materialize: tagged array → canonical %s (items=%s)", allocID, canonicalItems)
+					schemaPtr := fmt.Sprintf("%p", schema)
+					canonPtr := fmt.Sprintf("%p", canonical)
+					env.addWarning("materialize: tagged array → canonical %s (items=%s, empty=%v, hasItems=%v, schemaPtr=%s, canonPtr=%s)",
+						allocID, canonicalItems, isEmpty, canonHasItems, schemaPtr, canonPtr)
+				}
+				// Recurse into the canonical array’s items/prefixItems before returning
+				arr := *canonical
+				changed := false
+				// Items
+				if arr.Items != nil && arr.Items.Left != nil {
+					newItems := env.materializeArrays(arr.Items.Left, accum, schemaToAlloc, allocRedirect)
+					if newItems != arr.Items.Left {
+						arr.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newItems)
+						changed = true
+					}
+				}
+				// PrefixItems
+				if arr.PrefixItems != nil && len(arr.PrefixItems) > 0 {
+					newPrefix := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(arr.PrefixItems))
+					for _, pi := range arr.PrefixItems {
+						if pi != nil && pi.Left != nil {
+							newPi := env.materializeArrays(pi.Left, accum, schemaToAlloc, allocRedirect)
+							newPrefix = append(newPrefix, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newPi))
+							if newPi != pi.Left {
+								changed = true
+							}
+						} else {
+							newPrefix = append(newPrefix, pi)
+						}
+					}
+					if changed {
+						arr.PrefixItems = newPrefix
+					}
+				}
+				if changed {
+					return &arr
 				}
 				return canonical
 			}
@@ -2020,25 +3232,86 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 		if hasEmptyItems {
 			for allocID, canonical := range accum {
 				if canonical == schema {
-					// This IS a canonical array - already has accumulated items
+					// This IS a canonical array - recurse into its internals
+					arr := *canonical
+					changed := false
+					if arr.Items != nil && arr.Items.Left != nil {
+						newItems := env.materializeArrays(arr.Items.Left, accum, schemaToAlloc, allocRedirect)
+						if newItems != arr.Items.Left {
+							arr.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newItems)
+							changed = true
+						}
+					}
+					if arr.PrefixItems != nil && len(arr.PrefixItems) > 0 {
+						newPrefix := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(arr.PrefixItems))
+						for _, pi := range arr.PrefixItems {
+							if pi != nil && pi.Left != nil {
+								newPi := env.materializeArrays(pi.Left, accum, schemaToAlloc, allocRedirect)
+								newPrefix = append(newPrefix, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newPi))
+								if newPi != pi.Left {
+                                    changed = true
+                                }
+							} else {
+								newPrefix = append(newPrefix, pi)
+							}
+						}
+						if changed {
+							arr.PrefixItems = newPrefix
+						}
+					}
 					if env.opts.EnableWarnings {
-						env.addWarning("materialize: array is canonical %s (no replacement needed)", allocID)
+						env.addWarning("materialize: array is canonical %s (no replacement needed beyond recursive materialization)", allocID)
+					}
+					if changed {
+						return &arr
 					}
 					return canonical
 				}
 			}
-			// Empty array with no tag and not in accumulator - leave as-is
-			// Don't guess which accumulator to use (that would be heuristic)
+			// Not found in accum - fall through and recurse into internals
 		}
+
+		// Un-tagged array: still recurse into Items/PrefixItems
+		clone := *schema
+		changed := false
+		if clone.Items != nil && clone.Items.Left != nil {
+			newItems := env.materializeArrays(clone.Items.Left, accum, schemaToAlloc)
+			if newItems != clone.Items.Left {
+				clone.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newItems)
+				changed = true
+			}
+		}
+		if clone.PrefixItems != nil && len(clone.PrefixItems) > 0 {
+			newPrefix := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(clone.PrefixItems))
+			for _, pi := range clone.PrefixItems {
+				if pi != nil && pi.Left != nil {
+					newPi := env.materializeArrays(pi.Left, accum, schemaToAlloc, allocRedirect)
+					newPrefix = append(newPrefix, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newPi))
+					if newPi != pi.Left {
+						changed = true
+					}
+				} else {
+					newPrefix = append(newPrefix, pi)
+				}
+			}
+			if changed {
+				clone.PrefixItems = newPrefix
+			}
+		}
+		if changed {
+			return &clone
+		}
+		// No change
+		return schema
 	}
 
-	// Recursively materialize object properties
+	// Recursively materialize object properties and additionalProperties
 	if getType(schema) == "object" && schema.Properties != nil {
 		modified := false
 		newProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
 		for k, propSchema := range schema.Properties.All() {
 			if propSchema.Left != nil {
-				materialized := env.materializeArrays(propSchema.Left, accum, schemaToAlloc)
+				materialized := env.materializeArrays(propSchema.Left, accum, schemaToAlloc, allocRedirect)
 				if materialized != propSchema.Left {
 					modified = true
 				}
@@ -2047,6 +3320,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 				newProps.Set(k, propSchema)
 			}
 		}
+		clone := *schema
 		if modified {
 			if env.opts.EnableWarnings {
 				propCount := 0
@@ -2055,14 +3329,91 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 				}
 				env.addWarning("materialize: reconstructed object with %d properties", propCount)
 			}
-			result := *schema
-			result.Properties = newProps
-			return &result
+			clone.Properties = newProps
+		}
+		// additionalProperties
+		if clone.AdditionalProperties != nil && clone.AdditionalProperties.Left != nil {
+			newAP := env.materializeArrays(clone.AdditionalProperties.Left, accum, schemaToAlloc, allocRedirect)
+			if newAP != clone.AdditionalProperties.Left {
+				clone.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newAP)
+				return &clone
+			}
+		}
+		if modified {
+			return &clone
+		}
+		return schema
+	}
+
+	// NEW: Traverse union structures (anyOf, oneOf, allOf)
+	// anyOf
+	if schema.AnyOf != nil && len(schema.AnyOf) > 0 {
+		changed := false
+		newAny := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(schema.AnyOf))
+		for _, br := range schema.AnyOf {
+			if br != nil && br.Left != nil {
+				newBr := env.materializeArrays(br.Left, accum, schemaToAlloc, allocRedirect)
+				newAny = append(newAny, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newBr))
+				if newBr != br.Left {
+					changed = true
+				}
+			} else {
+				newAny = append(newAny, br)
+			}
+		}
+		if changed {
+			clone := *schema
+			clone.AnyOf = newAny
+			return &clone
+		}
+	}
+	// oneOf
+	if schema.OneOf != nil && len(schema.OneOf) > 0 {
+		changed := false
+		newOne := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(schema.OneOf))
+		for _, br := range schema.OneOf {
+			if br != nil && br.Left != nil {
+				newBr := env.materializeArrays(br.Left, accum, schemaToAlloc, allocRedirect)
+				newOne = append(newOne, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newBr))
+				if newBr != br.Left {
+					changed = true
+				}
+			} else {
+				newOne = append(newOne, br)
+			}
+		}
+		if changed {
+			clone := *schema
+			clone.OneOf = newOne
+			return &clone
+		}
+	}
+	// allOf
+	if schema.AllOf != nil && len(schema.AllOf) > 0 {
+		changed := false
+		newAll := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(schema.AllOf))
+		for _, br := range schema.AllOf {
+			if br != nil && br.Left != nil {
+				newBr := env.materializeArrays(br.Left, accum, schemaToAlloc, allocRedirect)
+				newAll = append(newAll, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newBr))
+				if newBr != br.Left {
+					changed = true
+				}
+			} else {
+				newAll = append(newAll, br)
+			}
+		}
+		if changed {
+			clone := *schema
+			clone.AllOf = newAll
+			return &clone
 		}
 	}
 
 	return schema
 }
+
+
 
 // ============================================================================
 // State Merging for Branch Explosion Control
@@ -2232,6 +3583,23 @@ func schemaEqual(a, b *oas3.Schema) bool {
 	return reflect.DeepEqual(a, b)
 }
 
+// accumMapsEqualByIdentity checks if two accum maps are identical by key set and pointer values
+func accumMapsEqualByIdentity(m1, m2 map[string]*oas3.Schema) bool {
+	if (m1 == nil) != (m2 == nil) {
+		return false
+	}
+	if len(m1) != len(m2) {
+		return false
+	}
+	for k, v1 := range m1 {
+		v2, ok := m2[k]
+		if !ok || v1 != v2 {
+			return false
+		}
+	}
+	return true
+}
+
 // joinState merges two states using lattice join (LUB).
 // When scope keys differ, union them and treat missing keys as if they were present
 // with the value from the other state (join with implicit "undefined" = keep existing).
@@ -2246,6 +3614,481 @@ func joinState(a, b *execState) *execState {
 		panic("joinState: scope length mismatch")
 	}
 
+	// CRITICAL FIX: Use robust map equality check instead of single-sample-key
+	// The old single-key check incorrectly treated maps as "same" when key sets didn't overlap
+	differentAccumMaps := !accumMapsEqualByIdentity(a.accum, b.accum)
+
+	// DEBUG: Sample accum map pointers for first few joins
+	if len(a.accum) > 0 && len(b.accum) > 0 {
+		aPtr := fmt.Sprintf("%p", a.accum)
+		bPtr := fmt.Sprintf("%p", b.accum)
+		samePtr := (aPtr == bPtr)
+		// Get a sample key to check values
+		var sampleKey string
+		var av, bv *oas3.Schema
+		for k, v := range a.accum {
+			sampleKey = k
+			av = v
+			if bval, ok := b.accum[k]; ok {
+				bv = bval
+				break
+			}
+		}
+		samePtrVal := (av == bv)
+		fmt.Printf("DEBUG joinState: aPtr=%s bPtr=%s samePtr=%v equal=%v sampleKey=%s samePtrVal=%v\n",
+			aPtr[:12], bPtr[:12], samePtr, !differentAccumMaps, sampleKey, samePtrVal)
+	}
+
+	if differentAccumMaps {
+		aPtr := fmt.Sprintf("%p", a.accum)
+		bPtr := fmt.Sprintf("%p", b.accum)
+		fmt.Printf("WARNING joinState: states have DIFFERENT accum maps! a=%s (len=%d), b=%s (len=%d)\n",
+			aPtr, len(a.accum), bPtr, len(b.accum))
+
+		// Merge the accum maps by taking the union
+		// This handles the case where states from different forks have separate accumulators
+		mergedAccum := make(map[string]*oas3.Schema)
+		mergedSchemaToAlloc := make(map[*oas3.Schema]string)
+
+		// Copy from a
+		for k, v := range a.accum {
+			mergedAccum[k] = v
+		}
+		for k, v := range a.schemaToAlloc {
+			mergedSchemaToAlloc[k] = v
+		}
+
+		// Merge from b
+		for k, v := range b.accum {
+			if existing, ok := mergedAccum[k]; ok {
+				// Both have this key - union the arrays
+				if getType(existing) == "array" && getType(v) == "array" {
+					// Union the items
+					var existingItems, vItems *oas3.Schema
+					if existing.Items != nil && existing.Items.Left != nil {
+						existingItems = existing.Items.Left
+					} else {
+						existingItems = Bottom()
+					}
+					if v.Items != nil && v.Items.Left != nil {
+						vItems = v.Items.Left
+					} else {
+						vItems = Bottom()
+					}
+					// Theory 10: Check cardinality to prefer non-empty arrays
+					var aCard, bCard *ArrayCardinality
+					if a.allocCardinality != nil {
+						aCard = a.allocCardinality[k]
+					}
+					if b.allocCardinality != nil {
+						bCard = b.allocCardinality[k]
+					}
+
+					// Determine if either is definitely non-empty (MinItems >= 1)
+					aNonEmpty := aCard != nil && aCard.MinItems != nil && *aCard.MinItems >= 1
+					bNonEmpty := bCard != nil && bCard.MinItems != nil && *bCard.MinItems >= 1
+
+					// If one is non-empty and other is empty, prefer the non-empty one's items
+					var unionedItems *oas3.Schema
+					if aNonEmpty && !bNonEmpty && existingItems != Bottom() {
+						// Prefer 'a' (existing) items since it's non-empty
+						unionedItems = existingItems
+					} else if bNonEmpty && !aNonEmpty && vItems != Bottom() {
+						// Prefer 'b' (v) items since it's non-empty
+						unionedItems = vItems
+					} else {
+						// Both non-empty or both maybe-empty - union them
+						unionedItems = Union([]*oas3.Schema{existingItems, vItems}, SchemaExecOptions{})
+					}
+
+					// Create new canonical array with unioned items
+					// Only set Items when unionedItems is non-nil to avoid invalid wrapper
+					var merged *oas3.Schema
+					if unionedItems == nil {
+						// Both inputs had no items - preserve empty array constraint if both are empty
+						existingEmpty := existing.MaxItems != nil && *existing.MaxItems == 0
+						vEmpty := v.MaxItems != nil && *v.MaxItems == 0
+						if existingEmpty && vEmpty {
+							// Both are empty arrays - result is empty array
+							merged = ArrayType(nil) // This creates maxItems=0 with Items=nil
+						} else {
+							// Keep an unconstrained array; do not create an invalid Items wrapper
+							merged = &oas3.Schema{
+								Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
+							}
+						}
+					} else {
+						merged = &oas3.Schema{
+							Type:  oas3.NewTypeFromString(oas3.SchemaTypeArray),
+							Items: oas3.NewJSONSchemaFromSchema[oas3.Referenceable](unionedItems),
+						}
+					}
+					mergedAccum[k] = merged
+					// CRITICAL FIX: Re-tag the new canonical pointer so opStore can find it
+					mergedSchemaToAlloc[merged] = k
+					fmt.Printf("WARNING joinState: merged accum key %s - union of items, re-tagged ptr=%p\n", k, merged)
+				}
+			} else {
+				mergedAccum[k] = v
+			}
+		}
+		for k, v := range b.schemaToAlloc {
+			if _, ok := mergedSchemaToAlloc[k]; !ok {
+				mergedSchemaToAlloc[k] = v
+			}
+		}
+
+		// Theory 10: Merge cardinality maps using lattice join
+		mergedCardinality := make(map[string]*ArrayCardinality)
+		if a.allocCardinality != nil {
+			for k, v := range a.allocCardinality {
+				mergedCardinality[k] = v
+			}
+		}
+		if b.allocCardinality != nil {
+			for k, v := range b.allocCardinality {
+				if existing, ok := mergedCardinality[k]; ok {
+					// Use lattice join
+					if existing != nil && v != nil {
+						mergedCardinality[k] = existing.Join(v)
+					} else if v != nil {
+						mergedCardinality[k] = v
+					}
+				} else {
+					mergedCardinality[k] = v
+				}
+			}
+		}
+
+		merged := &execState{
+			pc:        a.pc,
+			stack:     make([]SValue, len(a.stack)),
+			scopes:    make([]map[string]*oas3.Schema, len(a.scopes)),
+			depth:     maxInt(a.depth, b.depth),
+			callstack: a.callstack,
+			id:        a.id,
+			parentID:  a.parentID,
+			lineage:   a.lineage,
+			// Use merged accumulators
+			accum:         mergedAccum,
+			schemaToAlloc: mergedSchemaToAlloc,
+			allocCounter:  a.allocCounter,
+			// Theory 10: Hybrid Origin-Lattice
+			allocOrigin:      a.allocOrigin,      // SHARED (use from either)
+			allocCardinality: mergedCardinality,  // Merged with lattice join
+			dsu:              a.dsu,              // SHARED (use from either)
+		}
+
+		// Merge var history and intent
+		merged.varAllocHistory = make(map[string]map[string]struct{}, len(a.varAllocHistory)+len(b.varAllocHistory))
+		for k, set := range a.varAllocHistory {
+			dst := make(map[string]struct{}, len(set))
+			for id := range set {
+				dst[id] = struct{}{}
+			}
+			merged.varAllocHistory[k] = dst
+		}
+		for k, set := range b.varAllocHistory {
+			dst, ok := merged.varAllocHistory[k]
+			if !ok {
+				dst = make(map[string]struct{}, len(set))
+				merged.varAllocHistory[k] = dst
+			}
+			for id := range set {
+				dst[id] = struct{}{}
+			}
+		}
+
+		merged.varDesiredItemFP = make(map[string]string, len(a.varDesiredItemFP)+len(b.varDesiredItemFP))
+		for k, fp := range a.varDesiredItemFP {
+			merged.varDesiredItemFP[k] = fp
+		}
+		// Prefer non-empty FP when disagree
+		for k, fp := range b.varDesiredItemFP {
+			if old, ok := merged.varDesiredItemFP[k]; !ok || old == "" {
+				merged.varDesiredItemFP[k] = fp
+			}
+		}
+
+		// Merge allocDesiredFP (different-accum branch - create new merged map)
+		merged.allocDesiredFP = make(map[string]string, len(a.allocDesiredFP)+len(b.allocDesiredFP))
+		for id, fp := range a.allocDesiredFP {
+			merged.allocDesiredFP[id] = fp
+		}
+		for id, fp := range b.allocDesiredFP {
+			if _, ok := merged.allocDesiredFP[id]; !ok {
+				merged.allocDesiredFP[id] = fp
+			}
+		}
+
+		// Merge schemaFPIntent (pointer-level intent)
+		merged.schemaFPIntent = make(map[*oas3.Schema]string, len(a.schemaFPIntent)+len(b.schemaFPIntent))
+		for ptr, fp := range a.schemaFPIntent {
+			merged.schemaFPIntent[ptr] = fp
+		}
+		for ptr, fp := range b.schemaFPIntent {
+			if _, ok := merged.schemaFPIntent[ptr]; !ok {
+				merged.schemaFPIntent[ptr] = fp
+			}
+		}
+
+		// Join stack values
+		for i := range a.stack {
+			merged.stack[i] = SValue{Schema: joinTwoSchemas(a.stack[i].Schema, b.stack[i].Schema)}
+		}
+
+		// Join scopes
+		for i := range a.scopes {
+			mergedScope := make(map[string]*oas3.Schema)
+			aScope := a.scopes[i]
+			bScope := b.scopes[i]
+
+			allKeys := make(map[string]bool)
+			for k := range aScope {
+				allKeys[k] = true
+			}
+			for k := range bScope {
+				allKeys[k] = true
+			}
+
+			for k := range allKeys {
+				aVal, aHas := aScope[k]
+				bVal, bHas := bScope[k]
+
+				// DEBUG: Log merging of map accumulator variables (added "[44 0]", "[9 1]", "[10 0]")
+				if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" || k == "[9 1]" || k == "[10 0]" {
+					aEmpty := getType(aVal) == "array" && aVal.MaxItems != nil && *aVal.MaxItems == 0
+					bEmpty := getType(bVal) == "array" && bVal.MaxItems != nil && *bVal.MaxItems == 0
+					fmt.Printf("DEBUG scope-merge: var=%s aHas=%v bHas=%v aType=%s bType=%s aEmpty=%v bEmpty=%v\n",
+						k, aHas, bHas, getType(aVal), getType(bVal), aEmpty, bEmpty)
+				}
+
+				if aHas && bHas {
+					// CRITICAL FIX: Preserve canonical pointer for arrays in scope
+					// This is symmetric to the stack preservation logic above
+					if getType(aVal) == "array" && getType(bVal) == "array" {
+						aAlloc, aTagged := a.schemaToAlloc[aVal]
+						bAlloc, bTagged := b.schemaToAlloc[bVal]
+
+						// Theory 10: Cross-state DSU union - if both tagged and same origin, union them
+						if aTagged && bTagged {
+							oa := a.allocOrigin[aAlloc]
+							ob := b.allocOrigin[bAlloc]
+							if oa != nil && ob != nil && oa.PC == ob.PC && oa.Context == ob.Context {
+								// Same origin => union classes
+								fmt.Printf("TRACE DSU joinState(diff-accum): var=%s union %s with %s (same origin PC=%d, ctx=%s)\n",
+									k, aAlloc, bAlloc, oa.PC, oa.Context)
+								a.dsu.Union(aAlloc, bAlloc)
+								root := a.dsu.Find(aAlloc)
+
+								// Merge canonical arrays and bind canonical to merged scope
+								joined := joinTwoSchemas(aVal, bVal)
+								if joined != nil {
+									merged.accum[root] = joined
+									merged.schemaToAlloc[joined] = root
+									mergedScope[k] = joined
+									fmt.Printf("TRACE DSU joinState(diff-accum): merged to root=%s\n", root)
+								}
+
+								// Lattice-join cardinality under root
+								var c1, c2 *ArrayCardinality
+								if a.allocCardinality != nil {
+									c1 = a.allocCardinality[aAlloc]
+								}
+								if b.allocCardinality != nil {
+									c2 = b.allocCardinality[bAlloc]
+								}
+								var joinedCard *ArrayCardinality
+								switch {
+								case c1 == nil:
+									joinedCard = c2
+								case c2 == nil:
+									joinedCard = c1
+								default:
+									joinedCard = c1.Join(c2)
+								}
+								if joinedCard != nil {
+									merged.allocCardinality[root] = joinedCard
+									if joinedCard.MinItems != nil {
+										fmt.Printf("TRACE DSU joinState(diff-accum): cardinality root=%s MinItems=%d\n",
+											root, *joinedCard.MinItems)
+									}
+								}
+
+								// Alias old IDs to the root's canonical for robustness
+								merged.accum[aAlloc] = joined
+								merged.accum[bAlloc] = joined
+
+								// We handled this var binding; continue to next key
+								continue
+							}
+						}
+
+						isEmpty := func(s *oas3.Schema) bool {
+							return s != nil && getType(s) == "array" && s.MaxItems != nil && *s.MaxItems == 0
+						}
+
+						// DEBUG: Check isEmpty for tracked vars
+						if k == "[9 1]" || k == "[10 0]" || k == "[10 2]" {
+							fmt.Printf("DEBUG scope-merge (diff-accum): var=%s isEmpty(a)=%v isEmpty(b)=%v\n", k, isEmpty(aVal), isEmpty(bVal))
+						}
+
+						// Prefer non-empty over empty, regardless of tagging
+						// This prevents empty arrays from clobbering real data during merges
+						if isEmpty(aVal) && !isEmpty(bVal) {
+							mergedScope[k] = bVal
+							// Also update accumulator canonical if bVal is tagged
+							if bTagged {
+								mergedAccum[bAlloc] = bVal
+							}
+							fmt.Printf("DEBUG scope-merge (diff-accum): var=%s preferring non-empty b over empty a (bTagged=%v, bAlloc=%s)\n", k, bTagged, bAlloc)
+							continue
+						}
+						if isEmpty(bVal) && !isEmpty(aVal) {
+							mergedScope[k] = aVal
+							// Also update accumulator canonical if aVal is tagged
+							if aTagged {
+								mergedAccum[aAlloc] = aVal
+							}
+							fmt.Printf("DEBUG scope-merge (diff-accum): var=%s preferring non-empty a over empty b (aTagged=%v, aAlloc=%s)\n", k, aTagged, aAlloc)
+							continue
+						}
+
+						// Case 1: Both tagged with same allocID - use canonical
+						if aTagged && bTagged && aAlloc == bAlloc {
+							if canonical, ok := merged.accum[aAlloc]; ok {
+								if _, tagged := merged.schemaToAlloc[canonical]; !tagged {
+									merged.schemaToAlloc[canonical] = aAlloc
+								}
+								mergedScope[k] = canonical
+								// Alias both IDs to canonical (defensive)
+								if aTagged {
+									merged.accum[aAlloc] = canonical
+								}
+								if bTagged {
+									merged.accum[bAlloc] = canonical
+								}
+								if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" {
+									fmt.Printf("DEBUG scope-merge Case1: var=%s aAlloc=%s bAlloc=%s → canonical\n", k, aAlloc, bAlloc)
+								}
+								continue
+							}
+						}
+
+						// Case 2: One tagged canonical, other empty - prefer canonical
+						if aTagged && isEmpty(bVal) {
+							if canonical, ok := merged.accum[aAlloc]; ok {
+								if _, tagged := merged.schemaToAlloc[canonical]; !tagged {
+									merged.schemaToAlloc[canonical] = aAlloc
+								}
+								mergedScope[k] = canonical
+								// Alias both IDs to canonical
+								merged.accum[aAlloc] = canonical
+								if bTagged {
+									merged.accum[bAlloc] = canonical
+								}
+								if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" {
+									fmt.Printf("DEBUG scope-merge Case2a: var=%s aAlloc=%s bAlloc=%s → canonical from a\n", k, aAlloc, bAlloc)
+								}
+								continue
+							}
+						}
+						if bTagged && isEmpty(aVal) {
+							if canonical, ok := merged.accum[bAlloc]; ok {
+								if _, tagged := merged.schemaToAlloc[canonical]; !tagged {
+									merged.schemaToAlloc[canonical] = bAlloc
+								}
+								mergedScope[k] = canonical
+								// Alias both IDs to canonical
+								merged.accum[bAlloc] = canonical
+								if aTagged {
+									merged.accum[aAlloc] = canonical
+								}
+								if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" {
+									fmt.Printf("DEBUG scope-merge Case2b: var=%s aAlloc=%s bAlloc=%s → canonical from b\n", k, aAlloc, bAlloc)
+								}
+								continue
+							}
+						}
+
+						// Case 3: Join arrays and tag the result
+						joined := joinTwoSchemas(aVal, bVal)
+						if getType(joined) == "array" {
+							if _, tagged := merged.schemaToAlloc[joined]; !tagged {
+								*merged.allocCounter++
+								id := fmt.Sprintf("alloc%d", *merged.allocCounter)
+								merged.accum[id] = joined
+								merged.schemaToAlloc[joined] = id
+								// Propagate alloc intent from sources to new joined alloc
+								propagated := false
+								if aTagged {
+									if fp, ok := merged.allocDesiredFP[aAlloc]; ok && fp != "" {
+										merged.allocDesiredFP[id] = fp
+										propagated = true
+									}
+								}
+								if bTagged && !propagated {
+									if fp, ok := merged.allocDesiredFP[bAlloc]; ok && fp != "" {
+										merged.allocDesiredFP[id] = fp
+										propagated = true
+									}
+								}
+								if propagated {
+									fmt.Printf("DEBUG Case3 (diff-accum): propagated intent to new alloc %s for var=%s\n", id, k)
+								}
+							}
+							// Propagate pointer-intent to the joined pointer
+							if merged.schemaFPIntent == nil {
+								merged.schemaFPIntent = make(map[*oas3.Schema]string)
+							}
+							if fp, ok := a.schemaFPIntent[aVal]; ok && fp != "" {
+								merged.schemaFPIntent[joined] = fp
+							} else if fp, ok := b.schemaFPIntent[bVal]; ok && fp != "" {
+								merged.schemaFPIntent[joined] = fp
+							} else if aTagged {
+								// Fallback to alloc-intent
+								if fp, ok := merged.allocDesiredFP[aAlloc]; ok && fp != "" {
+									merged.schemaFPIntent[joined] = fp
+								}
+							} else if bTagged {
+								if fp, ok := merged.allocDesiredFP[bAlloc]; ok && fp != "" {
+									merged.schemaFPIntent[joined] = fp
+								}
+							}
+						}
+						mergedScope[k] = joined
+						// Alias both original IDs to the new joined canonical
+						if aTagged {
+							merged.accum[aAlloc] = joined
+						}
+						if bTagged {
+							merged.accum[bAlloc] = joined
+						}
+						if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" {
+							joinedEmpty := joined.MaxItems != nil && *joined.MaxItems == 0
+							joinedHasItems := joined.Items != nil && joined.Items.Left != nil
+							fmt.Printf("DEBUG scope-merge Case3: var=%s aAlloc=%s bAlloc=%s → joined (empty=%v, hasItems=%v)\n",
+								k, aAlloc, bAlloc, joinedEmpty, joinedHasItems)
+						}
+						continue
+					}
+
+					// Non-array or only one side array: default join
+					mergedScope[k] = joinTwoSchemas(aVal, bVal)
+				} else if aHas {
+					mergedScope[k] = aVal
+				} else {
+					mergedScope[k] = bVal
+				}
+			}
+
+			merged.scopes[i] = mergedScope
+		}
+
+		return merged
+	}
+
+	// States have same accum map - normal join
 	merged := &execState{
 		pc:        a.pc,
 		stack:     make([]SValue, len(a.stack)),
@@ -2259,11 +4102,103 @@ func joinState(a, b *execState) *execState {
 		accum:         a.accum,
 		schemaToAlloc: a.schemaToAlloc,
 		allocCounter:  a.allocCounter,
+		// Theory 10: Hybrid Origin-Lattice (SHARED since accum is same)
+		allocOrigin:      a.allocOrigin,
+		allocCardinality: a.allocCardinality,
+		dsu:              a.dsu,
+	}
+
+	// Merge var history and intent (same-accum branch)
+	merged.varAllocHistory = make(map[string]map[string]struct{}, len(a.varAllocHistory)+len(b.varAllocHistory))
+	for k, set := range a.varAllocHistory {
+		dst := make(map[string]struct{}, len(set))
+		for id := range set {
+			dst[id] = struct{}{}
+		}
+		merged.varAllocHistory[k] = dst
+	}
+	for k, set := range b.varAllocHistory {
+		dst, ok := merged.varAllocHistory[k]
+		if !ok {
+			dst = make(map[string]struct{}, len(set))
+			merged.varAllocHistory[k] = dst
+		}
+		for id := range set {
+			dst[id] = struct{}{}
+		}
+	}
+
+	merged.varDesiredItemFP = make(map[string]string, len(a.varDesiredItemFP)+len(b.varDesiredItemFP))
+	for k, fp := range a.varDesiredItemFP {
+		merged.varDesiredItemFP[k] = fp
+	}
+	// Prefer non-empty FP when disagree
+	for k, fp := range b.varDesiredItemFP {
+		if old, ok := merged.varDesiredItemFP[k]; !ok || old == "" {
+			merged.varDesiredItemFP[k] = fp
+		}
+	}
+
+	// allocDesiredFP is SHARED when accum is shared - use a's map and merge b's entries
+	merged.allocDesiredFP = a.allocDesiredFP
+	if merged.allocDesiredFP == nil {
+		merged.allocDesiredFP = make(map[string]string)
+	}
+	// Merge in b's entries (mutates shared map)
+	for id, fp := range b.allocDesiredFP {
+		if _, ok := merged.allocDesiredFP[id]; !ok {
+			merged.allocDesiredFP[id] = fp
+		}
+	}
+
+	// Merge schemaFPIntent (pointer-level intent, same-accum branch)
+	merged.schemaFPIntent = make(map[*oas3.Schema]string, len(a.schemaFPIntent)+len(b.schemaFPIntent))
+	for ptr, fp := range a.schemaFPIntent {
+		merged.schemaFPIntent[ptr] = fp
+	}
+	for ptr, fp := range b.schemaFPIntent {
+		if _, ok := merged.schemaFPIntent[ptr]; !ok {
+			merged.schemaFPIntent[ptr] = fp
+		}
+	}
+
+	// CRITICAL FIX: Merge schemaToAlloc even when accum maps are "same"
+	// This ensures tags from both states are preserved
+	for ptr, id := range b.schemaToAlloc {
+		if _, ok := merged.schemaToAlloc[ptr]; !ok {
+			merged.schemaToAlloc[ptr] = id
+		}
 	}
 
 	// Join stack values
 	for i := range a.stack {
-		merged.stack[i] = SValue{Schema: joinTwoSchemas(a.stack[i].Schema, b.stack[i].Schema)}
+		aSchema := a.stack[i].Schema
+		bSchema := b.stack[i].Schema
+
+		// CRITICAL FIX: Preserve pointer identity for accumulator arrays
+		// If both sides are arrays with the same allocID, use the canonical from merged.accum
+		// instead of creating a new union. This prevents losing the tag.
+		if getType(aSchema) == "array" && getType(bSchema) == "array" {
+			aAlloc, aTagged := a.schemaToAlloc[aSchema]
+			bAlloc, bTagged := b.schemaToAlloc[bSchema]
+			if aTagged && bTagged && aAlloc == bAlloc {
+				// Both refer to the same accumulator - use the canonical
+				if canonical, exists := merged.accum[aAlloc]; exists {
+					// Verify the canonical is tagged in merged.schemaToAlloc
+					if taggedAlloc, isTagged := merged.schemaToAlloc[canonical]; isTagged {
+						fmt.Printf("DEBUG joinState: preserving canonical ptr for allocID=%s (stack pos %d), canonical IS tagged as %s\n", aAlloc, i, taggedAlloc)
+					} else {
+						fmt.Printf("DEBUG joinState: preserving canonical ptr for allocID=%s (stack pos %d), canonical NOT TAGGED! Re-tagging now.\n", aAlloc, i)
+						merged.schemaToAlloc[canonical] = aAlloc
+					}
+					merged.stack[i] = SValue{Schema: canonical}
+					continue
+				}
+			}
+		}
+
+		// Default: join via union
+		merged.stack[i] = SValue{Schema: joinTwoSchemas(aSchema, bSchema)}
 	}
 
 	// Join scopes (union keys, join shared values)
@@ -2286,8 +4221,209 @@ func joinState(a, b *execState) *execState {
 			aVal, aHas := aScope[k]
 			bVal, bHas := bScope[k]
 
+			// DEBUG: Log merging of map accumulator variables (added "[44 0]", "[9 1]", "[10 0]")
+			if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" || k == "[9 1]" || k == "[10 0]" {
+				aEmpty := getType(aVal) == "array" && aVal.MaxItems != nil && *aVal.MaxItems == 0
+				bEmpty := getType(bVal) == "array" && bVal.MaxItems != nil && *bVal.MaxItems == 0
+				fmt.Printf("DEBUG scope-merge (same-accum): var=%s aHas=%v bHas=%v aType=%s bType=%s aEmpty=%v bEmpty=%v\n",
+					k, aHas, bHas, getType(aVal), getType(bVal), aEmpty, bEmpty)
+			}
+
 			if aHas && bHas {
-				// Both have it: join
+				// CRITICAL FIX: Preserve canonical pointer for arrays in scope (same-accum branch)
+				if getType(aVal) == "array" && getType(bVal) == "array" {
+					aAlloc, aTagged := a.schemaToAlloc[aVal]
+					bAlloc, bTagged := b.schemaToAlloc[bVal]
+
+					// Theory 10: Cross-state DSU union - if both tagged and same origin, union them
+					if aTagged && bTagged {
+						oa := a.allocOrigin[aAlloc]
+						ob := b.allocOrigin[bAlloc]
+						if oa != nil && ob != nil && oa.PC == ob.PC && oa.Context == ob.Context {
+							// Same origin => union classes
+							fmt.Printf("TRACE DSU joinState(same-accum): var=%s union %s with %s (same origin PC=%d, ctx=%s)\n",
+								k, aAlloc, bAlloc, oa.PC, oa.Context)
+							a.dsu.Union(aAlloc, bAlloc)
+							root := a.dsu.Find(aAlloc)
+
+							// Merge canonical arrays and bind canonical to merged scope
+							joined := joinTwoSchemas(aVal, bVal)
+							if joined != nil {
+								merged.accum[root] = joined
+								merged.schemaToAlloc[joined] = root
+								mergedScope[k] = joined
+								fmt.Printf("TRACE DSU joinState(same-accum): merged to root=%s\n", root)
+							}
+
+							// Lattice-join cardinality under root
+							var c1, c2 *ArrayCardinality
+							if a.allocCardinality != nil {
+								c1 = a.allocCardinality[aAlloc]
+							}
+							if b.allocCardinality != nil {
+								c2 = b.allocCardinality[bAlloc]
+							}
+							var joinedCard *ArrayCardinality
+							switch {
+							case c1 == nil:
+								joinedCard = c2
+							case c2 == nil:
+								joinedCard = c1
+							default:
+								joinedCard = c1.Join(c2)
+							}
+							if joinedCard != nil {
+								merged.allocCardinality[root] = joinedCard
+								if joinedCard.MinItems != nil {
+									fmt.Printf("TRACE DSU joinState(same-accum): cardinality root=%s MinItems=%d\n",
+										root, *joinedCard.MinItems)
+								}
+							}
+
+							// Alias old IDs to the root's canonical for robustness
+							merged.accum[aAlloc] = joined
+							merged.accum[bAlloc] = joined
+
+							// We handled this var binding; continue to next key
+							continue
+						}
+					}
+
+					isEmpty := func(s *oas3.Schema) bool {
+						return s != nil && getType(s) == "array" && s.MaxItems != nil && *s.MaxItems == 0
+					}
+
+					// DEBUG: Check isEmpty for tracked vars
+					if k == "[9 1]" || k == "[10 0]" || k == "[10 2]" {
+						fmt.Printf("DEBUG scope-merge: var=%s isEmpty(a)=%v isEmpty(b)=%v\n", k, isEmpty(aVal), isEmpty(bVal))
+					}
+
+					// Prefer non-empty over empty, regardless of tagging
+					// This prevents empty arrays from clobbering real data during merges
+					if isEmpty(aVal) && !isEmpty(bVal) {
+						mergedScope[k] = bVal
+						// Also update accumulator canonical if bVal is tagged
+						if bTagged {
+							merged.accum[bAlloc] = bVal
+						}
+						fmt.Printf("DEBUG scope-merge (same-accum): var=%s preferring non-empty b over empty a (bTagged=%v, bAlloc=%s)\n", k, bTagged, bAlloc)
+						continue
+					}
+					if isEmpty(bVal) && !isEmpty(aVal) {
+						mergedScope[k] = aVal
+						// Also update accumulator canonical if aVal is tagged
+						if aTagged {
+							merged.accum[aAlloc] = aVal
+						}
+						fmt.Printf("DEBUG scope-merge (same-accum): var=%s preferring non-empty a over empty b (aTagged=%v, aAlloc=%s)\n", k, aTagged, aAlloc)
+						continue
+					}
+
+					// Case 1: Both tagged with same allocID - use canonical
+					if aTagged && bTagged && aAlloc == bAlloc {
+						if canonical, ok := merged.accum[aAlloc]; ok {
+							if _, tagged := merged.schemaToAlloc[canonical]; !tagged {
+								merged.schemaToAlloc[canonical] = aAlloc
+							}
+							mergedScope[k] = canonical
+							// Alias both IDs to canonical (defensive, already same ID)
+							if aTagged {
+								merged.accum[aAlloc] = canonical
+							}
+							if bTagged {
+								merged.accum[bAlloc] = canonical
+							}
+							continue
+						}
+					}
+
+					// Case 2: One tagged canonical, other empty - prefer canonical
+					if aTagged && isEmpty(bVal) {
+						if canonical, ok := merged.accum[aAlloc]; ok {
+							if _, tagged := merged.schemaToAlloc[canonical]; !tagged {
+								merged.schemaToAlloc[canonical] = aAlloc
+							}
+							mergedScope[k] = canonical
+							// Alias both IDs to canonical
+							merged.accum[aAlloc] = canonical
+							if bTagged {
+								merged.accum[bAlloc] = canonical
+							}
+							continue
+						}
+					}
+					if bTagged && isEmpty(aVal) {
+						if canonical, ok := merged.accum[bAlloc]; ok {
+							if _, tagged := merged.schemaToAlloc[canonical]; !tagged {
+								merged.schemaToAlloc[canonical] = bAlloc
+							}
+							mergedScope[k] = canonical
+							// Alias both IDs to canonical
+							merged.accum[bAlloc] = canonical
+							if aTagged {
+								merged.accum[aAlloc] = canonical
+							}
+							continue
+						}
+					}
+
+					// Case 3: Join arrays and tag the result
+					joined := joinTwoSchemas(aVal, bVal)
+					if getType(joined) == "array" {
+						if _, tagged := merged.schemaToAlloc[joined]; !tagged {
+							*merged.allocCounter++
+							id := fmt.Sprintf("alloc%d", *merged.allocCounter)
+							merged.accum[id] = joined
+							merged.schemaToAlloc[joined] = id
+							// Propagate alloc intent from sources to new joined alloc
+							propagated := false
+							if aTagged {
+								if fp, ok := merged.allocDesiredFP[aAlloc]; ok && fp != "" {
+									merged.allocDesiredFP[id] = fp
+									propagated = true
+								}
+							}
+							if bTagged && !propagated {
+								if fp, ok := merged.allocDesiredFP[bAlloc]; ok && fp != "" {
+									merged.allocDesiredFP[id] = fp
+									propagated = true
+								}
+							}
+							if propagated {
+								fmt.Printf("DEBUG Case3 (same-accum): propagated intent to new alloc %s for var=%s\n", id, k)
+							}
+							// Propagate pointer-intent to the joined pointer
+							if merged.schemaFPIntent == nil {
+								merged.schemaFPIntent = make(map[*oas3.Schema]string)
+							}
+							if fp, ok := a.schemaFPIntent[aVal]; ok && fp != "" {
+								merged.schemaFPIntent[joined] = fp
+							} else if fp, ok := b.schemaFPIntent[bVal]; ok && fp != "" {
+								merged.schemaFPIntent[joined] = fp
+							} else if aTagged {
+								// Fallback to alloc-intent
+								if fp, ok := merged.allocDesiredFP[aAlloc]; ok && fp != "" {
+									merged.schemaFPIntent[joined] = fp
+								}
+							} else if bTagged {
+								if fp, ok := merged.allocDesiredFP[bAlloc]; ok && fp != "" {
+									merged.schemaFPIntent[joined] = fp
+								}
+							}
+						}
+					}
+					mergedScope[k] = joined
+					// Alias both original IDs to the new joined canonical
+					if aTagged {
+						merged.accum[aAlloc] = joined
+					}
+					if bTagged {
+						merged.accum[bAlloc] = joined
+					}
+					continue
+				}
+
+				// Non-array or only one side array: default join
 				mergedScope[k] = joinTwoSchemas(aVal, bVal)
 			} else if aHas {
 				// Only a has it: keep a's value
@@ -2304,8 +4440,14 @@ func joinState(a, b *execState) *execState {
 	return merged
 }
 
+
 // joinTwoSchemas performs schema-level join (LUB) using Union.
 func joinTwoSchemas(a, b *oas3.Schema) *oas3.Schema {
+	// CRITICAL FIX: If pointers are identical, return immediately to preserve pointer identity
+	// This prevents unnecessary cloning and preserves tags in schemaToAlloc
+	if a == b {
+		return a
+	}
 	return Union([]*oas3.Schema{a, b}, SchemaExecOptions{})
 }
 

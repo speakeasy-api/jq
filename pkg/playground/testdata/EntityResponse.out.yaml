@@ -18,8 +18,13 @@ properties:
               type: string
             name:
               type: string
+          required:
+            - id
           type: object
+        minItems: 1
         type: array
+    required:
+      - result
     type: object
   id:
     type: string

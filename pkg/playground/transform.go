@@ -134,8 +134,50 @@ func transformSchema(schema *oas3.JSONSchema[oas3.Referenceable], location strin
 		return fmt.Errorf("symbolic execution produced no output schema")
 	}
 
+	// DEBUG: Check configs.items.properties.value BEFORE ensurePropertiesInitialized
+	if location == "root.components.schemas.ClusterLinkCreate" {
+		if props := result.Schema.Properties; props != nil {
+			if configsProp, ok := props.Get("configs"); ok && configsProp.Left != nil {
+				configs := configsProp.Left
+				if configs.Items != nil && configs.Items.Left != nil {
+					items := configs.Items.Left
+					if items.Properties != nil {
+						if valueProp, ok := items.Properties.Get("value"); ok {
+							fmt.Printf("DEBUG ClusterLinkCreate BEFORE ensureProps: value property = %+v\n", valueProp)
+							if valueProp.Left != nil {
+								fmt.Printf("DEBUG value.Left type fields: Type=%v, AnyOf=%v\n",
+									valueProp.Left.Type, len(valueProp.Left.AnyOf))
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Ensure all nested properties are properly initialized
 	ensurePropertiesInitialized(result.Schema)
+
+	// DEBUG: Check configs.items.properties.value AFTER ensurePropertiesInitialized
+	if location == "root.components.schemas.ClusterLinkCreate" {
+		if props := result.Schema.Properties; props != nil {
+			if configsProp, ok := props.Get("configs"); ok && configsProp.Left != nil {
+				configs := configsProp.Left
+				if configs.Items != nil && configs.Items.Left != nil {
+					items := configs.Items.Left
+					if items.Properties != nil {
+						if valueProp, ok := items.Properties.Get("value"); ok {
+							fmt.Printf("DEBUG ClusterLinkCreate AFTER ensureProps: value property = %+v\n", valueProp)
+							if valueProp.Left != nil {
+								fmt.Printf("DEBUG value.Left type fields: Type=%v, AnyOf=%v\n",
+									valueProp.Left.Type, len(valueProp.Left.AnyOf))
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 
 	// Preserve original extensions (including the transform extension so it's visible in output)
 	originalExtensions := schema.GetExtensions()

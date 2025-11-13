@@ -1,6 +1,8 @@
 package schemaexec
 
 import (
+	"fmt"
+
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 	"github.com/speakeasy-api/openapi/sequencedmap"
 	"gopkg.in/yaml.v3"
@@ -274,8 +276,16 @@ func setPathInSchema(schema *oas3.Schema, path []PathSegment, value *oas3.Schema
 
 // setSegment sets a value at a single segment
 func setSegment(schema *oas3.Schema, seg PathSegment, value *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	fmt.Printf("DEBUG setSegment: IsSymbolic=%v, Key type=%T, Key=%v\n", seg.IsSymbolic, seg.Key, seg.Key)
+
 	if seg.IsSymbolic {
-		// Can't set wildcard - would need to set all elements
+		// Dynamic object key: widen additionalProperties with the value
+		if getType(schema) == "object" {
+			fmt.Printf("DEBUG setSegment: symbolic segment on object, setting additionalProperties\n")
+			return setDynamicProperty(schema, value, opts)
+		}
+		// For arrays, still unclear how to set "all elements" symbolically; keep conservative behavior
+		fmt.Printf("DEBUG setSegment: symbolic segment on non-object (type=%s), returning unchanged\n", getType(schema))
 		return schema
 	}
 
@@ -285,18 +295,24 @@ func setSegment(schema *oas3.Schema, seg PathSegment, value *oas3.Schema, opts S
 	}
 
 	// Set array element (complex for symbolic execution)
+	fmt.Printf("DEBUG setSegment: non-string key, returning unchanged\n")
 	return schema
 }
 
 // setProperty sets or updates a property in an object schema
 func setProperty(schema *oas3.Schema, propName string, value *oas3.Schema) *oas3.Schema {
+	fmt.Printf("DEBUG setProperty: setting property '%s' (value type=%s) on schema type=%s\n",
+		propName, getType(value), getType(schema))
+
 	if schema == nil {
 		// Create new object with property
+		fmt.Printf("DEBUG setProperty: schema is nil, creating new object\n")
 		return BuildObject(map[string]*oas3.Schema{propName: value}, []string{propName})
 	}
 
 	if getType(schema) != "object" {
 		// Not an object - can't set property
+		fmt.Printf("DEBUG setProperty: schema is not an object (type=%s), returning unchanged\n", getType(schema))
 		return schema
 	}
 

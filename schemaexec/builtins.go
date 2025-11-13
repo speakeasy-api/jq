@@ -60,14 +60,15 @@ var builtinRegistry = map[string]builtinFunc{
 	// "and", "or", "not" expand to fork/jumpifnot patterns
 
 	// Arithmetic operations (binary)
-	"_plus":     builtinPlus,
+	// IMPORTANT: _plus and _add both map to builtinAddOp to get full jq "+" semantics.
+	"_plus":     builtinAddOp,
 	"_minus":    builtinMinus,
 	"_multiply": builtinMultiply,
 	"_divide":   builtinDivide,
 	"_modulo":   builtinModulo,
 	"_negate":   builtinNegate,
 	// Aliases that jq actually uses
-	"_add":      builtinPlus,
+	"_add":      builtinAddOp,
 	"_subtract": builtinMinus,
 
 	// Path operations
@@ -84,6 +85,7 @@ var builtinRegistry = map[string]builtinFunc{
 	"rtrimstr":       builtinRtrimstr,
 	"ascii_downcase": builtinASCIIDowncase,
 	"ascii_upcase":   builtinASCIIUpcase,
+	"gsub":           builtinGsub,
 
 	// Math operations
 	"floor": builtinFloor,
@@ -394,15 +396,65 @@ func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 		return []*oas3.Schema{Bottom()}, nil
 	}
 
+	// DEBUG: Log input object structure
+	if env.opts.EnableWarnings {
+		propCount := 0
+		if input.Properties != nil {
+			propCount = input.Properties.Len()
+		}
+		hasAP := input.AdditionalProperties != nil && input.AdditionalProperties.Left != nil
+		var apType string
+		if hasAP {
+			apType = getType(input.AdditionalProperties.Left)
+		}
+		inputPtr := fmt.Sprintf("%p", input)
+		fmt.Printf("DEBUG builtinToEntries: input ptr=%s, %d properties, additionalProperties=%v (type=%s)\n",
+			inputPtr, propCount, hasAP, apType)
+	}
+
 	// Create entry object schema: {key: string, value: <union of all values>}
 	valueSchema := unionAllObjectValues(input, env.opts)
+
+	// DEBUG: Log what unionAllObjectValues returned
+	if env.opts.EnableWarnings {
+		fmt.Printf("DEBUG builtinToEntries: unionAllObjectValues returned type=%s, unconstrained=%v\n",
+			getType(valueSchema), isUnconstrainedSchema(valueSchema))
+	}
+
+	// If unionAllObjectValues returned an unconstrained schema (Top), it means
+	// the object had no properties or additionalProperties defined (empty object {}).
+	// to_entries on an empty object produces an empty array (no entries).
+	if isUnconstrainedSchema(valueSchema) {
+		if env.opts.EnableWarnings {
+			fmt.Printf("DEBUG builtinToEntries: unconstrained object -> returning EMPTY array (maxItems=0)\n")
+		}
+		// Return empty array - no entries, so maxItems=0 and Items=nil
+		// Call ArrayType(nil) which creates an empty array
+		return []*oas3.Schema{ArrayType(nil)}, nil
+	}
+
+	if env.opts.EnableWarnings {
+		fmt.Printf("DEBUG builtinToEntries: valueSchema is constrained (type=%s), building entry object\n", getType(valueSchema))
+	}
 
 	entrySchema := BuildObject(map[string]*oas3.Schema{
 		"key":   StringType(),
 		"value": valueSchema,
 	}, []string{"key", "value"})
 
-	return []*oas3.Schema{ArrayType(entrySchema)}, nil
+	result := ArrayType(entrySchema)
+	if env.opts.EnableWarnings {
+		resultIsEmpty := result.MaxItems != nil && *result.MaxItems == 0
+		resultHasItems := result.Items != nil && result.Items.Left != nil
+		var itemType string
+		if resultHasItems {
+			itemType = getType(result.Items.Left)
+		}
+		fmt.Printf("DEBUG builtinToEntries: returning array - empty=%v, hasItems=%v, itemType=%s\n",
+			resultIsEmpty, resultHasItems, itemType)
+	}
+
+	return []*oas3.Schema{result}, nil
 }
 
 // builtinFromEntries converts [{key:"a", value:1}] to {a:1}
@@ -1134,7 +1186,28 @@ func builtinIndexOp(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 			elemType = Top()
 		}
 
-		// Return element type | null (null for out-of-bounds)
+		// Check if index is provably in-bounds
+		mustBePresent := false
+		if idxVal, ok := extractConstValue(indexArg); ok {
+			if idxFloat, ok := idxVal.(float64); ok {
+				idx := int(idxFloat)
+				if idx >= 0 {
+					// Check minItems constraint
+					if input.MinItems != nil && idx < int(*input.MinItems) {
+						mustBePresent = true
+					}
+					// Check prefixItems length (for tuple arrays)
+					if len(input.PrefixItems) > 0 && idx < len(input.PrefixItems) {
+						mustBePresent = true
+					}
+				}
+			}
+		}
+
+		// Return element type only if must be present, otherwise element type | null
+		if mustBePresent {
+			return []*oas3.Schema{elemType}, nil
+		}
 		return []*oas3.Schema{Union([]*oas3.Schema{elemType, ConstNull()}, env.opts)}, nil
 	}
 
@@ -1273,6 +1346,10 @@ func builtinGetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 
 // builtinSetpath implements setpath(path; value) - set value at path
 func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if env != nil && env.opts.EnableWarnings {
+		fmt.Printf("DEBUG builtinSetpath: CALLED with %d args\n", len(args))
+	}
+
 	if len(args) < 2 {
 		return []*oas3.Schema{input}, nil
 	}
@@ -1280,18 +1357,164 @@ func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 	pathArg := args[0]
 	valueArg := args[1]
 
+	// Early dynamic-string key detection for tuple paths: [ non-const string ]
+	if env != nil && env.opts.EnableWarnings && MightBeArray(pathArg) {
+		hasPrefixItems := pathArg.PrefixItems != nil
+		prefixLen := 0
+		if hasPrefixItems {
+			prefixLen = len(pathArg.PrefixItems)
+		}
+		fmt.Printf("DEBUG builtinSetpath: pathArg is array, hasPrefixItems=%v, prefixLen=%d\n", hasPrefixItems, prefixLen)
+	}
+
+	if MightBeObject(input) && MightBeArray(pathArg) && pathArg.PrefixItems != nil && len(pathArg.PrefixItems) == 1 {
+		if seg := pathArg.PrefixItems[0]; seg != nil && seg.Left != nil {
+			if env != nil && env.opts.EnableWarnings {
+				fmt.Printf("DEBUG builtinSetpath: checking seg.Left type=%s, MightBeString=%v\n", getType(seg.Left), MightBeString(seg.Left))
+			}
+			if MightBeString(seg.Left) {
+				constVal, isConst := extractConstString(seg.Left)
+				if env != nil && env.opts.EnableWarnings {
+					fmt.Printf("DEBUG builtinSetpath: extractConstString returned '%s', isConst=%v\n", constVal, isConst)
+				}
+				if !isConst {
+					if env != nil && env.opts.EnableWarnings {
+						fmt.Printf("DEBUG builtinSetpath: tuple[0] is non-const string -> dynamic key; updating additionalProperties\n")
+					}
+					return []*oas3.Schema{setDynamicProperty(input, valueArg, env.opts)}, nil
+				}
+			}
+		}
+	}
+
 	paths := extractPathsFromSchema(pathArg)
+	if env != nil && env.opts.EnableWarnings {
+		pathType := getType(pathArg)
+		fmt.Printf("DEBUG builtinSetpath: extracted %d paths from pathArg (type=%s)\n", len(paths), pathType)
+	}
+
 	if len(paths) == 0 {
+		// DEBUG: Log when setpath no-ops due to non-const path
+		if env != nil && env.opts.EnableWarnings {
+			fmt.Printf("DEBUG builtinSetpath: no const paths extracted, checking for wildcard case\n")
+		}
+
+		// HANDLE EMPTY-PATH SENTINEL: Some upstream builders collapse non-const segments to an "empty array" (maxItems=0).
+		// Treat this as a dynamic string-key update on objects so reduce .[] as $c ({}; .[$c.name] = $c.value) can proceed.
+		if MightBeArray(pathArg) && pathArg.MaxItems != nil && *pathArg.MaxItems == 0 && MightBeObject(input) {
+			if env != nil && env.opts.EnableWarnings {
+				fmt.Printf("DEBUG builtinSetpath: empty path tuple treated as dynamic string key; updating additionalProperties\n")
+				fmt.Printf("DEBUG builtinSetpath: calling setDynamicProperty now...\n")
+			}
+			result := setDynamicProperty(input, valueArg, env.opts)
+			if env != nil && env.opts.EnableWarnings {
+				fmt.Printf("DEBUG builtinSetpath: setDynamicProperty returned, hasAP=%v\n",
+					result.AdditionalProperties != nil && result.AdditionalProperties.Left != nil)
+			}
+			return []*oas3.Schema{result}, nil
+		}
+
+		// HANDLE WILDCARD CASE: If pathArg is an array with non-const string items,
+		// treat it as setting a dynamic object key by updating additionalProperties.
+		if MightBeArray(pathArg) && pathArg.Items != nil && pathArg.Items.Left != nil {
+			pathItems := pathArg.Items.Left
+			// Check if this is a path array with string-typed items
+			if MightBeString(pathItems) && MightBeObject(input) {
+				if env != nil && env.opts.EnableWarnings {
+					fmt.Printf("DEBUG builtinSetpath: detected wildcard string key pattern (non-empty), updating additionalProperties\n")
+				}
+				return []*oas3.Schema{setDynamicProperty(input, valueArg, env.opts)}, nil
+			}
+		}
+
+		// No paths and not a wildcard pattern - return input unchanged
 		return []*oas3.Schema{input}, nil
 	}
 
 	// Set value at path (only handle single path for now)
+	// Take a structural snapshot so we can detect no-op static application
+	beforeFP := schemaFingerprint(input)
 	result := input
 	for _, path := range paths {
 		result = setPathInSchema(result, path, valueArg, env.opts)
 	}
 
+	// Static set done; check if it actually changed anything
+	afterFP := schemaFingerprint(result)
+	if afterFP == beforeFP && MightBeObject(input) {
+		if env != nil && env.opts.EnableWarnings {
+			fmt.Printf("DEBUG builtinSetpath: static set had no effect; treating path as dynamic string key and updating additionalProperties\n")
+		}
+		return []*oas3.Schema{setDynamicProperty(input, valueArg, env.opts)}, nil
+	}
+
+	// Heuristic: single-string tuple into a "fresh" object is almost always a dynamic key (e.g., reduce .[] as $c ({}; .[$c.name] = $c.value))
+	// Check if INPUT was fresh (before static set), not result
+	if MightBeObject(input) && MightBeArray(pathArg) && pathArg.PrefixItems != nil && len(pathArg.PrefixItems) == 1 {
+		if seg := pathArg.PrefixItems[0]; seg != nil && seg.Left != nil && MightBeString(seg.Left) {
+			inputPropCount := 0
+			if input.Properties != nil {
+				inputPropCount = input.Properties.Len()
+			}
+			inputHasAP := input.AdditionalProperties != nil && input.AdditionalProperties.Left != nil
+
+			// Treat a fresh accumulator {} (no properties, no AP before static set) as dynamic-key target
+			if inputPropCount == 0 && !inputHasAP {
+				if env != nil && env.opts.EnableWarnings {
+					fmt.Printf("DEBUG builtinSetpath: widening additionalProperties for single-string path into fresh object; value type=%s\n", getType(valueArg))
+				}
+				// Preserve accumulator pointer identity for fresh objects
+				// This ensures the original accumulator pointer gets AP, not just the cloned result
+				widened := setDynamicProperty(input, valueArg, env.opts)
+				return []*oas3.Schema{widened}, nil
+			}
+		}
+	}
+
 	return []*oas3.Schema{result}, nil
+}
+
+// setDynamicProperty updates an object schema to allow setting properties with dynamic (non-const) keys.
+// This is used for patterns like .[$variable] = value where the key isn't known at compile time.
+// It updates additionalProperties to union with the new value type.
+func setDynamicProperty(obj *oas3.Schema, value *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	fmt.Printf("DEBUG setDynamicProperty: CALLED with value type=%s, obj type=%s\n", getType(value), getType(obj))
+
+	if obj == nil {
+		// No input object - create one with additionalProperties
+		fmt.Printf("DEBUG setDynamicProperty: creating new object with additionalProperties\n")
+		result := &oas3.Schema{
+			Type:                 oas3.NewTypeFromString(oas3.SchemaTypeObject),
+			AdditionalProperties: oas3.NewJSONSchemaFromSchema[oas3.Referenceable](value),
+		}
+		return result
+	}
+
+	// Prefer in-place update so reduce keeps the same accumulator pointer
+	// This ensures the reduce accumulator variable gets the AP update
+	result := obj
+	objPtr := fmt.Sprintf("%p", obj)
+	fmt.Printf("DEBUG setDynamicProperty: modifying IN-PLACE ptr=%s\n", objPtr)
+
+	// Get existing additionalProperties
+	var existingAP *oas3.Schema
+	if result.AdditionalProperties != nil && result.AdditionalProperties.Left != nil {
+		existingAP = result.AdditionalProperties.Left
+	}
+
+	// Union existing additionalProperties with new value type
+	var newAP *oas3.Schema
+	if existingAP != nil {
+		fmt.Printf("DEBUG setDynamicProperty: unioning existing AP (type=%s) with new value\n", getType(existingAP))
+		newAP = Union([]*oas3.Schema{existingAP, value}, opts)
+	} else {
+		fmt.Printf("DEBUG setDynamicProperty: no existing AP, using value directly\n")
+		newAP = value
+	}
+
+	result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newAP)
+	fmt.Printf("DEBUG setDynamicProperty: MUTATED IN-PLACE ptr=%s, now has AP type=%s\n", objPtr, getType(newAP))
+	return result
 }
 
 // ============================================================================
@@ -1428,13 +1651,22 @@ func compareSchemas(lhs, rhs *oas3.Schema, pred func(int) bool) ([]*oas3.Schema,
 	return []*oas3.Schema{BoolType()}, nil
 }
 
-// extractConstValue extracts a const value from a schema if it has enum with 1 value.
+// extractConstValue extracts a const value from a schema if it has enum with 1 value or a const field.
 func extractConstValue(schema *oas3.Schema) (any, bool) {
-	if schema == nil || schema.Enum == nil || len(schema.Enum) != 1 {
+	if schema == nil {
 		return nil, false
 	}
 
-	node := schema.Enum[0]
+	var node *yaml.Node
+
+	// Check for Const field first
+	if schema.Const != nil {
+		node = schema.Const
+	} else if schema.Enum != nil && len(schema.Enum) == 1 {
+		node = schema.Enum[0]
+	} else {
+		return nil, false
+	}
 	if node.Kind != yaml.ScalarNode {
 		return nil, false
 	}
@@ -1593,12 +1825,222 @@ func builtinPlus(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 	return []*oas3.Schema{Top()}, nil
 }
 
-// builtinMinus implements - for two values.
-func builtinMinus(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
+// ============================================================================
+// BUILTINADDOP - JQ "+" WITH PROPER UNION DISTRIBUTION
+// ============================================================================
+
+// builtinAddOp implements jq "+" for JSON Schema types with:
+// - Union distribution (anyOf/oneOf)
+// - Nullable distribution
+// - Null identity
+// - Proper object merge semantics using allOf
+func builtinAddOp(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	var lhs, rhs *oas3.Schema
+	if len(args) == 2 {
+		// Arity-2: Use args directly (compiler pushes them in order)
+		lhs, rhs = args[0], args[1]
+	} else if len(args) == 1 {
+		// Arity-1: jq uses input as lhs and args[0] as rhs
+		lhs, rhs = input, args[0]
+	} else {
+		// Degenerate: no args
 		return []*oas3.Schema{NumberType()}, nil
 	}
-	return arithmeticOp(input, args[0], func(a, b float64) float64 { return a - b })
+
+	opts := SchemaExecOptions{}
+	if env != nil {
+		opts = env.opts
+	}
+
+	result := addSchemasDistributed(lhs, rhs, opts)
+	return []*oas3.Schema{result}, nil
+}
+
+// AddSchemasForTest exposes "+" semantics for tests without requiring a VM env.
+func AddSchemasForTest(lhs, rhs *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	return addSchemasDistributed(lhs, rhs, opts)
+}
+
+// addSchemasDistributed performs full union/nullable distribution for "+", unions all pairwise results.
+func addSchemasDistributed(lhs, rhs *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	if lhs == nil && rhs == nil {
+		return Bottom()
+	}
+
+	// Expand both operands into alternatives:
+	// - anyOf and oneOf branches
+	// - Nullable expansion (nullable: true => {non-null, null})
+	altsL := explodeAlternatives(lhs)
+	altsR := explodeAlternatives(rhs)
+
+	if len(altsL) == 0 && len(altsR) == 0 {
+		return Bottom()
+	}
+	if len(altsL) == 0 {
+		altsL = []*oas3.Schema{Bottom()}
+	}
+	if len(altsR) == 0 {
+		altsR = []*oas3.Schema{Bottom()}
+	}
+
+	results := make([]*oas3.Schema, 0, len(altsL)*len(altsR))
+	for _, a := range altsL {
+		for _, b := range altsR {
+			p := plusPair(a, b, opts)
+			if p != nil {
+				results = append(results, p)
+			}
+		}
+	}
+
+	if len(results) == 0 {
+		return Bottom()
+	}
+	return Union(results, opts)
+}
+
+// explodeAlternatives flattens anyOf/oneOf and expands nullable into explicit null alternative.
+// Returns at least one alternative unless the input is nil, in which case returns empty.
+func explodeAlternatives(s *oas3.Schema) []*oas3.Schema {
+	if s == nil {
+		return nil
+	}
+
+	// Gather direct union branches if present
+	branches := make([]*oas3.Schema, 0, 4)
+	if len(s.AnyOf) > 0 {
+		for _, br := range s.AnyOf {
+			if br != nil && br.Left != nil {
+				branches = append(branches, br.Left)
+			}
+		}
+	} else if len(s.OneOf) > 0 {
+		for _, br := range s.OneOf {
+			if br != nil && br.Left != nil {
+				branches = append(branches, br.Left)
+			}
+		}
+	}
+
+	if len(branches) == 0 {
+		// No union wrapper; start with the schema itself
+		branches = []*oas3.Schema{s}
+	}
+
+	// For each branch, expand nullable into an explicit null alternative
+	alts := make([]*oas3.Schema, 0, len(branches)*2)
+	for _, br := range branches {
+		if br == nil {
+			continue
+		}
+		nullable := br.Nullable != nil && *br.Nullable
+		if nullable {
+			// non-null variant (clone without Nullable) and explicit null
+			nn := cloneSchema(br)
+			nn.Nullable = nil
+			alts = append(alts, nn, ConstNull())
+			continue
+		}
+		alts = append(alts, br)
+	}
+	return alts
+}
+
+// plusPair applies jq "+" to a single pair of non-union, possibly-const (and non-nullable) schemas.
+// Handles null identity and dispatch by type.
+// Returns a result schema (Top/Bottom permitted).
+func plusPair(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	// Null identity (handles explicit null branches)
+	if isNullSchema(a) && isNullSchema(b) {
+		return ConstNull()
+	}
+	if isNullSchema(a) {
+		return b
+	}
+	if isNullSchema(b) {
+		return a
+	}
+
+	// Type dispatch
+	lt := getType(a)
+	rt := getType(b)
+
+	// Numbers (integer | number)
+	if (lt == "number" || lt == "integer") && (rt == "number" || rt == "integer") {
+		return addNumericSchemas(a, b)
+	}
+
+	// Strings
+	if lt == "string" && rt == "string" {
+		return concatStringSchemas(a, b)
+	}
+
+	// Arrays
+	if lt == "array" && rt == "array" {
+		return concatArraySchemas(a, b, opts)
+	}
+
+	// Objects: use allOf merge semantics
+	if lt == "object" && rt == "object" {
+		return mergeObjectsForPlus(a, b)
+	}
+
+	// Mixed/incompatible: jq would error; abstract as Top
+	return Top()
+}
+
+// mergeObjectsForPlus implements object "+" semantics using allOf:
+// - Create allOf [a, b] and collapse it
+// - This correctly handles required properties based on what's actually constructed
+// - Example: `. + .` preserves original required set
+// - Example: `. + {id: "x"}` makes `id` required because it's explicitly constructed
+func mergeObjectsForPlus(a, b *oas3.Schema) *oas3.Schema {
+	if a == nil && b == nil {
+		return Bottom()
+	}
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+
+	// Use allOf to combine the schemas, then collapse
+	// This delegates to the existing MergeObjects logic which handles required correctly
+	return MergeObjects(a, b, SchemaExecOptions{})
+}
+
+// builtinMinus implements - for two values.
+func builtinMinus(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) < 1 {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+
+	var lhs, rhs *oas3.Schema
+	if len(args) == 2 {
+		// Some jq plans encode - as arity-2
+		lhs, rhs = pickBinaryOperands(input, args[0], args[1])
+	} else {
+		// Arity-1: jq uses lhs as input, rhs as arg[0]
+		lhs = input
+		rhs = args[0]
+	}
+
+	// Safety check
+	if lhs == nil || rhs == nil {
+		return []*oas3.Schema{NumberType()}, nil
+	}
+
+	lType := getType(lhs)
+	rType := getType(rhs)
+
+	// Array subtraction: remove all occurrences of elements in rhs from lhs
+	if lType == "array" && rType == "array" {
+		return []*oas3.Schema{subtractArraySchemas(lhs, rhs, env.opts)}, nil
+	}
+
+	// Numbers (default arithmetic operation)
+	return arithmeticOp(lhs, rhs, func(a, b float64) float64 { return a - b })
 }
 
 // builtinMultiply implements * for two values.
@@ -1742,9 +2184,59 @@ func addNumericSchemas(lhs, rhs *oas3.Schema) *oas3.Schema {
 
 // concatArraySchemas concatenates arrays by unioning all possible element schemas.
 func concatArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	// Check if both arrays are empty (MaxItems=0)
+	// Empty array + Empty array = Empty array
+	aIsEmpty := a != nil && a.MaxItems != nil && *a.MaxItems == 0
+	bIsEmpty := b != nil && b.MaxItems != nil && *b.MaxItems == 0
+
+	// DEBUG: Log when concatenating non-empty arrays
+	hasNonEmpty := (a != nil && !aIsEmpty) || (b != nil && !bIsEmpty)
+	if opts.EnableWarnings && hasNonEmpty {
+		aType := "nil"
+		if a != nil {
+			if aIsEmpty {
+				aType = "empty"
+			} else if a.Items != nil && a.Items.Left != nil {
+				itemType := getType(a.Items.Left)
+				if itemType == "object" {
+					aType = "array<object>"
+				} else {
+					aType = fmt.Sprintf("array<%s>", itemType)
+				}
+			} else {
+				aType = "array<any>"
+			}
+		}
+		bType := "nil"
+		if b != nil {
+			if bIsEmpty {
+				bType = "empty"
+			} else if b.Items != nil && b.Items.Left != nil {
+				itemType := getType(b.Items.Left)
+				if itemType == "object" {
+					bType = "array<object>"
+				} else {
+					bType = fmt.Sprintf("array<%s>", itemType)
+				}
+			} else {
+				bType = "array<any>"
+			}
+		}
+		fmt.Printf("DEBUG concatArraySchemas: %s + %s\n", aType, bType)
+	}
+
+	if aIsEmpty && bIsEmpty {
+		fmt.Printf("DEBUG concatArraySchemas: both empty, returning empty array\n")
+		return ArrayType(Bottom()) // Empty array
+	}
+
 	items := make([]*oas3.Schema, 0, 8)
 	collectArrayItemCandidates := func(arr *oas3.Schema) {
 		if arr == nil {
+			return
+		}
+		// Skip empty arrays - they contribute no items
+		if arr.MaxItems != nil && *arr.MaxItems == 0 {
 			return
 		}
 		if arr.PrefixItems != nil {
@@ -1774,7 +2266,66 @@ func concatArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema 
 	if mergedItems == nil {
 		mergedItems = Bottom()
 	}
-	return ArrayType(mergedItems)
+
+	result := ArrayType(mergedItems)
+
+	// DEBUG: Log the result with more details
+	if opts.EnableWarnings && hasNonEmpty {
+		resultIsEmpty := result.MaxItems != nil && *result.MaxItems == 0
+		resultHasItems := result.Items != nil && result.Items.Left != nil
+		var resultItemType string
+		var mergedItemsType string
+		if resultHasItems {
+			resultItemType = getType(result.Items.Left)
+		}
+		if mergedItems != nil {
+			mergedItemsType = getType(mergedItems)
+		} else {
+			mergedItemsType = "nil"
+		}
+		fmt.Printf("DEBUG concatArraySchemas: mergedItems type=%s, result: empty=%v, hasItems=%v, itemType=%s\n",
+			mergedItemsType, resultIsEmpty, resultHasItems, resultItemType)
+		if resultIsEmpty {
+			fmt.Printf("DEBUG concatArraySchemas: WARNING - produced empty array from non-empty inputs!\n")
+		}
+	}
+
+	return result
+}
+
+// subtractArraySchemas subtracts array b from array a (removes all occurrences of b's elements from a).
+// In jq, array subtraction removes all elements in the second array from the first.
+// Since we work with schemas (not concrete values), we return an array with the same item type as lhs,
+// as we cannot determine statically which elements will remain.
+func subtractArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	if a == nil {
+		return ArrayType(Bottom())
+	}
+
+	// For schema analysis: array subtraction returns an array with potentially the same item types as lhs
+	// We cannot narrow the type further without concrete values
+	var itemType *oas3.Schema
+	if a.Items != nil && a.Items.Left != nil {
+		itemType = a.Items.Left
+	} else if a.PrefixItems != nil && len(a.PrefixItems) > 0 {
+		// For tuples, union all item types
+		items := make([]*oas3.Schema, 0, len(a.PrefixItems))
+		for _, item := range a.PrefixItems {
+			if item.Left != nil {
+				items = append(items, item.Left)
+			}
+		}
+		if len(items) > 0 {
+			itemType = Union(items, opts)
+		}
+	}
+
+	if itemType == nil {
+		itemType = Top()
+	}
+
+	// Return array with same item type as lhs (conservative - we can't narrow without concrete values)
+	return ArrayType(itemType)
 }
 
 // concatStringSchemas concatenates strings with const folding.

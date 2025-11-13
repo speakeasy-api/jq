@@ -200,7 +200,7 @@ func TestGoldenSuite(t *testing.T) {
 			name:     "const_addition",
 			jq:       "5 + 3",
 			input:    Top(),
-			expected: ConstNumber(8),
+			expected: ConstInteger(8),
 		},
 		{
 			name:     "const_subtraction",

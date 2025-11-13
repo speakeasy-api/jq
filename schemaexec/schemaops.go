@@ -1,6 +1,8 @@
 package schemaexec
 
 import (
+	"fmt"
+	"runtime/debug"
 	"sort"
 	"strconv"
 
@@ -88,6 +90,101 @@ func ConstNull() *oas3.Schema {
 	}
 }
 
+// accessPropertyUnion performs union-aware property access with jq semantics:
+// - For oneOf/anyOf, evaluate each alternative and union the results
+// - For plain objects, return property schema ∪ null if the property is optional/may be absent
+// - For additionalProperties, return additionalProperties ∪ null
+func accessPropertyUnion(obj *oas3.Schema, name string, opts SchemaExecOptions) *oas3.Schema {
+	if obj == nil {
+		// Unreachable branch must not contribute a null to the union
+		return Bottom()
+	}
+	// If union (oneOf/anyOf), map over alternatives
+	alts := make([]*oas3.Schema, 0)
+	if len(obj.OneOf) > 0 {
+		for _, br := range obj.OneOf {
+			if br != nil && br.Left != nil {
+				alts = append(alts, br.Left)
+			}
+		}
+	} else if len(obj.AnyOf) > 0 {
+		for _, br := range obj.AnyOf {
+			if br != nil && br.Left != nil {
+				alts = append(alts, br.Left)
+			}
+		}
+	}
+	if len(alts) > 0 {
+		results := make([]*oas3.Schema, 0, len(alts))
+		for _, a := range alts {
+			results = append(results, getPropertyWithNull(a, name, opts))
+		}
+		return Union(results, opts)
+	}
+
+	// Plain object
+	return getPropertyWithNull(obj, name, opts)
+}
+
+// getPropertyWithNull returns property schema ∪ null for optional/maybe-absent properties.
+// - If property is declared and required: return its schema
+// - If declared optional: union with null
+// - If not declared but additionalProperties present: additionalProperties ∪ null
+// - Otherwise: null
+func getPropertyWithNull(obj *oas3.Schema, name string, opts SchemaExecOptions) *oas3.Schema {
+	if obj == nil {
+		// Unreachable path: no value produced, do not widen with null
+		return Bottom()
+	}
+	// Only apply to objects; for non-object types, jq property access on them will be widened elsewhere.
+	// Consider object shape (properties/additionalProperties) as objects even if 'type' is omitted
+	if getType(obj) != "object" && obj.Properties == nil && obj.AdditionalProperties == nil {
+		return ConstNull()
+	}
+
+	// Declared property?
+	if obj.Properties != nil {
+		if js, ok := obj.Properties.Get(name); ok && js != nil {
+			var prop *oas3.Schema
+			if p, ok := derefJSONSchema(newCollapseContext(), js); ok {
+				prop = p
+			} else {
+				prop = Top()
+			}
+			// Required?
+			if isRequired(obj.Required, name) {
+				return prop
+			}
+			return Union([]*oas3.Schema{prop, ConstNull()}, opts)
+		}
+	}
+
+	// AdditionalProperties?
+	if obj.AdditionalProperties != nil {
+		if ap, ok := derefJSONSchema(newCollapseContext(), obj.AdditionalProperties); ok {
+			return Union([]*oas3.Schema{ap, ConstNull()}, opts)
+		}
+		// If boolean flag present and false, property cannot exist → definitely null
+		if obj.AdditionalProperties.Right != nil && !*obj.AdditionalProperties.Right {
+			return ConstNull()
+		}
+		// additionalProperties: true (or unresolved ref) → could be any type or absent
+		return Union([]*oas3.Schema{Top(), ConstNull()}, opts)
+	}
+
+	// Not declared and no additionalProperties ⇒ definitely missing
+	return ConstNull()
+}
+
+func isRequired(req []string, name string) bool {
+	for _, r := range req {
+		if r == name {
+			return true
+		}
+	}
+	return false
+}
+
 // StringType creates a basic string schema (unconstrained).
 func StringType() *oas3.Schema {
 	return &oas3.Schema{
@@ -125,12 +222,24 @@ func NullType() *oas3.Schema {
 
 // ArrayType creates a basic array schema with the given items schema.
 func ArrayType(items *oas3.Schema) *oas3.Schema {
+	// Empty array: items is Bottom (nil)
+	// Follow the same convention as buildArrayFromLiteral:
+	// Set MaxItems=0 and leave Items unset (nil) to avoid invalid wrapper
+	if items == nil {
+		emptyArray := &oas3.Schema{
+			Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
+		}
+		maxItems := int64(0)
+		emptyArray.MaxItems = &maxItems
+		return emptyArray
+	}
+
+	// Non-empty array
 	schema := &oas3.Schema{
 		Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
 	}
-	// ALWAYS set Items field, even if items is nil (Bottom).
+	// Set Items field for non-empty arrays
 	// This allows us to distinguish:
-	// - ArrayType(Bottom()) → Items.Left = nil (empty array, 0 elements)
 	// - ArrayType(StringType()) → Items.Left = StringType() (array of strings)
 	// - Unconstrained array → Items = nil (Items field not set at all)
 	schema.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](items)
@@ -159,7 +268,7 @@ func GetProperty(obj *oas3.Schema, key string, opts SchemaExecOptions) *oas3.Sch
 	if obj.Properties != nil {
 		if propSchema, ok := obj.Properties.Get(key); ok {
 			// Dereference the property schema (handles both inline and $ref)
-			if schema, ok := derefJSONSchema(propSchema); ok {
+			if schema, ok := derefJSONSchema(newCollapseContext(), propSchema); ok {
 				return schema
 			}
 			// Unresolved reference - widen conservatively
@@ -169,7 +278,7 @@ func GetProperty(obj *oas3.Schema, key string, opts SchemaExecOptions) *oas3.Sch
 
 	// Check additionalProperties
 	if obj.AdditionalProperties != nil {
-		if schema, ok := derefJSONSchema(obj.AdditionalProperties); ok {
+		if schema, ok := derefJSONSchema(newCollapseContext(), obj.AdditionalProperties); ok {
 			return schema
 		}
 		// Unresolved reference in additionalProperties - widen conservatively
@@ -183,11 +292,142 @@ func GetProperty(obj *oas3.Schema, key string, opts SchemaExecOptions) *oas3.Sch
 // Union creates a schema that matches any of the input schemas (anyOf).
 // Implements proper flattening, deduplication, and widening when limits exceeded.
 func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
-	// Filter out nil/Bottom
+	// DEBUG: Track AdditionalProperties in input schemas
+	if opts.EnableWarnings {
+		apCount := 0
+		for i, s := range schemas {
+			if s != nil && getType(s) == "object" && s.AdditionalProperties != nil && s.AdditionalProperties.Left != nil {
+				apCount++
+				if i < 3 {
+					fmt.Printf("DEBUG Union: schema[%d] (ptr=%p) has AP.Left type=%s\n", i, s, getType(s.AdditionalProperties.Left))
+				}
+			}
+		}
+		if apCount > 0 {
+			fmt.Printf("DEBUG Union: %d/%d objects have AP.Left set\n", apCount, len(schemas))
+		}
+	}
+	// DEBUG: Track large unions and inspect configs property
+	if opts.EnableWarnings && len(schemas) > 100 {
+		fmt.Printf("DEBUG Union: processing %d input schemas\n", len(schemas))
+
+		// Count how many have configs property and what it looks like
+		objectCount := 0
+		configsEmptyCount := 0
+		configsNonEmptyCount := 0
+		configsMissingCount := 0
+
+		for _, s := range schemas {
+			if s != nil && getType(s) == "object" {
+				objectCount++
+				if s.Properties != nil {
+					if configsProp, ok := s.Properties.Get("configs"); ok && configsProp.GetLeft() != nil {
+						configs := configsProp.GetLeft()
+						if getType(configs) == "array" {
+							isEmpty := configs.MaxItems != nil && *configs.MaxItems == 0
+							if isEmpty {
+								configsEmptyCount++
+							} else {
+								configsNonEmptyCount++
+							}
+						}
+					} else {
+						configsMissingCount++
+					}
+				} else {
+					configsMissingCount++
+				}
+			}
+		}
+
+		if objectCount > 0 {
+			fmt.Printf("DEBUG Union: of %d objects, configs: %d empty, %d non-empty, %d missing\n",
+				objectCount, configsEmptyCount, configsNonEmptyCount, configsMissingCount)
+		}
+	}
+	// DEBUG: Trace Union calls on arrays to understand empty array handling
+	if opts.EnableWarnings && len(schemas) > 0 {
+		allArrays := true
+		hasArray := false
+		for _, s := range schemas {
+			if s != nil {
+				if getType(s) == "array" {
+					hasArray = true
+				} else {
+					allArrays = false
+				}
+			}
+		}
+		if hasArray && allArrays {
+			fmt.Printf("DEBUG Union: merging %d arrays\n", len(schemas))
+			for i, s := range schemas {
+				if s == nil {
+					fmt.Printf("  [%d] nil schema\n", i)
+				} else {
+					isEmpty := s.MaxItems != nil && *s.MaxItems == 0
+					hasItems := s.Items != nil && s.Items.Left != nil
+					var itemType string
+					if hasItems {
+						itemType = getType(s.Items.Left)
+					}
+					fmt.Printf("  [%d] array: empty=%v, hasItems=%v, itemType=%s\n", i, isEmpty, hasItems, itemType)
+				}
+			}
+		}
+	}
+
+	// First pass: filter out nil/Bottom
 	filtered := make([]*oas3.Schema, 0, len(schemas))
 	for _, s := range schemas {
 		if s != nil {
 			filtered = append(filtered, s)
+		}
+	}
+
+	if len(filtered) == 0 {
+		return Bottom()
+	}
+
+	// Second pass: if we have multiple schemas and some are empty arrays,
+	// filter out the empty arrays since they contribute nothing to the union
+	if len(filtered) > 1 {
+		hasNonEmptyArray := false
+		hasEmptyArray := false
+		for _, s := range filtered {
+			if getType(s) == "array" {
+				if s.MaxItems != nil && *s.MaxItems == 0 {
+					hasEmptyArray = true
+				} else {
+					hasNonEmptyArray = true
+				}
+			} else {
+				// Non-array schema, keep it
+				hasNonEmptyArray = true
+			}
+		}
+
+		// DEBUG: Show filtering decision
+		if opts.EnableWarnings && hasEmptyArray {
+			fmt.Printf("DEBUG Union: filtering decision - hasEmpty=%v, hasNonEmpty=%v, total=%d schemas\n",
+				hasEmptyArray, hasNonEmptyArray, len(filtered))
+		}
+
+		// Only filter out empty arrays if there are non-empty alternatives
+		if hasNonEmptyArray && hasEmptyArray {
+			nonEmpty := make([]*oas3.Schema, 0, len(filtered))
+			filteredCount := 0
+			for _, s := range filtered {
+				// Keep non-arrays and non-empty arrays
+				if getType(s) != "array" || s.MaxItems == nil || *s.MaxItems != 0 {
+					nonEmpty = append(nonEmpty, s)
+				} else {
+					filteredCount++
+				}
+			}
+			if opts.EnableWarnings {
+				fmt.Printf("DEBUG Union: filtered out %d empty arrays, keeping %d schemas\n", filteredCount, len(nonEmpty))
+			}
+			filtered = nonEmpty
 		}
 	}
 
@@ -213,14 +453,132 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		}
 	}
 
+	// DEBUG: Count configs arrays before dedup
+	if opts.EnableWarnings && len(schemas) > 100 {
+		emptyConfigsCount := 0
+		nonEmptyConfigsCount := 0
+		fingerprints := make(map[string]int) // Track unique fingerprints
+		for idx, s := range flattened {
+			if s != nil && getType(s) == "object" && s.Properties != nil {
+				if configsProp, ok := s.Properties.Get("configs"); ok && configsProp.GetLeft() != nil {
+					configs := configsProp.GetLeft()
+					if getType(configs) == "array" {
+						isEmpty := configs.MaxItems != nil && *configs.MaxItems == 0
+						hasItems := configs.Items != nil && configs.Items.Left != nil
+
+						// Get fingerprint for this configs array
+						fp := schemaFingerprint(configs)
+						fingerprints[fp]++
+
+						if isEmpty {
+							emptyConfigsCount++
+							if idx < 2 {
+								fmt.Printf("DEBUG Union: flattened[%d] EMPTY configs: fp=%s, hasItems=%v\n",
+									idx, fp[:16], hasItems)
+							}
+						} else {
+							nonEmptyConfigsCount++
+							if idx < 2 {
+								var itemType string
+								if hasItems {
+									itemType = getType(configs.Items.Left)
+								}
+								fmt.Printf("DEBUG Union: flattened[%d] NON-EMPTY configs: fp=%s, hasItems=%v, itemType=%s\n",
+									idx, fp[:16], hasItems, itemType)
+							}
+						}
+					}
+				}
+			}
+		}
+		if emptyConfigsCount > 0 || nonEmptyConfigsCount > 0 {
+			fmt.Printf("DEBUG Union: BEFORE dedup - empty configs: %d, non-empty configs: %d, unique fingerprints: %d\n",
+				emptyConfigsCount, nonEmptyConfigsCount, len(fingerprints))
+		}
+	}
+
 	// Deduplicate
 	deduped := deduplicateSchemas(flattened)
+
+	// DEBUG: Track deduplication and check configs arrays AFTER dedup
+	if opts.EnableWarnings && len(schemas) > 100 {
+		fmt.Printf("DEBUG Union: after dedup, have %d schemas (from %d flattened)\n", len(deduped), len(flattened))
+
+		emptyConfigsCount := 0
+		nonEmptyConfigsCount := 0
+		for idx, s := range deduped {
+			if s != nil && getType(s) == "object" && s.Properties != nil {
+				if configsProp, ok := s.Properties.Get("configs"); ok && configsProp.GetLeft() != nil {
+					configs := configsProp.GetLeft()
+					if getType(configs) == "array" {
+						isEmpty := configs.MaxItems != nil && *configs.MaxItems == 0
+						hasItems := configs.Items != nil && configs.Items.Left != nil
+						var itemType string
+						if hasItems {
+							itemType = getType(configs.Items.Left)
+						}
+						if isEmpty {
+							emptyConfigsCount++
+							if idx < 3 {
+								fmt.Printf("DEBUG Union: deduped[%d] has EMPTY configs (maxItems=0, hasItems=%v, itemType=%s)\n",
+									idx, hasItems, itemType)
+							}
+						} else {
+							nonEmptyConfigsCount++
+							if idx < 3 {
+								fmt.Printf("DEBUG Union: deduped[%d] has NON-EMPTY configs (maxItems=nil, hasItems=%v, itemType=%s)\n",
+									idx, hasItems, itemType)
+							}
+						}
+					}
+				}
+			}
+		}
+		if emptyConfigsCount > 0 || nonEmptyConfigsCount > 0 {
+			fmt.Printf("DEBUG Union: AFTER dedup - empty configs: %d, non-empty configs: %d\n",
+				emptyConfigsCount, nonEmptyConfigsCount)
+		}
+	}
+
+	// EARLY MERGE: preserve shape/AP info before subsumption removes specifics
+	// Try merging objects first to preserve AdditionalProperties
+	if merged := tryMergeObjects(deduped, opts); merged != nil {
+		if opts.EnableWarnings {
+			fmt.Printf("DEBUG Union: early object merge succeeded, returning merged object\n")
+		}
+		return merged
+	}
 
 	// Remove subsumed schemas (e.g., {type: number, enum: [0]} ⊆ {type: number})
 	collapsed := removeSubsumedSchemas(deduped)
 
+	// DEBUG: Track progression through Union stages
+	if opts.EnableWarnings && len(schemas) > 100 {
+		fmt.Printf("DEBUG Union: after collapse, have %d schemas (from %d initial)\n", len(collapsed), len(schemas))
+	}
+
 	// If only one unique schema after dedup and collapse, return it directly
 	if len(collapsed) == 1 {
+		// DEBUG: Show what the final collapsed schema looks like
+		if opts.EnableWarnings && len(schemas) > 100 {
+			finalSchema := collapsed[0]
+			fmt.Printf("DEBUG Union: collapsed to single schema of type=%s\n", getType(finalSchema))
+			if getType(finalSchema) == "object" && finalSchema.Properties != nil {
+				if configsProp, ok := finalSchema.Properties.Get("configs"); ok && configsProp.GetLeft() != nil {
+					configs := configsProp.GetLeft()
+					if getType(configs) == "array" {
+						isEmpty := configs.MaxItems != nil && *configs.MaxItems == 0
+						hasItems := configs.Items != nil && configs.Items.Left != nil
+						var itemType string
+						if hasItems {
+							itemType = getType(configs.Items.Left)
+						}
+						fmt.Printf("DEBUG Union: final 'configs' property: empty=%v, hasItems=%v, itemType=%s\n",
+							isEmpty, hasItems, itemType)
+					}
+				}
+			}
+		}
 		return collapsed[0]
 	}
 
@@ -261,6 +619,21 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 
 	// Check if we exceed the anyOf limit
 	if len(collapsed) > opts.AnyOfLimit {
+		if opts.EnableWarnings {
+			typeCounts := make(map[string]int)
+			for _, s := range collapsed {
+				t := getType(s)
+				if t == "" {
+					t = "untyped"
+				}
+				typeCounts[t]++
+			}
+			fmt.Printf("DEBUG Union: exceeding anyOf limit (%d > %d), widening. Types: ", len(collapsed), opts.AnyOfLimit)
+			for t, count := range typeCounts {
+				fmt.Printf("%s=%d ", t, count)
+			}
+			fmt.Printf("\n")
+		}
 		return widenUnion(collapsed, opts)
 	}
 
@@ -288,9 +661,30 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		anyOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](s)
 	}
 
-	return &oas3.Schema{
+	result := &oas3.Schema{
 		AnyOf: anyOf,
 	}
+
+	// DEBUG: Trace Union result for objects with 'value' property
+	if opts.EnableWarnings && len(anyOf) > 0 {
+		hasValueProp := false
+		for _, branch := range anyOf {
+			if branch.GetLeft() != nil {
+				s := branch.GetLeft()
+				if getType(s) == "object" && s.Properties != nil {
+					if _, ok := s.Properties.Get("value"); ok {
+						hasValueProp = true
+						break
+					}
+				}
+			}
+		}
+		if hasValueProp {
+			fmt.Printf("DEBUG Union: result is anyOf with %d branches (contains 'value' property)\n", len(anyOf))
+		}
+	}
+
+	return result
 }
 
 // tryMergeObjects attempts to merge multiple object schemas into a single object
@@ -315,6 +709,20 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 		return nil
 	}
 
+	// If every array is the exact same pointer, preserve pointer identity.
+	// This avoids creating a fresh, untagged array when a canonical one already exists.
+	samePtr := true
+	first := schemas[0]
+	for i := 1; i < len(schemas); i++ {
+		if schemas[i] != first {
+			samePtr = false
+			break
+		}
+	}
+	if samePtr {
+		return first
+	}
+
 	// Collect all item schemas
 	var itemSchemas []*oas3.Schema
 	for _, s := range schemas {
@@ -324,9 +732,15 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 	}
 
 	if len(itemSchemas) == 0 {
-		// All arrays have empty/nil items - return array with Bottom() items
-		// This represents "no specific item type" which is correct for merging empty arrays
-		return ArrayType(Bottom())
+		// All arrays have unknown/nil items - return an UNCONSTRAINED array, not an empty one
+		// ArrayType(Bottom()) would create maxItems=0 which means "provably empty"
+		// Instead, we want "array with unknown items" = plain array type with Items unset
+		if opts.EnableWarnings {
+			fmt.Printf("DEBUG tryMergeArrays: len(itemSchemas)==0, returning unconstrained array (not empty)\n")
+		}
+		return &oas3.Schema{
+			Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
+		}
 	}
 
 	// Union the item schemas
@@ -352,12 +766,58 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 		}
 	}
 
-	// All must have identical required sets (critical for correctness)
-	if !haveSameRequiredSets(schemas) {
-		return nil
+	// DEBUG: Track tryMergeObjects calls
+	if opts.EnableWarnings {
+		hasConfigs := false
+		for _, s := range schemas {
+			if s.Properties != nil {
+				if _, ok := s.Properties.Get("configs"); ok {
+					hasConfigs = true
+					break
+				}
+			}
+		}
+		if hasConfigs {
+			fmt.Printf("DEBUG tryMergeObjects: merging %d objects with 'configs' property\n", len(schemas))
+		}
 	}
 
-	// Collect all property names across all branches
+	// CRITICAL FIX: Instead of requiring identical required sets, compute the intersection
+	// A property is required in the merged schema only if it's required in ALL input schemas
+	// This correctly models conditional object construction in symbolic execution
+
+	// Calculate required set intersection (property required in ALL schemas)
+	var requiredIntersection []string
+	if len(schemas) > 0 {
+		// Start with first schema's required set
+		candidateRequired := make(map[string]bool)
+		for _, r := range schemas[0].Required {
+			candidateRequired[r] = true
+		}
+
+		// Intersect with all other schemas
+		for i := 1; i < len(schemas); i++ {
+			schemaRequired := make(map[string]bool)
+			for _, r := range schemas[i].Required {
+				schemaRequired[r] = true
+			}
+
+			// Keep only properties that are required in this schema too
+			for prop := range candidateRequired {
+				if !schemaRequired[prop] {
+					delete(candidateRequired, prop)
+				}
+			}
+		}
+
+		// Convert to slice
+		for prop := range candidateRequired {
+			requiredIntersection = append(requiredIntersection, prop)
+		}
+		sort.Strings(requiredIntersection)
+	}
+
+	// Collect all property names across all branches (property union)
 	allProps := make(map[string]bool)
 	for _, s := range schemas {
 		if s.Properties != nil {
@@ -381,21 +841,59 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 			}
 		}
 
+		// DEBUG: Track what's happening with "configs" property
+		if propName == "configs" && opts.EnableWarnings && len(propSchemas) > 0 {
+			fmt.Printf("DEBUG tryMergeObjects: merging 'configs' property from %d object schemas\n", len(propSchemas))
+			emptyCount := 0
+			nonEmptyCount := 0
+			for i, ps := range propSchemas {
+				if getType(ps) == "array" {
+					isEmpty := ps.MaxItems != nil && *ps.MaxItems == 0
+					hasItems := ps.Items != nil && ps.Items.Left != nil
+					var itemType string
+					if hasItems {
+						itemType = getType(ps.Items.Left)
+					}
+					if isEmpty {
+						emptyCount++
+					} else {
+						nonEmptyCount++
+					}
+					fmt.Printf("  [%d] array: empty=%v, hasItems=%v, itemType=%s\n", i, isEmpty, hasItems, itemType)
+				} else {
+					fmt.Printf("  [%d] not array: type=%s\n", i, getType(ps))
+				}
+			}
+			fmt.Printf("  Summary: %d empty, %d non-empty arrays\n", emptyCount, nonEmptyCount)
+		}
+
 		if len(propSchemas) > 0 {
 			// CRITICAL FIX: Filter out unconstrained/unknown schemas before Union to preserve precision
 			// When merging {id: {type: string}} with {id: {}}, keep {type: string}
 			// Empty schemas {} represent "unknown" and should not eliminate concrete schemas
 			filteredSchemas := make([]*oas3.Schema, 0, len(propSchemas))
 			hasConcreteSchema := false
+			unconstrainedCount := 0
 			for _, ps := range propSchemas {
 				if !isUnconstrainedSchema(ps) {
 					filteredSchemas = append(filteredSchemas, ps)
 					hasConcreteSchema = true
+				} else {
+					unconstrainedCount++
 				}
 			}
 			// If all are unconstrained, keep exactly one
 			if !hasConcreteSchema && len(propSchemas) > 0 {
 				filteredSchemas = []*oas3.Schema{propSchemas[0]}
+			}
+
+			// DEBUG: Log when we filter out unconstrained schemas for "value" property
+			if opts.EnableWarnings && propName == "value" && unconstrainedCount > 0 {
+				fmt.Printf("DEBUG tryMergeObjects: property=%s had %d schemas (%d unconstrained, %d concrete)\n",
+					propName, len(propSchemas), unconstrainedCount, len(filteredSchemas))
+				for i, ps := range propSchemas {
+					fmt.Printf("  [%d] type=%s, unconstrained=%v\n", i, getType(ps), isUnconstrainedSchema(ps))
+				}
 			}
 
 			// Recursively union the property schemas
@@ -405,16 +903,76 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 				unionSchema = unionSchema.AnyOf[0].GetLeft()
 			}
 			mergedProps[propName] = unionSchema
+
+			// DEBUG: Show final result for configs property
+			if propName == "configs" && opts.EnableWarnings {
+				if getType(unionSchema) == "array" {
+					isEmpty := unionSchema.MaxItems != nil && *unionSchema.MaxItems == 0
+					hasItems := unionSchema.Items != nil && unionSchema.Items.Left != nil
+					var itemType string
+					if hasItems {
+						itemType = getType(unionSchema.Items.Left)
+					}
+					fmt.Printf("DEBUG tryMergeObjects: 'configs' final result: empty=%v, hasItems=%v, itemType=%s\n",
+						isEmpty, hasItems, itemType)
+				} else {
+					fmt.Printf("DEBUG tryMergeObjects: 'configs' final result: type=%s (not array!)\n", getType(unionSchema))
+				}
+			}
+
+			// DEBUG: Log final schema for "value" property
+			if opts.EnableWarnings && propName == "value" {
+				fmt.Printf("DEBUG tryMergeObjects: property=%s final type=%s, unconstrained=%v\n",
+					propName, getType(unionSchema), isUnconstrainedSchema(unionSchema))
+			}
 		}
 	}
 
-	// Build merged object
-	required := []string{}
-	if len(schemas) > 0 && schemas[0].Required != nil {
-		required = schemas[0].Required
+	// Build merged object with intersected required set
+	result := BuildObject(mergedProps, requiredIntersection)
+
+	// Merge AdditionalProperties across branches
+	var apSchemas []*oas3.Schema
+	seenTrue := false
+	nilCount := 0
+	for _, s := range schemas {
+		if s.AdditionalProperties != nil {
+			if s.AdditionalProperties.Right != nil {
+				if *s.AdditionalProperties.Right {
+					seenTrue = true
+				}
+			}
+			if s.AdditionalProperties.Left != nil {
+				apSchemas = append(apSchemas, s.AdditionalProperties.Left)
+			}
+		} else {
+			nilCount++
+		}
+	}
+	if opts.EnableWarnings && (len(apSchemas) > 0 || seenTrue) {
+		fmt.Printf("DEBUG tryMergeObjects: AP merge - %d schemas, %d with AP.Left, seenTrue=%v, nilCount=%d\n",
+			len(schemas), len(apSchemas), seenTrue, nilCount)
+	}
+	switch {
+	case seenTrue:
+		// true dominates (most permissive)
+		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Top())
+	case len(apSchemas) > 0:
+		// Union schema APs
+		mergedAP := Union(apSchemas, opts)
+		if mergedAP == nil {
+			mergedAP = Top()
+		}
+		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](mergedAP)
+		if opts.EnableWarnings {
+			fmt.Printf("DEBUG tryMergeObjects: merged AP type=%s schemaCount=%d\n",
+				getType(mergedAP), len(apSchemas))
+		}
+	default:
+		// Leave nil (unknown) - includes seenFalse case
 	}
 
-	return BuildObject(mergedProps, required)
+	return result
 }
 
 // haveSameRequiredSets checks if all schemas have identical required sets
@@ -512,8 +1070,13 @@ func removeSubsumedSchemas(schemas []*oas3.Schema) []*oas3.Schema {
 		return schemas
 	}
 
+	// DEBUG: Track what's being removed
+	initialCount := len(schemas)
+	iteration := 0
+
 	changed := true
 	for changed {
+		iteration++
 		changed = false
 		n := len(schemas)
 		removed := make([]bool, n)
@@ -532,6 +1095,11 @@ func removeSubsumedSchemas(schemas []*oas3.Schema) []*oas3.Schema {
 				if isSubschemaOf(a, b) {
 					removed[i] = true
 					changed = true
+					// DEBUG: Show subsumption for objects
+					if n == initialCount && iteration == 1 && i < 3 {
+						fmt.Printf("DEBUG subsumption iter=%d: schema[%d] (type=%s) subsumed by schema[%d] (type=%s)\n",
+							iteration, i, getType(a), j, getType(b))
+					}
 					break
 				}
 
@@ -539,6 +1107,12 @@ func removeSubsumedSchemas(schemas []*oas3.Schema) []*oas3.Schema {
 				if isSubschemaOf(b, a) {
 					removed[j] = true
 					changed = true
+					// DEBUG: Show subsumption for objects with configs
+					if n == initialCount && getType(b) == "object" && b.Properties != nil {
+						if _, ok := b.Properties.Get("configs"); ok {
+							fmt.Printf("DEBUG subsumption iter=%d: schema[%d] subsumed by schema[%d]\n", iteration, j, i)
+						}
+					}
 				}
 			}
 		}
@@ -796,6 +1370,12 @@ func cloneSchema(s *oas3.Schema) *oas3.Schema {
 // BuildObject creates an object schema from property map.
 // Simplified version for Phase 1.
 func BuildObject(props map[string]*oas3.Schema, required []string) *oas3.Schema {
+	// DEBUG: Trace BuildObject calls with unconstrained 'value' property
+	if valProp, ok := props["value"]; ok && isUnconstrainedSchema(valProp) {
+		fmt.Printf("DEBUG BuildObject: building object with UNCONSTRAINED value property!\n")
+		fmt.Printf("  Stack trace: %s\n", string(debug.Stack()))
+	}
+
 	propMap := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
 	keysInOrder := make([]string, 0, len(props))
 	for k := range props {
@@ -1043,11 +1623,42 @@ func MergeObjects(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		}
 	}
 
-	return &oas3.Schema{
+	// Sort required array for deterministic output
+	sort.Strings(required)
+
+	result := &oas3.Schema{
 		Type:       oas3.NewTypeFromString(oas3.SchemaTypeObject),
 		Properties: propMap,
 		Required:   required,
 	}
+
+	// Merge AdditionalProperties
+	// true dominates (most permissive), then schemas are unioned, false is preserved if both forbid
+	switch {
+	case a.AdditionalProperties != nil && a.AdditionalProperties.Right != nil && *a.AdditionalProperties.Right:
+		// true on a dominates
+		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Top())
+	case b.AdditionalProperties != nil && b.AdditionalProperties.Right != nil && *b.AdditionalProperties.Right:
+		// true on b dominates
+		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Top())
+	default:
+		var apParts []*oas3.Schema
+		if a.AdditionalProperties != nil && a.AdditionalProperties.Left != nil {
+			apParts = append(apParts, a.AdditionalProperties.Left)
+		}
+		if b.AdditionalProperties != nil && b.AdditionalProperties.Left != nil {
+			apParts = append(apParts, b.AdditionalProperties.Left)
+		}
+		if len(apParts) > 0 {
+			result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Union(apParts, opts))
+		} else if (a.AdditionalProperties != nil && a.AdditionalProperties.Right != nil && !*a.AdditionalProperties.Right) ||
+			(b.AdditionalProperties != nil && b.AdditionalProperties.Right != nil && !*b.AdditionalProperties.Right) {
+			// preserve false if any side explicitly forbids
+			result.AdditionalProperties = oas3.NewJSONSchemaFromBool(false)
+		}
+	}
+
+	return result
 }
 
 // BuildArray creates an array schema from element schemas.
@@ -1364,6 +1975,40 @@ func stringConstraintsSubsumed(a, b *oas3.Schema) bool {
 
 // arrayConstraintsSubsumed checks if A's array constraints are stricter than or equal to B's
 func arrayConstraintsSubsumed(a, b *oas3.Schema) bool {
+	fmt.Printf("DEBUG arrayConstraintsSubsumed: CALLED\n")
+	// Special case: empty arrays (MaxItems=0) are not subsumed by non-empty arrays
+	// An empty array represents a specific constraint (must be empty), not a general array
+	aIsEmpty := a.MaxItems != nil && *a.MaxItems == 0
+	bIsEmpty := b.MaxItems != nil && *b.MaxItems == 0
+
+	// DEBUG: Log empty array checks
+	logArraySubsumption := aIsEmpty || bIsEmpty
+	if logArraySubsumption {
+		aHasItems := a.Items != nil && a.Items.Left != nil
+		bHasItems := b.Items != nil && b.Items.Left != nil
+		var aItemType, bItemType string
+		if aHasItems {
+			aItemType = getType(a.Items.Left)
+		}
+		if bHasItems {
+			bItemType = getType(b.Items.Left)
+		}
+		fmt.Printf("DEBUG arrayConstraintsSubsumed: aEmpty=%v (items=%v, itemType=%s), bEmpty=%v (items=%v, itemType=%s)\n",
+			aIsEmpty, aHasItems, aItemType, bIsEmpty, bHasItems, bItemType)
+	}
+
+	if aIsEmpty && !bIsEmpty {
+		// A is empty array, B is not - A is NOT subsumed by B
+		fmt.Printf("DEBUG arrayConstraintsSubsumed: returning FALSE (A empty, B not)\n")
+		return false
+	}
+	if !aIsEmpty && bIsEmpty {
+		// A is non-empty, B is empty - A is NOT subsumed by B
+		fmt.Printf("DEBUG arrayConstraintsSubsumed: returning FALSE (A not empty, B empty)\n")
+		return false
+	}
+	// If both empty or both non-empty, continue with normal checks
+
 	// Check minItems: A.min >= B.min
 	if b.MinItems != nil {
 		if a.MinItems == nil || *a.MinItems < *b.MinItems {
@@ -1421,6 +2066,17 @@ func arrayConstraintsSubsumed(a, b *oas3.Schema) bool {
 
 // objectConstraintsSubsumed checks if A's object constraints are stricter than or equal to B's
 func objectConstraintsSubsumed(a, b *oas3.Schema) bool {
+	// DEBUG: Track configs property comparisons
+	debugConfigs := false
+	if a.Properties != nil && b.Properties != nil {
+		if _, aHas := a.Properties.Get("configs"); aHas {
+			if _, bHas := b.Properties.Get("configs"); bHas {
+				debugConfigs = true
+				fmt.Printf("DEBUG objectConstraintsSubsumed: comparing objects with 'configs' property\n")
+			}
+		}
+	}
+
 	// Check required: B.required ⊆ A.required (B cannot require more than A)
 	for _, req := range b.Required {
 		found := false
@@ -1431,6 +2087,9 @@ func objectConstraintsSubsumed(a, b *oas3.Schema) bool {
 			}
 		}
 		if !found {
+			if debugConfigs {
+				fmt.Printf("DEBUG objectConstraintsSubsumed: B requires '%s' but A doesn't -> FALSE\n", req)
+			}
 			return false
 		}
 	}
@@ -1442,7 +2101,22 @@ func objectConstraintsSubsumed(a, b *oas3.Schema) bool {
 				if b.Properties != nil {
 					if bProp, ok := b.Properties.Get(propName); ok && bProp.Left != nil {
 						// Both have this property: check subsumption
-						if !isSubschemaOf(aProp.Left, bProp.Left) {
+						if debugConfigs && propName == "configs" {
+							aConfigsType := getType(aProp.Left)
+							bConfigsType := getType(bProp.Left)
+							aIsEmpty := aProp.Left.MaxItems != nil && *aProp.Left.MaxItems == 0
+							bIsEmpty := bProp.Left.MaxItems != nil && *bProp.Left.MaxItems == 0
+							fmt.Printf("DEBUG objectConstraintsSubsumed: before check - A(type=%s, empty=%v) vs B(type=%s, empty=%v)\n",
+								aConfigsType, aIsEmpty, bConfigsType, bIsEmpty)
+						}
+						propSubsumed := isSubschemaOf(aProp.Left, bProp.Left)
+						if debugConfigs && propName == "configs" {
+							fmt.Printf("DEBUG objectConstraintsSubsumed: configs property subsumption check = %v\n", propSubsumed)
+						}
+						if !propSubsumed {
+							if debugConfigs && propName == "configs" {
+								fmt.Printf("DEBUG objectConstraintsSubsumed: configs NOT subsumed -> returning FALSE\n")
+							}
 							return false
 						}
 					}
@@ -1453,17 +2127,54 @@ func objectConstraintsSubsumed(a, b *oas3.Schema) bool {
 		}
 	}
 
-	// AdditionalProperties: simplified check
-	// If A forbids additional but B allows, A ⊆ B is true
-	// If A allows but B forbids, A ⊆ B is false
-	if a.AdditionalProperties != nil && a.AdditionalProperties.Right != nil {
-		aAllows := *a.AdditionalProperties.Right
-		if b.AdditionalProperties != nil && b.AdditionalProperties.Right != nil {
-			bAllows := *b.AdditionalProperties.Right
-			if aAllows && !bAllows {
-				return false
+	// AdditionalProperties subsumption:
+	// Semantics:
+	//   - AP == nil          => forbids additional properties
+	//   - AP.Right == false  => forbids additional properties
+	//   - AP.Right == true   => allows any additional properties (Top)
+	//   - AP.Left != nil     => allows additional properties conforming to AP.Left
+	//
+	// For A ⊆ B:
+	//   - If B forbids additional: A must also forbid additional
+	//   - If B allows any additional (Right=true): always ok
+	//   - If B allows schema S (Left): A must forbid (stricter) OR A allows schema T with T ⊆ S
+	aAP := a.AdditionalProperties
+	bAP := b.AdditionalProperties
+
+	aForbids := aAP == nil || (aAP.Right != nil && !*aAP.Right)
+	aAllowAny := aAP != nil && aAP.Right != nil && *aAP.Right
+	aSchema := aAP != nil && aAP.Left != nil
+
+	bForbids := bAP == nil || (bAP.Right != nil && !*bAP.Right)
+	bAllowAny := bAP != nil && bAP.Right != nil && *bAP.Right
+	bSchema := bAP != nil && bAP.Left != nil
+
+	switch {
+	case bAllowAny:
+		// B allows anything additional: fine
+	case bForbids:
+		// B forbids: A must forbid too
+		if !aForbids {
+			if debugConfigs {
+				fmt.Printf("DEBUG objectConstraintsSubsumed: B forbids additional properties but A doesn't -> FALSE\n")
 			}
+			return false
 		}
+	case bSchema:
+		// B allows schema S: A must forbid OR allow T with T ⊆ S
+		if aAllowAny {
+			if debugConfigs {
+				fmt.Printf("DEBUG objectConstraintsSubsumed: B has AP schema but A allows any -> FALSE\n")
+			}
+			return false
+		}
+		if aSchema && !isSubschemaOf(aAP.Left, bAP.Left) {
+			if debugConfigs {
+				fmt.Printf("DEBUG objectConstraintsSubsumed: A.AP schema not subsumed by B.AP schema -> FALSE\n")
+			}
+			return false
+		}
+		// aForbids is fine (stricter than B)
 	}
 
 	return true
@@ -1562,4 +2273,100 @@ func canonicalizeYAMLNodes(nodes []*yaml.Node) string {
 		strs[i] = canonicalizeYAMLNode(node)
 	}
 	return canonicalizeStringSlice(strs)
+}
+
+// stripNullUnion removes an explicit null alternative from a union and returns the non-null schema.
+// Returns nil if the value is definitely null or cannot be refined.
+func stripNullUnion(s *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	if s == nil {
+		return nil
+	}
+	if getType(s) == "null" {
+		return nil
+	}
+
+	// anyOf
+	if len(s.AnyOf) > 0 {
+		nonNulls := make([]*oas3.Schema, 0, len(s.AnyOf))
+		for _, br := range s.AnyOf {
+			if br == nil || br.Left == nil {
+				continue
+			}
+			if getType(br.Left) == "null" {
+				continue
+			}
+			nonNulls = append(nonNulls, br.Left)
+		}
+		if len(nonNulls) == 0 {
+			return nil
+		}
+		if len(nonNulls) == 1 {
+			return nonNulls[0]
+		}
+		return Union(nonNulls, opts)
+	}
+
+	// oneOf
+	if len(s.OneOf) > 0 {
+		nonNulls := make([]*oas3.Schema, 0, len(s.OneOf))
+		for _, br := range s.OneOf {
+			if br == nil || br.Left == nil {
+				continue
+			}
+			if getType(br.Left) == "null" {
+				continue
+			}
+			nonNulls = append(nonNulls, br.Left)
+		}
+		if len(nonNulls) == 0 {
+			return nil
+		}
+		if len(nonNulls) == 1 {
+			return nonNulls[0]
+		}
+		return Union(nonNulls, opts)
+	}
+
+	// Not a union with null; treat as already non-null
+	return s
+}
+
+// refineVarRefs replaces any scope variable whose schema pointer matches 'old' with 'nw' (in-place).
+func refineVarRefs(st *execState, old, nw *oas3.Schema) {
+	if st == nil || old == nil || nw == nil {
+		return
+	}
+	reboundCount := 0
+	stackReboundCount := 0
+
+	// Rebind scope variables
+	for i := range st.scopes {
+		frame := st.scopes[i]
+		for k, v := range frame {
+			if v == old {
+				frame[k] = nw
+				reboundCount++
+				fmt.Printf("DEBUG refineVarRefs: rebound var '%s' from %p to %p\n", k, old, nw)
+			}
+		}
+	}
+
+	// Also rebind stack references
+	for i := range st.stack {
+		if st.stack[i].Schema == old {
+			st.stack[i].Schema = nw
+			stackReboundCount++
+			fmt.Printf("DEBUG refineVarRefs: rebound stack[%d] from %p to %p\n", i, old, nw)
+		} else {
+			// DEBUG: Show why this stack entry wasn't rebound
+			fmt.Printf("DEBUG refineVarRefs: stack[%d] NOT rebound (stack ptr=%p, old ptr=%p, same=%v)\n",
+				i, st.stack[i].Schema, old, st.stack[i].Schema == old)
+		}
+	}
+
+	if reboundCount == 0 && stackReboundCount == 0 {
+		fmt.Printf("DEBUG refineVarRefs: NO variables or stack refs rebound (old ptr=%p not found)\n", old)
+	} else {
+		fmt.Printf("DEBUG refineVarRefs: rebound %d vars, %d stack refs\n", reboundCount, stackReboundCount)
+	}
 }

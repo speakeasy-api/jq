@@ -61,7 +61,7 @@ func TestTagList_ReverseTransform(t *testing.T) {
 
 	// Check the items type
 	if tagsProp.Items != nil {
-		if itemSchema, ok := derefJSONSchema(tagsProp.Items); ok {
+		if itemSchema, ok := derefJSONSchema(newCollapseContext(), tagsProp.Items); ok {
 			itemType := getType(itemSchema)
 			t.Logf("Tags items type: %v", itemType)
 
@@ -79,7 +79,7 @@ func TestTagList_ReverseTransform(t *testing.T) {
 				if hasProps {
 					t.Error("String items should not have properties")
 				for k, v := range itemSchema.Properties.All() {
-					if propSchema, ok := derefJSONSchema(v); ok {
+					if propSchema, ok := derefJSONSchema(newCollapseContext(), v); ok {
 						propType := getType(propSchema)
 						t.Logf("  Unexpected property %s: type=%v, isTop=%v", k, propType, isTop(propSchema))
 
@@ -146,7 +146,7 @@ func TestTagList_BothDirections(t *testing.T) {
 
 	t.Logf("Enriched tags type: %v", getType(enrichedTags))
 	if enrichedTags.Items != nil {
-		if itemSchema, ok := derefJSONSchema(enrichedTags.Items); ok {
+		if itemSchema, ok := derefJSONSchema(newCollapseContext(), enrichedTags.Items); ok {
 			t.Logf("Enriched tags items type: %v", getType(itemSchema))
 			if itemSchema.Properties != nil {
 				propCount := 0
@@ -184,7 +184,7 @@ func TestTagList_BothDirections(t *testing.T) {
 
 	t.Logf("API tags type: %v", getType(apiTags))
 	if apiTags.Items != nil {
-		if itemSchema, ok := derefJSONSchema(apiTags.Items); ok {
+		if itemSchema, ok := derefJSONSchema(newCollapseContext(), apiTags.Items); ok {
 			itemType := getType(itemSchema)
 			t.Logf("API tags items type: %v", itemType)
 
@@ -203,7 +203,7 @@ func TestTagList_BothDirections(t *testing.T) {
 			if hasProps {
 				t.Error("ERROR: String items should not have properties!")
 				for k, v := range itemSchema.Properties.All() {
-					if propSchema, ok := derefJSONSchema(v); ok {
+					if propSchema, ok := derefJSONSchema(newCollapseContext(), v); ok {
 						propType := getType(propSchema)
 						t.Errorf("  Found unexpected property '%s': type=%v, isTop=%v", k, propType, isTop(propSchema))
 

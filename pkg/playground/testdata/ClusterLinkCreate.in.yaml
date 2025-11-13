@@ -1,0 +1,227 @@
+type: object
+x-speakeasy-transform-from-api:
+  jq: |
+    (
+      . as $in
+      | ($in.source_kafka_cluster // null) as $src
+      | ($in.destination_kafka_cluster // null) as $dest
+      | ($in.local_kafka_cluster // null) as $local
+      | ($in.remote_kafka_cluster // null) as $remote
+      | (if $src then $src elif $dest then $dest elif $remote then $remote else null end) as $remoteBlock
+      | (if $remoteBlock then ($remoteBlock.bootstrap_endpoint // $remoteBlock.rest_endpoint // null) else null end) as $ep
+      | (
+          if $ep == null then null
+          elif ($ep | test("://")) then ($ep | split("://")[1] | split("/")[0] | sub(":443$"; ":9092") | if test(":\\d+$") then . else . + ":9092" end)
+          else ($ep | split("/")[0] | sub(":443$"; ":9092") | if test(":\\d+$") then . else . + ":9092" end)
+          end
+        ) as $bootstrap
+      | ($in.config // {}) as $usercfg
+      | (
+          if $in.link_mode then $in.link_mode
+          elif ($local and $remote) then "BIDIRECTIONAL"
+          elif $src then "DESTINATION"
+          elif $dest then "SOURCE"
+          else null
+          end
+        ) as $lm
+      | (if $in.connection_mode then $in.connection_mode else "OUTBOUND" end) as $cm
+      | (
+          (
+            ($usercfg | to_entries | map({name: .key, value: (.value | tostring)}))
+            + (if $bootstrap then [{name: "bootstrap.servers", value: $bootstrap}] else [] end)
+            + (
+                if $remoteBlock.credentials then
+                  [
+                    {name: "sasl.mechanism", value: "PLAIN"},
+                    {name: "security.protocol", value: "SASL_SSL"},
+                    {name: "sasl.jaas.config", value: ("org.apache.kafka.common.security.plain.PlainLoginModule required username='" + ($remoteBlock.credentials.key // "") + "' password='" + ($remoteBlock.credentials.secret // "") + "';")}
+                  ]
+                else []
+                end
+              )
+            + (
+                if $local.credentials then
+                  [
+                    {name: "local.sasl.mechanism", value: "PLAIN"},
+                    {name: "local.security.protocol", value: "SASL_SSL"},
+                    {name: "local.sasl.jaas.config", value: ("org.apache.kafka.common.security.plain.PlainLoginModule required username='" + ($local.credentials.key // "") + "' password='" + ($local.credentials.secret // "") + "';")}
+                  ]
+                else []
+                end
+              )
+            + (if $lm then [{name: "link.mode", value: $lm}] else [] end)
+            + (if $cm then [{name: "connection.mode", value: $cm}] else [] end)
+          ) | reduce .[] as $c ({}; .[$c.name] = $c.value)
+            | to_entries
+            | sort_by(.key)
+            | map({name: .key, value: .value})
+        ) as $configs
+      | (
+          {}
+          | if $src then . + {source_cluster_id: $src.id} else . end
+          | if $dest then . + {destination_cluster_id: $dest.id} else . end
+          | if ($local and $remote) then . + {remote_cluster_id: $remote.id} else . end
+          | . + {configs: $configs}
+        )
+    )
+description: Cluster link creation request
+properties:
+  link_name:
+    type: string
+    description: The cluster link identifier
+    example: my-cluster-link
+  source_kafka_cluster:
+    type: object
+    description: Source cluster configuration (mutually exclusive with destination_kafka_cluster, local_kafka_cluster, remote_kafka_cluster)
+    properties:
+      id:
+        type: string
+        description: Cluster identifier
+        example: lkc-abc123
+      rest_endpoint:
+        type: string
+        description: REST API endpoint (mutually exclusive with bootstrap_endpoint)
+        example: https://pkc-00000.us-central1.gcp.confluent.cloud:443
+      bootstrap_endpoint:
+        type: string
+        description: Bootstrap connection endpoint (mutually exclusive with rest_endpoint)
+        example: SASL_SSL://pkc-00000.us-central1.gcp.confluent.cloud:9092
+      credentials:
+        type: object
+        properties:
+          key:
+            type: string
+            description: API key
+            example: ABCDEFGH12345678
+          secret:
+            type: string
+            description: API secret
+            example: abc123def456ghi789jkl012mno345pqr678stu901vwx234yzabcdefghijklm
+        required:
+          - key
+          - secret
+    required:
+      - id
+  destination_kafka_cluster:
+    type: object
+    description: Destination cluster configuration (mutually exclusive with source_kafka_cluster, local_kafka_cluster, remote_kafka_cluster)
+    properties:
+      id:
+        type: string
+        description: Cluster identifier
+        example: lkc-abc123
+      rest_endpoint:
+        type: string
+        description: REST API endpoint (mutually exclusive with bootstrap_endpoint)
+        example: https://pkc-00000.us-central1.gcp.confluent.cloud:443
+      bootstrap_endpoint:
+        type: string
+        description: Bootstrap connection endpoint (mutually exclusive with rest_endpoint)
+        example: SASL_SSL://pkc-00000.us-central1.gcp.confluent.cloud:9092
+      credentials:
+        type: object
+        properties:
+          key:
+            type: string
+            description: API key
+            example: ABCDEFGH12345678
+          secret:
+            type: string
+            description: API secret
+            example: abc123def456ghi789jkl012mno345pqr678stu901vwx234yzabcdefghijklm
+        required:
+          - key
+          - secret
+    required:
+      - id
+  local_kafka_cluster:
+    type: object
+    description: Local cluster configuration for bidirectional links (mutually exclusive with source_kafka_cluster, destination_kafka_cluster)
+    properties:
+      id:
+        type: string
+        description: Cluster identifier
+        example: lkc-abc123
+      rest_endpoint:
+        type: string
+        description: REST API endpoint (mutually exclusive with bootstrap_endpoint)
+        example: https://pkc-00000.us-central1.gcp.confluent.cloud:443
+      bootstrap_endpoint:
+        type: string
+        description: Bootstrap connection endpoint (mutually exclusive with rest_endpoint)
+        example: SASL_SSL://pkc-00000.us-central1.gcp.confluent.cloud:9092
+      credentials:
+        type: object
+        properties:
+          key:
+            type: string
+            description: API key
+            example: ABCDEFGH12345678
+          secret:
+            type: string
+            description: API secret
+            example: abc123def456ghi789jkl012mno345pqr678stu901vwx234yzabcdefghijklm
+        required:
+          - key
+          - secret
+    required:
+      - id
+  remote_kafka_cluster:
+    type: object
+    description: Remote cluster configuration for bidirectional links (mutually exclusive with source_kafka_cluster, destination_kafka_cluster)
+    properties:
+      id:
+        type: string
+        description: Cluster identifier
+        example: lkc-xyz789
+      rest_endpoint:
+        type: string
+        description: REST API endpoint (mutually exclusive with bootstrap_endpoint)
+        example: https://pkc-00000.us-west-2.aws.confluent.cloud:443
+      bootstrap_endpoint:
+        type: string
+        description: Bootstrap connection endpoint (mutually exclusive with rest_endpoint)
+        example: SASL_SSL://pkc-00000.us-west-2.aws.confluent.cloud:9092
+      credentials:
+        type: object
+        properties:
+          key:
+            type: string
+            description: API key
+            example: IJKLMNOP87654321
+          secret:
+            type: string
+            description: API secret
+            example: xyz987wvu654tsr321qpo098nml765kji432hgf210edcbazyxwvutsrqponmlk
+        required:
+          - key
+          - secret
+    required:
+      - id
+  link_mode:
+    type: string
+    enum:
+      - DESTINATION
+      - SOURCE
+      - BIDIRECTIONAL
+    default: DESTINATION
+    description: Mode type for the cluster link
+    example: DESTINATION
+  connection_mode:
+    type: string
+    enum:
+      - INBOUND
+      - OUTBOUND
+    default: OUTBOUND
+    description: Connection type for the cluster link
+    example: OUTBOUND
+  config:
+    type: object
+    additionalProperties:
+      type: string
+    description: Custom settings with name-value pairs
+    example:
+      acl.sync.enable: "false"
+      consumer.offset.sync.enable: "true"
+required:
+  - link_name
