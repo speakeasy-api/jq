@@ -743,6 +743,36 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 		}
 	}
 
+	// CRITICAL FIX: If merging arrays where some have nested arrays (items=array) and others have objects (items=object),
+	// filter out the nested arrays as they're likely incorrect artifacts from bytecode execution
+	hasNestedArrays := false
+	hasNonArrayItems := false
+	for _, item := range itemSchemas {
+		itemType := getType(item)
+		if itemType == "array" {
+			hasNestedArrays = true
+		} else if itemType != "" {
+			hasNonArrayItems = true
+		}
+	}
+
+	if hasNestedArrays && hasNonArrayItems {
+		// Filter out nested arrays, keep only non-array items
+		filtered := make([]*oas3.Schema, 0, len(itemSchemas))
+		for _, item := range itemSchemas {
+			if getType(item) != "array" {
+				filtered = append(filtered, item)
+			}
+		}
+		if len(filtered) > 0 {
+			if opts.EnableWarnings {
+				fmt.Printf("DEBUG tryMergeArrays: filtered out %d nested arrays, keeping %d non-array items\n",
+					len(itemSchemas)-len(filtered), len(filtered))
+			}
+			itemSchemas = filtered
+		}
+	}
+
 	// Union the item schemas
 	mergedItems := Union(itemSchemas, opts)
 

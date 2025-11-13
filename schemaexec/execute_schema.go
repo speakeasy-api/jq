@@ -1651,6 +1651,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 							prevOrigin := next.allocOrigin[priorID]
 							if prevOrigin != nil && currOrigin != nil &&
 								prevOrigin.PC == currOrigin.PC && prevOrigin.Context == currOrigin.Context {
+
 								// Union classes
 								fmt.Printf("TRACE DSU opStore: var=%s union %s with %s (same origin PC=%d, ctx=%s)\n",
 									key, priorID, currID, currOrigin.PC, currOrigin.Context)
@@ -2512,7 +2513,21 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 		}
 	} else {
 		// Normal array accumulation - union items
-		unionedItems = Union([]*oas3.Schema{priorItems, val}, env.opts)
+		// CRITICAL FIX: If priorItems is a nested array and val is not an array,
+		// the nested array is likely incorrect (e.g., from a bytecode artifact).
+		// In this case, use only val to avoid creating anyOf[array, object].
+		priorType := getType(priorItems)
+		valType := getType(val)
+		if priorType == "array" && valType != "" && valType != "array" {
+			// Prior is nested array, val is not an array - use val only
+			if env.opts.EnableWarnings {
+				fmt.Printf("DEBUG execAppendMulti: prior items is nested array (type=%s), val is %s - using val only\n",
+					priorType, valType)
+			}
+			unionedItems = val
+		} else {
+			unionedItems = Union([]*oas3.Schema{priorItems, val}, env.opts)
+		}
 	}
 
 	// MUTATE canonical array in-place - safe with unique keys!
@@ -4448,6 +4463,7 @@ func joinTwoSchemas(a, b *oas3.Schema) *oas3.Schema {
 	if a == b {
 		return a
 	}
+
 	return Union([]*oas3.Schema{a, b}, SchemaExecOptions{})
 }
 
