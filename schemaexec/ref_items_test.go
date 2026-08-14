@@ -154,6 +154,68 @@ func TestRefItems_MapHasTypedItems(t *testing.T) {
 	}
 }
 
+// refOneOfDoc: an array property whose items are a oneOf of $ref branches —
+// the discriminated-union shape (e.g. event/step lists) real documents use.
+const refOneOfDoc = `openapi: 3.1.0
+info:
+  title: ref-oneof repro
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    TextEvent:
+      type: object
+      properties:
+        content:
+          type: string
+        kind:
+          type: string
+      required: [content, kind]
+    MetaEvent:
+      type: object
+      properties:
+        kind:
+          type: string
+      required: [kind]
+    Event:
+      type: object
+      oneOf:
+        - $ref: '#/components/schemas/TextEvent'
+        - $ref: '#/components/schemas/MetaEvent'
+    EventList:
+      type: object
+      properties:
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+      required: [events]
+`
+
+// TestRefItems_OneOfRefBranches: `.events[].content` must union the property
+// across resolved oneOf branches: string (from TextEvent) ∪ null (MetaEvent
+// has no content). Before the fix, $ref branch shells misread as
+// "definitely missing" and the result was provably-null — an unsound
+// under-approximation.
+func TestRefItems_OneOfRefBranches(t *testing.T) {
+	list := loadComponentSchema(t, refOneOfDoc, "EventList")
+	out := runQuery(t, ".events[].content", list)
+	if out == nil {
+		t.Fatal(".events[].content: got Bottom")
+	}
+	if getType(out) == "null" {
+		t.Fatalf(".events[].content: provably null — oneOf $ref branches were not resolved")
+	}
+	if !MightBeString(out) {
+		t.Errorf(".events[].content: expected string-compatible schema, got %s", schemaTypeSummary(out, 2))
+	}
+	// kind exists in every branch and is required: must not be null-only.
+	kind := runQuery(t, ".events[].kind", list)
+	if getType(kind) != "string" {
+		t.Errorf(".events[].kind: expected string, got %s", schemaTypeSummary(kind, 2))
+	}
+}
+
 // TestRefItems_PropertyRefStillWorks: property-level $refs (the reference
 // behavior) must keep resolving: `.owner.name` → string.
 func TestRefItems_PropertyRefStillWorks(t *testing.T) {

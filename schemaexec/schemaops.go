@@ -99,18 +99,21 @@ func accessPropertyUnion(obj *oas3.Schema, name string, opts SchemaExecOptions) 
 		// Unreachable branch must not contribute a null to the union
 		return Bottom()
 	}
-	// If union (oneOf/anyOf), map over alternatives
+	// If union (oneOf/anyOf), map over alternatives.
+	// Branches may be $refs (oneOf is not collapsed ahead of time), so follow
+	// the wrapper's resolved schema; the raw Left of a $ref branch is a bare
+	// shell that would misread as "property definitely missing" (unsound).
 	alts := make([]*oas3.Schema, 0)
 	if len(obj.OneOf) > 0 {
 		for _, br := range obj.OneOf {
-			if br != nil && br.Left != nil {
-				alts = append(alts, br.Left)
+			if left := resolvedLeft(br); left != nil {
+				alts = append(alts, left)
 			}
 		}
 	} else if len(obj.AnyOf) > 0 {
 		for _, br := range obj.AnyOf {
-			if br != nil && br.Left != nil {
-				alts = append(alts, br.Left)
+			if left := resolvedLeft(br); left != nil {
+				alts = append(alts, left)
 			}
 		}
 	}
@@ -1492,12 +1495,13 @@ func getType(s *oas3.Schema) string {
 	}
 
 	// Check anyOf - if all branches have same type, return it
+	// ($ref branches are followed via resolvedLeft)
 	if len(s.AnyOf) > 0 {
 		firstType := ""
 		allSame := true
 		for _, branch := range s.AnyOf {
-			if branch.Left != nil {
-				branchType := getType(branch.Left)
+			if left := resolvedLeft(branch); left != nil {
+				branchType := getType(left)
 				if firstType == "" {
 					firstType = branchType
 				} else if firstType != branchType {
@@ -1555,10 +1559,10 @@ func mightBeType(s *oas3.Schema, typ oas3.SchemaType) bool {
 		return true
 	}
 
-	// Check anyOf branches
+	// Check anyOf branches ($ref branches followed via resolvedLeft)
 	if s.AnyOf != nil {
 		for _, branch := range s.AnyOf {
-			if branch.Left != nil && mightBeType(branch.Left, typ) {
+			if left := resolvedLeft(branch); left != nil && mightBeType(left, typ) {
 				return true
 			}
 		}
