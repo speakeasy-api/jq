@@ -116,6 +116,15 @@ func Analyze(ctx context.Context, q *gojq.Query, input *oas3.Schema, opts ...Sch
 		return nil, fmt.Errorf("invalid input schema: %w", err)
 	}
 
+	// Same root normalization as ExecSchema: collapse combinators and follow
+	// resolved $refs so builtins never observe bare $ref shells.
+	if collapsed, err := collapseAllOf(input); err == nil && collapsed != nil {
+		if collapsed2, err2 := collapseAnyOf(collapsed); err2 == nil && collapsed2 != nil {
+			collapsed = collapsed2
+		}
+		input = collapsed
+	}
+
 	env := newSchemaEnv(ctx, opt)
 	result, err := env.execute(code, input)
 	if err != nil {

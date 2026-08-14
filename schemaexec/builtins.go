@@ -342,22 +342,22 @@ func builtinAdd(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 	}
 
 	// add on array array -> array (concatenation)
-	if itemType == "array" && input.Items != nil && input.Items.Left != nil {
-		return []*oas3.Schema{input.Items.Left}, nil
+	if itemType == "array" {
+		if left := resolvedLeft(input.Items); left != nil {
+			return []*oas3.Schema{left}, nil
+		}
 	}
 
 	// add on object array -> object (merge)
-	if itemType == "object" && input.Items != nil && input.Items.Left != nil {
-		return []*oas3.Schema{input.Items.Left}, nil
+	if itemType == "object" {
+		if left := resolvedLeft(input.Items); left != nil {
+			return []*oas3.Schema{left}, nil
+		}
 	}
 
-	// If items are empty/unknown but we're in a numeric context (e.g., map arithmetic),
-	// conservatively return number (most common case for add)
-	if itemType == "" {
-		return []*oas3.Schema{NumberType()}, nil
-	}
-
-	// Unknown - return Top
+	// Unknown item type: jq's add can produce null (empty array), a number,
+	// a string, an array, or an object depending on the items — narrowing to
+	// number would discard valid outputs. Widen.
 	return []*oas3.Schema{Top()}, nil
 }
 
@@ -437,15 +437,18 @@ func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 			getType(valueSchema), isUnconstrainedSchema(valueSchema))
 	}
 
-	// If unionAllObjectValues returned an unconstrained schema (Top), it means
-	// the object had no properties or additionalProperties defined (empty object {}).
-	// to_entries on an empty object produces an empty array (no entries).
-	if isUnconstrainedSchema(valueSchema) {
+	// Distinguish "provably NO entries" from "entries of UNKNOWN value type":
+	// unionAllObjectValues returns Top for both an open object (AP true /
+	// raw-mode absent AP) and genuinely unknown values, so the emptiness
+	// decision must come from object closure, not from the value union.
+	noDeclared := input.Properties == nil || input.Properties.Len() == 0
+	apForbids := input.AdditionalProperties == nil ||
+		(input.AdditionalProperties.Right != nil && !*input.AdditionalProperties.Right)
+	openWorld := env.opts.Semantics == SchemaSemanticsRaw && input.AdditionalProperties == nil
+	if noDeclared && apForbids && !openWorld {
 		if env.opts.EnableWarnings {
-			env.logger.Debugf("builtinToEntries: unconstrained object -> returning EMPTY array (maxItems=0)")
+			env.logger.Debugf("builtinToEntries: provably empty object -> empty array")
 		}
-		// Return empty array - no entries, so maxItems=0 and Items=nil
-		// Call ArrayType(nil) which creates an empty array
 		return []*oas3.Schema{ArrayType(nil)}, nil
 	}
 

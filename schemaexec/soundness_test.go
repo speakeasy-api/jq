@@ -434,3 +434,116 @@ func TestSoundness_NullableRewriteSkipsEnums(t *testing.T) {
 		t.Fatalf("null branch lost: %s", schemaTypeSummary(u, 2))
 	}
 }
+
+// --- Round D probes ---
+
+// TestSoundness_UnionItemlessArrayNotNarrowed: Union(array<any>, array<string>)
+// must keep any-typed items.
+func TestSoundness_UnionItemlessArrayNotNarrowed(t *testing.T) {
+	anyArr := &oas3.Schema{Type: oas3.NewTypeFromString(oas3.SchemaTypeArray)}
+	u := Union([]*oas3.Schema{anyArr, ArrayType(StringType())}, DefaultOptions())
+	if getType(u) == "array" {
+		if left := resolvedLeft(u.Items); left != nil && getType(left) == "string" && !isTopSchema(left) {
+			// items narrowed to string only — the itemless branch admitted anything
+			if len(left.AnyOf) == 0 && len(left.OneOf) == 0 {
+				t.Fatalf("array items narrowed to string; itemless branch discarded: %s", schemaTypeSummary(u, 3))
+			}
+		}
+	}
+}
+
+// TestSoundness_AnyOfArrayItemsNotNarrowed: collapsing anyOf[array<any>,
+// array<string>] must not pin items to string.
+func TestSoundness_AnyOfArrayItemsNotNarrowed(t *testing.T) {
+	anyArr := &oas3.Schema{Type: oas3.NewTypeFromString(oas3.SchemaTypeArray)}
+	in := &oas3.Schema{
+		AnyOf: []*oas3.JSONSchema[oas3.Referenceable]{
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](anyArr),
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](ArrayType(StringType())),
+		},
+	}
+	out := execExpr(t, ".", in)
+	if getType(out) == "array" {
+		if left := resolvedLeft(out.Items); left != nil && getType(left) == "string" &&
+			len(left.AnyOf) == 0 && len(left.OneOf) == 0 && !isTopSchema(left) {
+			t.Fatalf("anyOf array collapse narrowed items to string: %s", schemaTypeSummary(out, 3))
+		}
+	}
+}
+
+// TestSoundness_EnumSubsumptionRespectsFacets: Union(const "x",
+// string{minLength:10}) must keep the const — "x" does not satisfy the
+// minLength, so the string schema does not subsume it.
+func TestSoundness_EnumSubsumptionRespectsFacets(t *testing.T) {
+	ten := int64(10)
+	longStr := StringType()
+	longStr.MinLength = &ten
+	u := Union([]*oas3.Schema{ConstString("x"), longStr}, DefaultOptions())
+	admitsX := false
+	var walk func(s *oas3.Schema)
+	walk = func(s *oas3.Schema) {
+		if s == nil || admitsX {
+			return
+		}
+		for _, n := range s.Enum {
+			if n != nil && n.Value == "x" {
+				admitsX = true
+			}
+		}
+		if s.Const != nil && s.Const.Value == "x" {
+			admitsX = true
+		}
+		for _, br := range s.AnyOf {
+			walk(resolvedLeft(br))
+		}
+		for _, br := range s.OneOf {
+			walk(resolvedLeft(br))
+		}
+		if getType(s) == "string" && len(s.Enum) == 0 && s.Const == nil && s.MinLength == nil {
+			admitsX = true // unconstrained string admits "x"
+		}
+	}
+	walk(u)
+	if !admitsX {
+		t.Fatalf("const \"x\" was discarded against string{minLength:10}: %s", schemaTypeSummary(u, 3))
+	}
+}
+
+// TestSoundness_ToEntriesOpenObjectNotEmpty: to_entries on an object with
+// additionalProperties: true must not fold to the empty array.
+func TestSoundness_ToEntriesOpenObjectNotEmpty(t *testing.T) {
+	in := ObjectType()
+	in.AdditionalProperties = oas3.NewJSONSchemaFromBool(true)
+	out := execExpr(t, "to_entries", in)
+	if out != nil && out.MaxItems != nil && *out.MaxItems == 0 {
+		t.Fatalf("to_entries on an open object folded to empty array")
+	}
+}
+
+// TestSoundness_AddUnknownItemsNotNumber: add over an array with unknown item
+// type must not narrow to number.
+func TestSoundness_AddUnknownItemsNotNumber(t *testing.T) {
+	anyArr := &oas3.Schema{Type: oas3.NewTypeFromString(oas3.SchemaTypeArray)}
+	out := execExpr(t, "add", anyArr)
+	if got := getType(out); got == "number" || got == "integer" {
+		t.Fatalf("add over unknown items narrowed to %s", got)
+	}
+}
+
+// TestSemantics_RawAPMergeKeepsOpen: merging an open (absent-AP) object with
+// an AP-schema object under raw semantics must not impose the AP schema on
+// the open branch.
+func TestSemantics_RawAPMergeKeepsOpen(t *testing.T) {
+	open := ObjectType() // absent AP: open under raw
+	apObj := ObjectType()
+	apObj.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](StringType())
+
+	opts := DefaultOptions()
+	opts.Semantics = SchemaSemanticsRaw
+	u := Union([]*oas3.Schema{open, apObj}, opts)
+	if u != nil && getType(u) == "object" && u.AdditionalProperties != nil {
+		if left := resolvedLeft(u.AdditionalProperties); left != nil && getType(left) == "string" && !isTopSchema(left) {
+			t.Fatalf("raw semantics: merged AP narrowed to string despite an open branch: %s", schemaTypeSummary(u, 3))
+		}
+	}
+}

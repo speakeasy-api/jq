@@ -701,6 +701,46 @@ func disjunctiveFacetsMergeable(s1, s2 *oas3.Schema) bool {
 	if !mm(s1.MinItems, s2.MinItems) || !mm(s1.MaxItems, s2.MaxItems) {
 		return false
 	}
+	// additionalProperties: no disjunctive union implemented — flattening two
+	// object shapes with different AP configurations would impose one
+	// branch's AP on the other. Require equivalence.
+	apEqual := func(a, b *oas3.JSONSchema[oas3.Referenceable]) bool {
+		if (a == nil) != (b == nil) {
+			return false
+		}
+		if a == nil {
+			return true
+		}
+		if (a.Right == nil) != (b.Right == nil) || (a.Left == nil) != (b.Left == nil) {
+			return false
+		}
+		if a.Right != nil && *a.Right != *b.Right {
+			return false
+		}
+		if a.Left != nil && a.Left != b.Left {
+			return false
+		}
+		return true
+	}
+	if !apEqual(s1.AdditionalProperties, s2.AdditionalProperties) {
+		return false
+	}
+	// prefixItems (tuples): no disjunctive union implemented.
+	if len(s1.PrefixItems) != len(s2.PrefixItems) {
+		return false
+	}
+	for i := range s1.PrefixItems {
+		if s1.PrefixItems[i] != s2.PrefixItems[i] {
+			return false
+		}
+	}
+	// contains: no disjunctive union implemented.
+	if (s1.Contains == nil) != (s2.Contains == nil) {
+		return false
+	}
+	if s1.Contains != nil && s1.Contains != s2.Contains {
+		return false
+	}
 	return true
 }
 
@@ -923,16 +963,34 @@ func mergeSchemasModeGuarded(s1, s2 *oas3.Schema, mode MergeMode, inProgress map
 	}
 
 	// Merge array items ($refs followed via resolvedLeft)
-	if items2 := resolvedLeft(s2.Items); items2 != nil {
-		if items1 := resolvedLeft(result.Items); items1 == nil {
-			result.Items = s2.Items
+	items1, items2 := resolvedLeft(s1.Items), resolvedLeft(s2.Items)
+	switch {
+	case items1 != nil && items2 != nil:
+		merged, err := mergeSchemasModeGuarded(items1, items2, mode, inProgress)
+		if err != nil {
+			return nil, fmt.Errorf("incompatible array items: %w", err)
+		}
+		result.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](merged)
+	case items1 == nil && items2 != nil:
+		if mode == MergeDisjunctive {
+			// s1 admits items of any type; taking s2's items would narrow.
+			result.Items = nil
 		} else {
-			// Merge the item schemas
-			merged, err := mergeSchemasModeGuarded(items1, items2, mode, inProgress)
-			if err != nil {
-				return nil, fmt.Errorf("incompatible array items: %w", err)
-			}
-			result.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](merged)
+			result.Items = s2.Items
+		}
+	case items1 != nil && items2 == nil:
+		if mode == MergeDisjunctive {
+			// s2 admits items of any type.
+			result.Items = nil
+		}
+		// conjunctive: keep s1's items (already cloned)
+	}
+	// uniqueItems: disjunctive union of unique and non-unique is non-unique.
+	if mode == MergeDisjunctive {
+		u1 := s1.UniqueItems != nil && *s1.UniqueItems
+		u2 := s2.UniqueItems != nil && *s2.UniqueItems
+		if u1 != u2 {
+			result.UniqueItems = nil
 		}
 	}
 
@@ -3191,7 +3249,9 @@ func isTopSchema(s *oas3.Schema) bool {
 		return true
 	}
 
-	// Structural check: empty type with no constraints
+	// Structural check: empty type with no constraints. Any validation facet
+	// below makes the schema non-universal — treating a constraint-bearing
+	// schema as Top would let subsumption drop branches it does not subsume.
 	if getType(s) == "" &&
 		s.Properties == nil &&
 		s.AdditionalProperties == nil &&
@@ -3207,8 +3267,28 @@ func isTopSchema(s *oas3.Schema) bool {
 		s.MaxLength == nil &&
 		s.Minimum == nil &&
 		s.Maximum == nil &&
+		s.ExclusiveMinimum == nil &&
+		s.ExclusiveMaximum == nil &&
+		s.MultipleOf == nil &&
 		s.Items == nil &&
-		s.PrefixItems == nil {
+		s.PrefixItems == nil &&
+		s.MinItems == nil &&
+		s.MaxItems == nil &&
+		s.UniqueItems == nil &&
+		s.Contains == nil &&
+		s.MinProperties == nil &&
+		s.MaxProperties == nil &&
+		s.Required == nil &&
+		s.PatternProperties == nil &&
+		s.PropertyNames == nil &&
+		s.DependentSchemas == nil &&
+		s.If == nil &&
+		s.Then == nil &&
+		s.Else == nil &&
+		s.UnevaluatedProperties == nil &&
+		s.UnevaluatedItems == nil &&
+		s.ContentSchema == nil &&
+		s.Ref == nil {
 		return true
 	}
 

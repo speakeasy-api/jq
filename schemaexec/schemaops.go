@@ -762,12 +762,20 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 		return first
 	}
 
-	// Collect all item schemas
+	// Collect all item schemas ($refs followed). A non-empty array branch
+	// WITHOUT an items schema admits items of any type: it contributes Top.
+	// Only empty-array sentinels (maxItems=0) contribute nothing.
 	var itemSchemas []*oas3.Schema
+	sawUnconstrainedItems := false
 	for _, s := range schemas {
-		if s.Items != nil && s.Items.Left != nil {
-			itemSchemas = append(itemSchemas, s.Items.Left)
+		if left := resolvedLeft(s.Items); left != nil {
+			itemSchemas = append(itemSchemas, left)
+		} else if s.MaxItems == nil || *s.MaxItems != 0 {
+			sawUnconstrainedItems = true
 		}
+	}
+	if sawUnconstrainedItems && len(itemSchemas) > 0 {
+		itemSchemas = append(itemSchemas, Top())
 	}
 
 	if len(itemSchemas) == 0 {
@@ -996,6 +1004,12 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 	if opts.EnableWarnings && (len(apSchemas) > 0 || seenTrue) {
 		opts.debugf("tryMergeObjects: AP merge - %d schemas, %d with AP.Left, seenTrue=%v, nilCount=%d",
 			len(schemas), len(apSchemas), seenTrue, nilCount)
+	}
+	// Under raw JSON Schema semantics an ABSENT additionalProperties means
+	// the branch is OPEN (admits arbitrary extras): merging it with an
+	// AP-schema branch must not impose that schema on the open branch.
+	if opts.Semantics == SchemaSemanticsRaw && nilCount > 0 {
+		seenTrue = true
 	}
 	switch {
 	case seenTrue:
@@ -1814,9 +1828,21 @@ func BuildArray(items *oas3.Schema, elements []*oas3.Schema) *oas3.Schema {
 // schemaFingerprint creates a canonical hash of validation-relevant schema fields
 // Used for structural deduplication - ignores annotations like title, description
 func schemaFingerprint(s *oas3.Schema) string {
+	return schemaFingerprintSeen(s, make(map[*oas3.Schema]int))
+}
+
+// schemaFingerprintSeen is the cycle-safe implementation: revisiting a schema
+// already on the walk emits a stable back-reference marker instead of
+// recursing forever.
+func schemaFingerprintSeen(s *oas3.Schema, seen map[*oas3.Schema]int) string {
 	if s == nil {
 		return "null"
 	}
+	if id, ok := seen[s]; ok {
+		return fmt.Sprintf("cycle:%d", id)
+	}
+	seen[s] = len(seen)
+	defer delete(seen, s)
 
 	// Build canonical string representation
 	var parts []string
@@ -1851,6 +1877,11 @@ func schemaFingerprint(s *oas3.Schema) string {
 		parts = append(parts, "nullable:true")
 	}
 
+	// Format
+	if s.Format != nil {
+		parts = append(parts, "format:"+*s.Format)
+	}
+
 	// Number constraints
 	if s.Minimum != nil {
 		parts = append(parts, "min:"+strconv.FormatFloat(*s.Minimum, 'g', -1, 64))
@@ -1862,6 +1893,12 @@ func schemaFingerprint(s *oas3.Schema) string {
 	// For simplicity in fingerprinting, we skip them as they're rarely used
 	if s.MultipleOf != nil {
 		parts = append(parts, "mult:"+strconv.FormatFloat(*s.MultipleOf, 'g', -1, 64))
+	}
+	if s.ExclusiveMinimum != nil {
+		parts = append(parts, fmt.Sprintf("exclMin:%v/%v", derefOr(s.ExclusiveMinimum.Left), derefOr(s.ExclusiveMinimum.Right)))
+	}
+	if s.ExclusiveMaximum != nil {
+		parts = append(parts, fmt.Sprintf("exclMax:%v/%v", derefOr(s.ExclusiveMaximum.Left), derefOr(s.ExclusiveMaximum.Right)))
 	}
 
 	// String constraints
@@ -1877,7 +1914,7 @@ func schemaFingerprint(s *oas3.Schema) string {
 
 	// Array constraints
 	if s.Items != nil && s.Items.Left != nil {
-		parts = append(parts, "items:"+schemaFingerprint(s.Items.Left))
+		parts = append(parts, "items:"+schemaFingerprintSeen(s.Items.Left, seen))
 	}
 	if s.MinItems != nil {
 		parts = append(parts, "minItems:"+strconv.FormatInt(int64(*s.MinItems), 10))
@@ -1888,13 +1925,22 @@ func schemaFingerprint(s *oas3.Schema) string {
 	if s.UniqueItems != nil && *s.UniqueItems {
 		parts = append(parts, "unique:true")
 	}
+	if s.Contains != nil && s.Contains.Left != nil {
+		parts = append(parts, "contains:"+schemaFingerprintSeen(s.Contains.Left, seen))
+	}
+	if s.MinProperties != nil {
+		parts = append(parts, "minProps:"+strconv.FormatInt(*s.MinProperties, 10))
+	}
+	if s.MaxProperties != nil {
+		parts = append(parts, "maxProps:"+strconv.FormatInt(*s.MaxProperties, 10))
+	}
 
 	// Object constraints
 	if s.Properties != nil {
 		var propParts []string
 		for k, v := range s.Properties.All() {
 			if v.Left != nil {
-				propParts = append(propParts, k+":"+schemaFingerprint(v.Left))
+				propParts = append(propParts, k+":"+schemaFingerprintSeen(v.Left, seen))
 			}
 		}
 		if len(propParts) > 0 {
@@ -1906,7 +1952,7 @@ func schemaFingerprint(s *oas3.Schema) string {
 	}
 	if s.AdditionalProperties != nil {
 		if s.AdditionalProperties.Left != nil {
-			parts = append(parts, "addProps:"+schemaFingerprint(s.AdditionalProperties.Left))
+			parts = append(parts, "addProps:"+schemaFingerprintSeen(s.AdditionalProperties.Left, seen))
 		} else if s.AdditionalProperties.Right != nil {
 			parts = append(parts, "addProps:"+strconv.FormatBool(*s.AdditionalProperties.Right))
 		}
@@ -1917,7 +1963,7 @@ func schemaFingerprint(s *oas3.Schema) string {
 		var piParts []string
 		for _, pi := range s.PrefixItems {
 			if pi.Left != nil {
-				piParts = append(piParts, schemaFingerprint(pi.Left))
+				piParts = append(piParts, schemaFingerprintSeen(pi.Left, seen))
 			}
 		}
 		parts = append(parts, "prefixItems:["+strings.Join(piParts, ",")+"]")
@@ -1929,7 +1975,7 @@ func schemaFingerprint(s *oas3.Schema) string {
 		var anyOfParts []string
 		for _, branch := range s.AnyOf {
 			if branch.Left != nil {
-				anyOfParts = append(anyOfParts, schemaFingerprint(branch.Left))
+				anyOfParts = append(anyOfParts, schemaFingerprintSeen(branch.Left, seen))
 			}
 		}
 		parts = append(parts, "anyOf:["+canonicalizeStringSlice(anyOfParts)+"]")
@@ -1938,7 +1984,7 @@ func schemaFingerprint(s *oas3.Schema) string {
 		var oneOfParts []string
 		for _, branch := range s.OneOf {
 			if branch.Left != nil {
-				oneOfParts = append(oneOfParts, schemaFingerprint(branch.Left))
+				oneOfParts = append(oneOfParts, schemaFingerprintSeen(branch.Left, seen))
 			}
 		}
 		parts = append(parts, "oneOf:["+canonicalizeStringSlice(oneOfParts)+"]")
@@ -1947,16 +1993,65 @@ func schemaFingerprint(s *oas3.Schema) string {
 		var allOfParts []string
 		for _, branch := range s.AllOf {
 			if branch.Left != nil {
-				allOfParts = append(allOfParts, schemaFingerprint(branch.Left))
+				allOfParts = append(allOfParts, schemaFingerprintSeen(branch.Left, seen))
 			}
 		}
 		parts = append(parts, "allOf:["+canonicalizeStringSlice(allOfParts)+"]")
 	}
 	if s.Not != nil && s.Not.Left != nil {
-		parts = append(parts, "not:"+schemaFingerprint(s.Not.Left))
+		parts = append(parts, "not:"+schemaFingerprintSeen(s.Not.Left, seen))
+	}
+
+	// Conditionals and remaining applicators: presence + structure
+	if s.If != nil && s.If.Left != nil {
+		parts = append(parts, "if:"+schemaFingerprintSeen(s.If.Left, seen))
+	}
+	if s.Then != nil && s.Then.Left != nil {
+		parts = append(parts, "then:"+schemaFingerprintSeen(s.Then.Left, seen))
+	}
+	if s.Else != nil && s.Else.Left != nil {
+		parts = append(parts, "else:"+schemaFingerprintSeen(s.Else.Left, seen))
+	}
+	if s.PatternProperties != nil && s.PatternProperties.Len() > 0 {
+		var ppParts []string
+		for k, v := range s.PatternProperties.All() {
+			if v.Left != nil {
+				ppParts = append(ppParts, k+":"+schemaFingerprintSeen(v.Left, seen))
+			}
+		}
+		parts = append(parts, "patternProps:{"+canonicalizeStringSlice(ppParts)+"}")
+	}
+	if s.PropertyNames != nil && s.PropertyNames.Left != nil {
+		parts = append(parts, "propNames:"+schemaFingerprintSeen(s.PropertyNames.Left, seen))
+	}
+	if s.DependentSchemas != nil && s.DependentSchemas.Len() > 0 {
+		var dsParts []string
+		for k, v := range s.DependentSchemas.All() {
+			if v.Left != nil {
+				dsParts = append(dsParts, k+":"+schemaFingerprintSeen(v.Left, seen))
+			}
+		}
+		parts = append(parts, "depSchemas:{"+canonicalizeStringSlice(dsParts)+"}")
+	}
+	if s.UnevaluatedProperties != nil && s.UnevaluatedProperties.Left != nil {
+		parts = append(parts, "unevalProps:"+schemaFingerprintSeen(s.UnevaluatedProperties.Left, seen))
+	}
+	if s.UnevaluatedItems != nil && s.UnevaluatedItems.Left != nil {
+		parts = append(parts, "unevalItems:"+schemaFingerprintSeen(s.UnevaluatedItems.Left, seen))
+	}
+	if s.ContentSchema != nil && s.ContentSchema.Left != nil {
+		parts = append(parts, "contentSchema:"+schemaFingerprintSeen(s.ContentSchema.Left, seen))
 	}
 
 	return "{" + canonicalizeStringSlice(parts) + "}"
+}
+
+// derefOr renders a possibly-nil pointer value for fingerprinting.
+func derefOr[T any](p *T) any {
+	if p == nil {
+		return "_"
+	}
+	return *p
 }
 
 // isSubschemaOf checks if schema A is a subschema of (subsumed by) schema B
@@ -1975,11 +2070,19 @@ func isSubschemaOf(a, b *oas3.Schema) bool {
 			// Both have enums: A ⊆ B if all of A's values are in B
 			return enumSubset(a.Enum, b.Enum)
 		}
-		// A has enum, B doesn't: check if all A's enum values satisfy B's constraints
-		// For now, simplified: if B is just a type without constraints, A ⊆ B
+		// A has enum, B doesn't: A ⊆ B only if all of A's values satisfy B.
+		// This fast path is valid ONLY when B carries no value-restricting
+		// facets beyond its type (a minLength/format/bounds/etc. on B could
+		// exclude some enum values).
 		bType := getType(b)
-		if bType != "" && b.Minimum == nil && b.Maximum == nil && b.Pattern == nil {
-			// B is unconstrained type, A's enum values must match that type
+		if bType != "" &&
+			b.Minimum == nil && b.Maximum == nil && b.ExclusiveMinimum == nil && b.ExclusiveMaximum == nil &&
+			b.MultipleOf == nil &&
+			b.Pattern == nil && b.Format == nil && b.MinLength == nil && b.MaxLength == nil &&
+			b.MinItems == nil && b.MaxItems == nil && b.Items == nil && b.PrefixItems == nil &&
+			b.Properties == nil && b.Required == nil && b.AdditionalProperties == nil &&
+			b.AllOf == nil && b.AnyOf == nil && b.OneOf == nil && b.Not == nil && b.Const == nil {
+			// B is an unconstrained type; A's enum values must match that type
 			return enumMatchesType(a.Enum, bType)
 		}
 		return false
