@@ -2981,128 +2981,20 @@ func getClosurePC(s *oas3.Schema) (int, bool) {
 // validateStrictResult performs a deep scan of the result schema to ensure
 // it does not contain any Top or Bottom structures when in strict mode.
 // Returns an error with a path to the first offending node if found.
+// The walk itself is shared with the Analyze API (collectSchemaIssues).
 func (env *schemaEnv) validateStrictResult(schema *oas3.Schema) error {
-	return env.validateStrictResultPath(schema, "$")
-}
-
-// validateStrictResultPath recursively validates a schema at the given path.
-func (env *schemaEnv) validateStrictResultPath(schema *oas3.Schema, path string) error {
-	// Check if this is Bottom (which is represented as nil)
-	if isBottomSchema(schema) {
-		return fmt.Errorf("strict mode: result contains Bottom at %s", path)
-	}
-
-	// After Bottom check, if nil, it's safe to skip
-	if schema == nil {
+	issues := collectSchemaIssues(schema, env.topCauses)
+	if len(issues) == 0 {
 		return nil
 	}
-
-	// Check if this is Top
-	if isTopSchema(schema) {
-		if env.topCauses != nil {
-			if cause, ok := env.topCauses[schema]; ok {
-				return fmt.Errorf("strict mode: result contains Top at %s; cause: %s", path, cause)
-			}
-		}
-		return fmt.Errorf("strict mode: result contains Top at %s", path)
+	first := issues[0]
+	if first.isBottom {
+		return fmt.Errorf("strict mode: result contains Bottom at %s", first.path)
 	}
-
-	// Recursively check array items
-	if schema.Items != nil && schema.Items.Left != nil {
-		if err := env.validateStrictResultPath(schema.Items.Left, path+".items"); err != nil {
-			return err
-		}
+	if first.cause != "" {
+		return fmt.Errorf("strict mode: result contains Top at %s; cause: %s", first.path, first.cause)
 	}
-
-	// Recursively check prefixItems (tuple items)
-	if schema.PrefixItems != nil {
-		for i, item := range schema.PrefixItems {
-			if item.Left != nil {
-				itemPath := fmt.Sprintf("%s.prefixItems[%d]", path, i)
-				if err := env.validateStrictResultPath(item.Left, itemPath); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	// Recursively check object properties
-	if schema.Properties != nil {
-		for k, prop := range schema.Properties.All() {
-			if prop.Left != nil {
-				propPath := fmt.Sprintf("%s.properties.%s", path, k)
-				if err := env.validateStrictResultPath(prop.Left, propPath); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	// Recursively check additionalProperties
-	if schema.AdditionalProperties != nil && schema.AdditionalProperties.Left != nil {
-		if err := env.validateStrictResultPath(schema.AdditionalProperties.Left, path+".additionalProperties"); err != nil {
-			return err
-		}
-	}
-
-	// Recursively check anyOf branches
-	if schema.AnyOf != nil {
-		for i, branch := range schema.AnyOf {
-			if branch.Left != nil {
-				branchPath := fmt.Sprintf("%s.anyOf[%d]", path, i)
-				if err := env.validateStrictResultPath(branch.Left, branchPath); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	// Recursively check allOf branches
-	if schema.AllOf != nil {
-		for i, branch := range schema.AllOf {
-			if branch.Left != nil {
-				branchPath := fmt.Sprintf("%s.allOf[%d]", path, i)
-				if err := env.validateStrictResultPath(branch.Left, branchPath); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	// Recursively check oneOf branches
-	if schema.OneOf != nil {
-		for i, branch := range schema.OneOf {
-			if branch.Left != nil {
-				branchPath := fmt.Sprintf("%s.oneOf[%d]", path, i)
-				if err := env.validateStrictResultPath(branch.Left, branchPath); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	// Recursively check not
-	if schema.Not != nil && schema.Not.Left != nil {
-		if err := env.validateStrictResultPath(schema.Not.Left, path+".not"); err != nil {
-			return err
-		}
-	}
-
-	// Recursively check contains
-	if schema.Contains != nil && schema.Contains.Left != nil {
-		if err := env.validateStrictResultPath(schema.Contains.Left, path+".contains"); err != nil {
-			return err
-		}
-	}
-
-	// Recursively check unevaluatedProperties
-	if schema.UnevaluatedProperties != nil && schema.UnevaluatedProperties.Left != nil {
-		if err := env.validateStrictResultPath(schema.UnevaluatedProperties.Left, path+".unevaluatedProperties"); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return fmt.Errorf("strict mode: result contains Top at %s", first.path)
 }
 
 // isTopSchema checks if a schema is Top using both pointer identity and structural checks.
