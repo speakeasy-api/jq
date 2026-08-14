@@ -820,6 +820,24 @@ func mergeSchemasModeGuarded(s1, s2 *oas3.Schema, mode MergeMode, inProgress map
 		return cloneSchema(s1), nil
 	}
 
+	// Lattice identities for Top. These come FIRST: routing Top through the
+	// field-by-field merger would narrow it (disjunctive Top ∨ X previously
+	// picked up X's type/facets), and conjunctive Top ∧ X must preserve ALL
+	// of X's facets — including ones the merger does not handle (nullable,
+	// additionalProperties: true), which an "empty base" merge used to drop.
+	if mode == MergeDisjunctive {
+		if isTopSchema(s1) || isTopSchema(s2) {
+			return Top(), nil
+		}
+	} else {
+		if isTopSchema(s1) {
+			return cloneSchema(s2), nil
+		}
+		if isTopSchema(s2) {
+			return cloneSchema(s1), nil
+		}
+	}
+
 	if mode == MergeDisjunctive && !disjunctiveFacetsMergeable(s1, s2) {
 		return nil, errCannotFlatten
 	}

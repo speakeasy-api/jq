@@ -547,3 +547,113 @@ func TestSemantics_RawAPMergeKeepsOpen(t *testing.T) {
 		}
 	}
 }
+
+// --- Final round probes ---
+
+// TestSoundness_ExclusiveBoundSubsumption: Union(number,
+// number{exclusiveMinimum:10}) must not collapse onto the bounded schema.
+func TestSoundness_ExclusiveBoundSubsumption(t *testing.T) {
+	bounded := NumberType()
+	bounded.ExclusiveMinimum = oas3.NewExclusiveMinimumFromFloat64(10)
+	u := Union([]*oas3.Schema{NumberType(), bounded}, DefaultOptions())
+	if u != nil && u.ExclusiveMinimum != nil && len(u.AnyOf) == 0 {
+		t.Fatalf("plain number was subsumed by exclusively-bounded number: %s", schemaTypeSummary(u, 2))
+	}
+}
+
+// TestSoundness_BooleanSchemaFingerprint: {not: true} (unsatisfiable) must not
+// dedup-collide with an unconstrained schema of the same type.
+func TestSoundness_BooleanSchemaFingerprint(t *testing.T) {
+	notTrue := StringType()
+	notTrue.Not = oas3.NewJSONSchemaFromBool(true)
+	plain := StringType()
+	u := Union([]*oas3.Schema{notTrue, plain}, DefaultOptions())
+	// The plain string branch must survive: either as the merged result
+	// without the not-constraint, or as a distinct anyOf branch.
+	admitsPlain := false
+	if u != nil {
+		if u.Not == nil && getType(u) == "string" {
+			admitsPlain = true
+		}
+		for _, br := range u.AnyOf {
+			if left := resolvedLeft(br); left != nil && left.Not == nil && getType(left) == "string" {
+				admitsPlain = true
+			}
+		}
+	}
+	if !admitsPlain {
+		t.Fatalf("plain string branch lost against {not:true}: %s", schemaTypeSummary(u, 3))
+	}
+}
+
+// TestSoundness_NestedTopDominatesPropertyUnion: anyOf[{x:Top},{x:string}]
+// must not pin x to string.
+func TestSoundness_NestedTopDominatesPropertyUnion(t *testing.T) {
+	branchA := BuildObject(map[string]*oas3.Schema{"x": Top()}, []string{"x"})
+	branchB := BuildObject(map[string]*oas3.Schema{"x": StringType()}, []string{"x"})
+	in := &oas3.Schema{
+		AnyOf: []*oas3.JSONSchema[oas3.Referenceable]{
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branchA),
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branchB),
+		},
+	}
+	out := execExpr(t, ".", in)
+	if out != nil && getType(out) == "object" && out.Properties != nil {
+		if xs, ok := out.Properties.Get("x"); ok {
+			if left := resolvedLeft(xs); left != nil && getType(left) == "string" && !isTopSchema(left) &&
+				len(left.AnyOf) == 0 && len(left.OneOf) == 0 {
+				t.Fatalf("x narrowed to string despite a Top branch: %s", schemaTypeSummary(out, 3))
+			}
+		}
+	}
+}
+
+// TestSoundness_AnyOfBranchKeepsNullableAndOpenAP: normalizing anyOf branches
+// through the empty base must preserve nullable and additionalProperties:true.
+func TestSoundness_AnyOfBranchKeepsNullableAndOpenAP(t *testing.T) {
+	nullable := true
+	nullableStr := StringType()
+	nullableStr.Nullable = &nullable
+
+	openObj := ObjectType()
+	openObj.AdditionalProperties = oas3.NewJSONSchemaFromBool(true)
+
+	in := &oas3.Schema{
+		AnyOf: []*oas3.JSONSchema[oas3.Referenceable]{
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](nullableStr),
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](openObj),
+		},
+	}
+	out := execExpr(t, ".", in)
+	if out == nil {
+		t.Fatal("got Bottom")
+	}
+	sawNullable := false
+	sawOpenAP := false
+	check := func(s *oas3.Schema) {
+		if s == nil {
+			return
+		}
+		if s.Nullable != nil && *s.Nullable {
+			sawNullable = true
+		}
+		if s.AdditionalProperties != nil &&
+			((s.AdditionalProperties.Right != nil && *s.AdditionalProperties.Right) ||
+				(s.AdditionalProperties.Left != nil && isTopSchema(s.AdditionalProperties.Left))) {
+			sawOpenAP = true
+		}
+	}
+	check(out)
+	for _, br := range out.AnyOf {
+		check(resolvedLeft(br))
+	}
+	for _, br := range out.OneOf {
+		check(resolvedLeft(br))
+	}
+	if !sawNullable {
+		t.Errorf("nullable:true was dropped during anyOf normalization: %s", schemaTypeSummary(out, 3))
+	}
+	if !sawOpenAP {
+		t.Errorf("additionalProperties:true was dropped during anyOf normalization: %s", schemaTypeSummary(out, 3))
+	}
+}
