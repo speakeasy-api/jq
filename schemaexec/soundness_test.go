@@ -766,3 +766,64 @@ func TestSoundness_PatternPropertiesNotProvenBroken(t *testing.T) {
 		t.Errorf(".y (no pattern match, AP false): verdict = %s, want proven-broken", b.Verdict)
 	}
 }
+
+// --- Final contract probes ---
+
+// TestSoundness_HasKeysPatternProperties: has()/keys must account for
+// patternProperties-admitted keys.
+func TestSoundness_HasKeysPatternProperties(t *testing.T) {
+	obj := BuildObject(map[string]*oas3.Schema{"known": StringType()}, []string{"known"})
+	obj.PatternProperties = sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+	obj.PatternProperties.Set("^x$", oas3.NewJSONSchemaFromSchema[oas3.Referenceable](StringType()))
+	obj.AdditionalProperties = oas3.NewJSONSchemaFromBool(false)
+
+	out := execExpr(t, `has("x")`, obj)
+	if len(out.Enum) == 1 && out.Enum[0].Value == "false" {
+		t.Fatalf(`has("x") folded to const false despite matching patternProperties`)
+	}
+
+	keysOut := execExpr(t, "keys", obj)
+	if keysOut != nil && keysOut.Items != nil && keysOut.Items.Left != nil {
+		items := keysOut.Items.Left
+		if len(items.Enum) > 0 {
+			// A fixed key enum under-enumerates pattern-admitted keys.
+			t.Fatalf("keys enumerated a closed key set despite patternProperties: %s", schemaTypeSummary(keysOut, 3))
+		}
+	}
+}
+
+// TestSoundness_AnyOfMinPropertiesNotFlattened: anyOf[object{minProperties:2},
+// object{}] must not flatten onto the constrained branch.
+func TestSoundness_AnyOfMinPropertiesNotFlattened(t *testing.T) {
+	two := int64(2)
+	constrained := ObjectType()
+	constrained.MinProperties = &two
+	in := &oas3.Schema{
+		AnyOf: []*oas3.JSONSchema[oas3.Referenceable]{
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](constrained),
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](ObjectType()),
+		},
+	}
+	a := analyzeExpr(t, ".", in)
+	if a.Output != nil && len(a.Output.AnyOf) == 0 && a.Output.MinProperties != nil {
+		t.Fatalf("anyOf flattened onto minProperties-constrained branch: %s", schemaTypeSummary(a.Output, 3))
+	}
+}
+
+// TestSoundness_AppendKeepsNestedArrayItem: [[.], 1] must admit BOTH the
+// nested-array element and the integer element.
+func TestSoundness_AppendKeepsNestedArrayItem(t *testing.T) {
+	a := analyzeExpr(t, "[[.], 1]", StringType())
+	if getType(a.Output) != "array" {
+		t.Fatalf("expected array output, got %s", schemaTypeSummary(a.Output, 2))
+	}
+	items := resolvedLeft(a.Output.Items)
+	if items == nil {
+		t.Fatal("array output lost its items")
+	}
+	admitsArray := mightBeType(items, oas3.SchemaTypeArray)
+	admitsInt := mightBeType(items, oas3.SchemaTypeInteger) || mightBeType(items, oas3.SchemaTypeNumber)
+	if !admitsArray || !admitsInt {
+		t.Fatalf("items must admit both the nested array and the integer, got %s", schemaTypeSummary(items, 3))
+	}
+}

@@ -212,9 +212,24 @@ func TestReduceToEntriesMap(t *testing.T) {
 		t.Fatal("Array has no items schema")
 	}
 
+	// The item schema may be the entry object directly, or a sound
+	// over-approximating union that contains it (the accumulator machinery
+	// can add sibling branches for allocs its origin-tracking links).
 	itemSchema := result.Schema.Items.Left
 	if getType(itemSchema) != "object" {
-		t.Fatalf("Expected item to be object, got: %s", getType(itemSchema))
+		var entry *oas3.Schema
+		for _, br := range itemSchema.AnyOf {
+			if br.Left != nil && getType(br.Left) == "object" && br.Left.Properties != nil {
+				if _, ok := br.Left.Properties.Get("value"); ok {
+					entry = br.Left
+					break
+				}
+			}
+		}
+		if entry == nil {
+			t.Fatalf("Expected item to be (or contain) an entry object, got: %s", getType(itemSchema))
+		}
+		itemSchema = entry
 	}
 
 	// Check for name and value properties
@@ -291,9 +306,24 @@ func TestReduceToEntriesMapSort(t *testing.T) {
 		t.Fatal("Array has no items schema")
 	}
 
+	// The item schema may be the entry object directly, or a sound
+	// over-approximating union that contains it (the accumulator machinery
+	// can add sibling branches for allocs its origin-tracking links).
 	itemSchema := result.Schema.Items.Left
 	if getType(itemSchema) != "object" {
-		t.Fatalf("Expected item to be object, got: %s", getType(itemSchema))
+		var entry *oas3.Schema
+		for _, br := range itemSchema.AnyOf {
+			if br.Left != nil && getType(br.Left) == "object" && br.Left.Properties != nil {
+				if _, ok := br.Left.Properties.Get("value"); ok {
+					entry = br.Left
+					break
+				}
+			}
+		}
+		if entry == nil {
+			t.Fatalf("Expected item to be (or contain) an entry object, got: %s", getType(itemSchema))
+		}
+		itemSchema = entry
 	}
 
 	// Check for name and value properties

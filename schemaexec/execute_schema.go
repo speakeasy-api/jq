@@ -706,6 +706,28 @@ func disjunctiveFacetsMergeable(s1, s2 *oas3.Schema) bool {
 	if !mm(s1.MinItems, s2.MinItems) || !mm(s1.MaxItems, s2.MaxItems) {
 		return false
 	}
+	// Facets with no disjunctive union implemented must be identical (or
+	// absent on both sides) to flatten; otherwise the anyOf structure is
+	// kept. Pointer identity is the conservative equality for wrapper-typed
+	// facets.
+	if !mm(s1.MinProperties, s2.MinProperties) || !mm(s1.MaxProperties, s2.MaxProperties) {
+		return false
+	}
+	if !mm(s1.MinContains, s2.MinContains) || !mm(s1.MaxContains, s2.MaxContains) {
+		return false
+	}
+	if s1.Not != s2.Not || s1.If != s2.If || s1.Then != s2.Then || s1.Else != s2.Else {
+		return false
+	}
+	if s1.PatternProperties != s2.PatternProperties || s1.PropertyNames != s2.PropertyNames ||
+		s1.DependentSchemas != s2.DependentSchemas {
+		return false
+	}
+	if s1.UnevaluatedProperties != s2.UnevaluatedProperties || s1.UnevaluatedItems != s2.UnevaluatedItems ||
+		s1.ContentSchema != s2.ContentSchema {
+		return false
+	}
+
 	// additionalProperties: no disjunctive union implemented — flattening two
 	// object shapes with different AP configurations would impose one
 	// branch's AP on the other. Require equivalence.
@@ -2832,22 +2854,11 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 			unionedItems = Union([]*oas3.Schema{priorItems, val}, env.opts)
 		}
 	} else {
-		// Normal array accumulation - union items
-		// CRITICAL FIX: If priorItems is a nested array and val is not an array,
-		// the nested array is likely incorrect (e.g., from a bytecode artifact).
-		// In this case, use only val to avoid creating anyOf[array, object].
-		priorType := getType(priorItems)
-		valType := getType(val)
-		if priorType == "array" && valType != "" && valType != "array" {
-			// Prior is nested array, val is not an array - use val only
-			if env.opts.EnableWarnings {
-				env.logger.Debugf("execAppendMulti: prior items is nested array (type=%s), val is %s - using val only",
-					priorType, valType)
-			}
-			unionedItems = val
-		} else {
-			unionedItems = Union([]*oas3.Schema{priorItems, val}, env.opts)
-		}
+		// Normal array accumulation - union items. A previous heuristic
+		// dropped a nested-array prior item when the next item was a scalar
+		// ("likely a bytecode artifact"); that discarded real outputs
+		// ([[.], 1] lost its array element). Always union.
+		unionedItems = Union([]*oas3.Schema{priorItems, val}, env.opts)
 	}
 
 	// MUTATE canonical array in-place - safe with unique keys!

@@ -211,6 +211,12 @@ func builtinKeys(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 		itemSchema = StringType()
 	}
 
+	// patternProperties admit arbitrary matching keys: the declared-key enum
+	// would under-enumerate.
+	if input.PatternProperties != nil && input.PatternProperties.Len() > 0 {
+		itemSchema = StringType()
+	}
+
 	// If additionalProperties allowed (schema or boolean true), or the object
 	// is open (absent AP under raw semantics), arbitrary keys are possible.
 	if input.AdditionalProperties != nil {
@@ -266,6 +272,17 @@ func builtinHas(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 				}
 				// Exists but optional - could be true or false
 				return []*oas3.Schema{BoolType()}, nil
+			}
+		}
+
+		// patternProperties: a matching pattern admits the key; an
+		// unparseable pattern prevents proving absence.
+		if input.PatternProperties != nil && input.PatternProperties.Len() > 0 {
+			for pattern := range input.PatternProperties.All() {
+				re, err := regexp.Compile(pattern)
+				if err != nil || re.MatchString(keyStr) {
+					return []*oas3.Schema{BoolType()}, nil
+				}
 			}
 		}
 
