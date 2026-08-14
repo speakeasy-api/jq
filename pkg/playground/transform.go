@@ -11,6 +11,7 @@ import (
 	"github.com/speakeasy-api/openapi/extensions"
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 	"github.com/speakeasy-api/openapi/openapi"
+	"github.com/speakeasy-api/openapi/yml"
 )
 
 // SymbolicExecuteJQ validates an OpenAPI spec and performs symbolic execution
@@ -211,6 +212,20 @@ type PipelineResult struct {
 	Warnings       []string `json:"warnings"`
 }
 
+// forceYAMLOutput pins the document's marshal format to YAML. The library's
+// format auto-detection scans the first few lines of the source and can be
+// tricked into JSON output by YAML block scalars whose content starts with
+// '{' (e.g. the jq programs in x-speakeasy-transform-* extensions). The
+// playground is YAML-in/YAML-out, so pin it explicitly.
+func forceYAMLOutput(doc *openapi.OpenAPI) {
+	if doc == nil {
+		return
+	}
+	if cfg := doc.GetCore().GetConfig(); cfg != nil {
+		cfg.OutputFormat = yml.OutputFormatYAML
+	}
+}
+
 // SymbolicExecuteJQPipeline performs sequential transformation pipeline
 func SymbolicExecuteJQPipeline(oasYAML string, strict bool) (*PipelineResult, error) {
 	ctx := context.Background()
@@ -224,6 +239,7 @@ func SymbolicExecuteJQPipeline(oasYAML string, strict bool) (*PipelineResult, er
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse OpenAPI document: %w", err)
 	}
+	forceYAMLOutput(doc1)
 	if len(validationErrs) > 0 {
 		return nil, fmt.Errorf("OpenAPI validation failed: %v", validationErrs[0])
 	}
@@ -293,6 +309,7 @@ func cloneDocument(ctx context.Context, yamlStr string) (*openapi.OpenAPI, error
 	if err != nil {
 		return nil, err
 	}
+	forceYAMLOutput(doc)
 	// Resolve all $refs in the cloned document
 	if _, err := doc.ResolveAllReferences(ctx, openapi.ResolveAllOptions{}); err != nil {
 		return nil, fmt.Errorf("failed to resolve $refs: %w", err)
