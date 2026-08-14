@@ -8,6 +8,7 @@ import (
 	gojq "github.com/speakeasy-api/jq"
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 	"github.com/speakeasy-api/openapi/references"
+	"github.com/speakeasy-api/openapi/sequencedmap"
 )
 
 // These tests encode adversarial soundness probes: cases where the executor
@@ -655,5 +656,113 @@ func TestSoundness_AnyOfBranchKeepsNullableAndOpenAP(t *testing.T) {
 	}
 	if !sawOpenAP {
 		t.Errorf("additionalProperties:true was dropped during anyOf normalization: %s", schemaTypeSummary(out, 3))
+	}
+}
+
+// --- Round E probes (Analyze-contract violations) ---
+
+// TestSoundness_AnyOfExclusiveBoundsNotFlattened: anyOf branches with
+// different exclusive bounds must not flatten onto the first branch's bound.
+func TestSoundness_AnyOfExclusiveBoundsNotFlattened(t *testing.T) {
+	b20 := NumberType()
+	b20.ExclusiveMinimum = oas3.NewExclusiveMinimumFromFloat64(20)
+	b10 := NumberType()
+	b10.ExclusiveMinimum = oas3.NewExclusiveMinimumFromFloat64(10)
+	in := &oas3.Schema{
+		AnyOf: []*oas3.JSONSchema[oas3.Referenceable]{
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](b20),
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](b10),
+		},
+	}
+	a := analyzeExpr(t, ".", in)
+	// value 15 is valid (second branch); a flattened exclusiveMinimum:20
+	// output would exclude it.
+	if a.Verdict == VerdictProven && a.Output != nil && len(a.Output.AnyOf) == 0 &&
+		a.Output.ExclusiveMinimum != nil && a.Output.ExclusiveMinimum.GetRight() != nil && *a.Output.ExclusiveMinimum.GetRight() > 15 {
+		t.Fatalf("anyOf flattened onto the tighter exclusive bound: %s", schemaTypeSummary(a.Output, 2))
+	}
+}
+
+// TestSoundness_AnyOfNullableBranchSurvives: anyOf[string, string{nullable}]
+// must stay nullable.
+func TestSoundness_AnyOfNullableBranchSurvives(t *testing.T) {
+	nb := true
+	nullableStr := StringType()
+	nullableStr.Nullable = &nb
+	in := &oas3.Schema{
+		AnyOf: []*oas3.JSONSchema[oas3.Referenceable]{
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](StringType()),
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](nullableStr),
+		},
+	}
+	a := analyzeExpr(t, ".", in)
+	admitsNull := false
+	check := func(s *oas3.Schema) {
+		if s == nil {
+			return
+		}
+		if s.Nullable != nil && *s.Nullable {
+			admitsNull = true
+		}
+		if mightBeType(s, oas3.SchemaTypeNull) {
+			admitsNull = true
+		}
+	}
+	check(a.Output)
+	if a.Output != nil {
+		for _, br := range a.Output.AnyOf {
+			check(resolvedLeft(br))
+		}
+	}
+	if !admitsNull {
+		t.Fatalf("nullable branch lost in anyOf flatten: %s", schemaTypeSummary(a.Output, 3))
+	}
+}
+
+// TestSoundness_IndexZeroAdmitsNull: .[0] on a possibly-empty array must admit
+// null (jq yields null out of bounds); with minItems >= 1 the null goes away.
+func TestSoundness_IndexZeroAdmitsNull(t *testing.T) {
+	arr := ArrayType(StringType())
+	a := analyzeExpr(t, ".[0]", arr)
+	if a.Verdict != VerdictProven {
+		t.Fatalf(".[0]: verdict = %s, want proven (causes %v)", a.Verdict, a.Causes)
+	}
+	nullable := a.Output != nil && a.Output.Nullable != nil && *a.Output.Nullable
+	if !nullable && !mightBeType(a.Output, oas3.SchemaTypeNull) {
+		t.Fatalf(".[0] on possibly-empty array must admit null, got %s", schemaTypeSummary(a.Output, 2))
+	}
+
+	one := int64(1)
+	nonEmpty := ArrayType(StringType())
+	nonEmpty.MinItems = &one
+	b := analyzeExpr(t, ".[0]", nonEmpty)
+	if got := getType(b.Output); got != "string" {
+		t.Errorf(".[0] with minItems:1 should be exactly string, got %q", got)
+	}
+	if b.Output != nil && b.Output.Nullable != nil && *b.Output.Nullable {
+		t.Errorf(".[0] with minItems:1 should not be nullable")
+	}
+}
+
+// TestSoundness_PatternPropertiesNotProvenBroken: access to a property
+// admitted by patternProperties must not be provably null.
+func TestSoundness_PatternPropertiesNotProvenBroken(t *testing.T) {
+	obj := ObjectType()
+	obj.PatternProperties = sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+	obj.PatternProperties.Set("^x$", oas3.NewJSONSchemaFromSchema[oas3.Referenceable](StringType()))
+	obj.AdditionalProperties = oas3.NewJSONSchemaFromBool(false)
+
+	a := analyzeExpr(t, ".x", obj)
+	if a.Verdict == VerdictProvenBroken {
+		t.Fatalf(".x admitted by patternProperties classified ProvenBroken")
+	}
+	if !MightBeString(a.Output) {
+		t.Errorf(".x should admit the pattern schema's string, got %s", schemaTypeSummary(a.Output, 2))
+	}
+
+	// A name NOT matched by any pattern still follows closed-world rules.
+	b := analyzeExpr(t, ".y", obj)
+	if b.Verdict != VerdictProvenBroken {
+		t.Errorf(".y (no pattern match, AP false): verdict = %s, want proven-broken", b.Verdict)
 	}
 }

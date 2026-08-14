@@ -920,13 +920,36 @@ func TestFourBranchConcat(t *testing.T) {
 		t.FailNow()
 	}
 
+	// The item schema may be the entry object directly, or a sound
+	// over-approximating union that CONTAINS the entry object (the
+	// accumulator machinery can add sibling array branches for allocs its
+	// own origin-tracking links). The essential guarantees: items are not
+	// lost, and the entry object {name, value: string} is admitted.
 	itemSchema := configs.Items.Left
-	valueProp, hasValue := itemSchema.Properties.Get("value")
+	entryCandidates := []*oas3.Schema{itemSchema}
+	for _, br := range itemSchema.AnyOf {
+		if br.Left != nil {
+			entryCandidates = append(entryCandidates, br.Left)
+		}
+	}
 
-	if !hasValue || valueProp.Left == nil {
+	var entry *oas3.Schema
+	for _, cand := range entryCandidates {
+		if cand.Properties != nil {
+			if _, ok := cand.Properties.Get("value"); ok {
+				entry = cand
+				break
+			}
+		}
+	}
+	if entry == nil {
 		t.Fatal("Configs entry object missing 'value' property")
 	}
 
+	valueProp, _ := entry.Properties.Get("value")
+	if valueProp == nil || valueProp.Left == nil {
+		t.Fatal("Configs entry object missing 'value' property schema")
+	}
 	valueType := getType(valueProp.Left)
 
 	if valueType != "string" {

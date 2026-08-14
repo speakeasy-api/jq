@@ -2,6 +2,7 @@ package schemaexec
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -147,7 +148,8 @@ func getPropertyWithNull(obj *oas3.Schema, name string, opts SchemaExecOptions) 
 	}
 	// Only apply to objects; for non-object types, jq property access on them will be widened elsewhere.
 	// Consider object shape (properties/additionalProperties) as objects even if 'type' is omitted
-	if getType(obj) != "object" && obj.Properties == nil && obj.AdditionalProperties == nil {
+	if getType(obj) != "object" && obj.Properties == nil && obj.AdditionalProperties == nil &&
+		(obj.PatternProperties == nil || obj.PatternProperties.Len() == 0) {
 		return ConstNull()
 	}
 
@@ -166,6 +168,28 @@ func getPropertyWithNull(obj *oas3.Schema, name string, opts SchemaExecOptions) 
 			}
 			return Union([]*oas3.Schema{prop, ConstNull()}, opts)
 		}
+	}
+
+	// patternProperties: a matching pattern schema admits the property, so it
+	// must be consulted before any "definitely missing" conclusion (a false
+	// ProvenBroken otherwise).
+	if obj.PatternProperties != nil && obj.PatternProperties.Len() > 0 {
+		for pattern, pjs := range obj.PatternProperties.All() {
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				// Unsupported pattern syntax: we cannot prove the property
+				// absent. Widen.
+				return Union([]*oas3.Schema{Top(), ConstNull()}, opts)
+			}
+			if re.MatchString(name) {
+				if ps, ok := derefJSONSchema(newCollapseContext(), pjs); ok {
+					return Union([]*oas3.Schema{ps, ConstNull()}, opts)
+				}
+				return Union([]*oas3.Schema{Top(), ConstNull()}, opts)
+			}
+		}
+		// No pattern matches this name: patternProperties does not admit it;
+		// fall through to additionalProperties / closed-world handling.
 	}
 
 	// AdditionalProperties?

@@ -689,6 +689,11 @@ func disjunctiveFacetsMergeable(s1, s2 *oas3.Schema) bool {
 	if !eqF(s1.Minimum, s2.Minimum) || !eqF(s1.Maximum, s2.Maximum) || !eqF(s1.MultipleOf, s2.MultipleOf) {
 		return false
 	}
+	// Exclusive bounds: no disjunctive union implemented — require identical
+	// wrappers (both nil, or the same wrapper) to flatten.
+	if s1.ExclusiveMinimum != s2.ExclusiveMinimum || s1.ExclusiveMaximum != s2.ExclusiveMaximum {
+		return false
+	}
 	if !eqI(s1.MinLength, s2.MinLength) || !eqI(s1.MaxLength, s2.MaxLength) {
 		return false
 	}
@@ -864,6 +869,13 @@ func mergeSchemasModeGuarded(s1, s2 *oas3.Schema, mode MergeMode, inProgress map
 		// is unconstrained). Without this, flattening anyOf[{const "a"},
 		// {const "b"}] would keep only s1's value — discarding outputs.
 		mergeDisjunctiveValueFacets(result, s1, s2)
+
+		// Nullable union: if either branch admits null, the flattened
+		// schema must too.
+		if (s1.Nullable != nil && *s1.Nullable) || (s2.Nullable != nil && *s2.Nullable) {
+			nb := true
+			result.Nullable = &nb
+		}
 	}
 
 	// Merge type
@@ -1331,6 +1343,21 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 	}, nil
 }
 
+
+// sortedAccumKeys returns the keys of an accumulator map in sorted order.
+// Accumulator merging, tagging, and redirect selection MUST iterate
+// deterministically: several of these loops are first-wins or mutate shared
+// entries, and Go map order would otherwise make outputs (and flaky tests)
+// depend on the run. See AGENTS.md "Determinism/Stability".
+func sortedAccumKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // mergeTwoAccumulatorSets merges two accumulator/tag sets, unioning array items when a key
 // is present in both accum maps and ensuring the resulting canonical arrays are (re)tagged.
 func mergeTwoAccumulatorSets(
@@ -1351,9 +1378,11 @@ func mergeTwoAccumulatorSets(
 			mergedTags[p] = id
 		}
 		// ensure canonical pointers are tagged
-		for id, canon := range mergedAccum {
-			if _, ok := mergedTags[canon]; !ok {
-				mergedTags[canon] = id
+		for _, id := range sortedAccumKeys(mergedAccum) {
+			if canon := mergedAccum[id]; canon != nil {
+				if _, ok := mergedTags[canon]; !ok {
+					mergedTags[canon] = id
+				}
 			}
 		}
 		return mergedAccum, mergedTags
@@ -1367,9 +1396,11 @@ func mergeTwoAccumulatorSets(
 		for p, id := range tagsA {
 			mergedTags[p] = id
 		}
-		for id, canon := range mergedAccum {
-			if _, ok := mergedTags[canon]; !ok {
-				mergedTags[canon] = id
+		for _, id := range sortedAccumKeys(mergedAccum) {
+			if canon := mergedAccum[id]; canon != nil {
+				if _, ok := mergedTags[canon]; !ok {
+					mergedTags[canon] = id
+				}
 			}
 		}
 		return mergedAccum, mergedTags
@@ -1435,9 +1466,11 @@ func mergeTwoAccumulatorSets(
 			mergedTags[p] = id
 		}
 	}
-	for id, canon := range mergedAccum {
-		if _, ok := mergedTags[canon]; !ok {
-			mergedTags[canon] = id
+	for _, id := range sortedAccumKeys(mergedAccum) {
+		if canon := mergedAccum[id]; canon != nil {
+			if _, ok := mergedTags[canon]; !ok {
+				mergedTags[canon] = id
+			}
 		}
 	}
 	return mergedAccum, mergedTags
@@ -1485,9 +1518,11 @@ func (env *schemaEnv) mergeTerminalAccumulators(states []*execState) (map[string
 				mergedTags[p] = id
 			}
 			// ensure canon tagged
-			for id, canon := range mergedAccum {
-				if _, ok := mergedTags[canon]; !ok {
-					mergedTags[canon] = id
+			for _, id := range sortedAccumKeys(mergedAccum) {
+				if canon := mergedAccum[id]; canon != nil {
+					if _, ok := mergedTags[canon]; !ok {
+						mergedTags[canon] = id
+					}
 				}
 			}
 			continue
@@ -1502,6 +1537,33 @@ func (env *schemaEnv) mergeTerminalAccumulators(states []*execState) (map[string
 // 2 = has concrete items, 1 = unconstrained array, 0 = empty array
 // Uses co-occurrence grouping to connect variables that appear together in states
 func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[string]*oas3.Schema) map[string]string {
+	// DSU gating: a redirect between two allocIDs is legitimate when SOME
+	// terminal state links them — equivalences are path-local facts, so we
+	// must neither look at only states[0] (order-dependent: a link recorded
+	// in a sibling state was invisible) nor take the transitive closure
+	// ACROSS states (which conflates arrays that are distinct on every
+	// concrete path).
+	anyStateLinks := func(a, b string) bool {
+		linked := false
+		for _, st := range states {
+			if st == nil || st.dsu == nil {
+				continue
+			}
+			linked = st.dsu.Find(a) == st.dsu.Find(b)
+			if linked {
+				break
+			}
+		}
+		return linked
+	}
+	haveDSU := false
+	for _, st := range states {
+		if st != nil && st.dsu != nil {
+			haveDSU = true
+			break
+		}
+	}
+
 	// varKey -> set of allocIDs
 	varToAllocs := make(map[string]map[string]struct{})
 
@@ -1546,7 +1608,8 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 				}
 			}
 		}
-		// Union all vars that co-occur in this state
+		// Union all vars that co-occur in this state (sorted for determinism)
+		sort.Strings(varsInState)
 		for i := 0; i < len(varsInState); i++ {
 			for j := i + 1; j < len(varsInState); j++ {
 				union(varsInState[i], varsInState[j])
@@ -1572,7 +1635,8 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 
 	// Build best-allocID-by-fingerprint table for intent-driven redirects
 	bestByFP := make(map[string]string, 64)
-	for id, arr := range mergedAccum {
+	for _, id := range sortedAccumKeys(mergedAccum) {
+		arr := mergedAccum[id]
 		if arr == nil {
 			continue
 		}
@@ -1588,7 +1652,8 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 
 	// INTENT-DRIVEN REDIRECT: Use var history + desired FP to connect orphaned allocIDs
 	for _, s := range states {
-		for varKey, varFP := range s.varDesiredItemFP {
+		for _, varKey := range sortedAccumKeys(s.varDesiredItemFP) {
+			varFP := s.varDesiredItemFP[varKey]
 			target, ok := bestByFP[varFP]
 			if !ok || target == "" {
 				if env.opts.EnableWarnings {
@@ -1599,14 +1664,11 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 			}
 			// Gather all allocIDs this var ever held
 			hist := s.varAllocHistory[varKey]
-			for allocID := range hist {
+			for _, allocID := range sortedAccumKeys(hist) {
 				if allocID != target {
 					// Theory 10: Only redirect within the same DSU class
-					if len(states) > 0 && states[0].dsu != nil {
-						d := states[0].dsu
-						if d.Find(allocID) != d.Find(target) {
-							continue
-						}
+					if haveDSU && !anyStateLinks(allocID, target) {
+						continue
 					}
 					redirect[allocID] = target
 					if env.opts.EnableWarnings {
@@ -1618,20 +1680,18 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 		}
 
 		// FALLBACK: If var has no intent, check if any of its allocIDs have allocDesiredFP
-		for varKey, hist := range s.varAllocHistory {
+		for _, varKey := range sortedAccumKeys(s.varAllocHistory) {
+			hist := s.varAllocHistory[varKey]
 			if _, hasVarIntent := s.varDesiredItemFP[varKey]; hasVarIntent {
 				continue // Already handled above
 			}
 			// Check if any allocID in history has a known FP
-			for allocID := range hist {
+			for _, allocID := range sortedAccumKeys(hist) {
 				if fp, ok := s.allocDesiredFP[allocID]; ok {
 					if target, ok := bestByFP[fp]; ok && target != "" && allocID != target {
 						// Theory 10: Only redirect within the same DSU class
-						if len(states) > 0 && states[0].dsu != nil {
-							d := states[0].dsu
-							if d.Find(allocID) != d.Find(target) {
-								continue
-							}
+						if haveDSU && !anyStateLinks(allocID, target) {
+							continue
 						}
 						redirect[allocID] = target
 						if env.opts.EnableWarnings {
@@ -1651,18 +1711,19 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 		}
 	}
 	groups := make(map[string][]string)
-	for v := range parent {
+	for _, v := range sortedAccumKeys(parent) {
 		r := find(v)
 		groups[r] = append(groups[r], v)
 	}
 
 	// For each co-occurrence group, pick group-best alloc by rank
-	for groupRoot, members := range groups {
+	for _, groupRoot := range sortedAccumKeys(groups) {
+		members := groups[groupRoot]
 		// Gather all candidate allocIDs across group members
 		candidates := make([]string, 0, 16)
 		candidateSet := make(map[string]struct{})
 		for _, varKey := range members {
-			for allocID := range varToAllocs[varKey] {
+			for _, allocID := range sortedAccumKeys(varToAllocs[varKey]) {
 				if _, seen := candidateSet[allocID]; !seen {
 					candidates = append(candidates, allocID)
 					candidateSet[allocID] = struct{}{}
@@ -1691,10 +1752,17 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 			continue
 		}
 
-		// If multiple rank-2, union their items into best
+		// If multiple rank-2, union their items into best — but ONLY allocs
+		// that some state's DSU actually links to best. Variable
+		// co-occurrence alone groups DISTINCT arrays (e.g. an entries array
+		// and a string-values array from the same pipeline); unioning their
+		// items conflates array types that are never merged on any path.
 		if len(rank2IDs) > 1 {
 			items := make([]*oas3.Schema, 0, len(rank2IDs))
 			for _, id := range rank2IDs {
+				if id != best && haveDSU && !anyStateLinks(id, best) {
+					continue
+				}
 				if arr := mergedAccum[id]; arr != nil && arr.Items != nil && arr.Items.Left != nil {
 					items = append(items, arr.Items.Left)
 				}
@@ -1711,14 +1779,11 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 
 		// Redirect every allocID in the group to the chosen best
 		for _, varKey := range members {
-			for allocID := range varToAllocs[varKey] {
+			for _, allocID := range sortedAccumKeys(varToAllocs[varKey]) {
 				if allocID != best {
 					// Theory 10: Only redirect within the same DSU class
-					if len(states) > 0 && states[0].dsu != nil {
-						d := states[0].dsu
-						if d.Find(allocID) != d.Find(best) {
-							continue
-						}
+					if haveDSU && !anyStateLinks(allocID, best) {
+						continue
 					}
 					redirect[allocID] = best
 					if env.opts.EnableWarnings {
@@ -1730,20 +1795,26 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 		}
 	}
 
-	// Theory 10: Overlay DSU canonicalization and ensure mergedAccum has class roots
-	if len(states) > 0 && states[0].dsu != nil {
-		d := states[0].dsu
-		for id := range mergedAccum {
-			root := d.Find(id)
-			if root == "" {
+	// Theory 10: Overlay DSU canonicalization and ensure mergedAccum has
+	// class roots. Applied PER STATE (sorted, first-wins) so path-local
+	// equivalence classes never merge transitively across alternative paths.
+	if haveDSU {
+		for _, st := range states {
+			if st == nil || st.dsu == nil {
 				continue
 			}
-			if root != id {
+			d := st.dsu
+			for _, id := range sortedAccumKeys(mergedAccum) {
+				if _, done := redirect[id]; done {
+					continue
+				}
+				root := d.Find(id)
+				if root == "" || root == id {
+					continue
+				}
 				env.logger.Debugf("DSU computeAllocRedirect: redirect %s -> %s (DSU root)", id, root)
 				redirect[id] = root
-			}
-			// Ensure we have an entry at the root and union siblings there
-			if root != id {
+				// Ensure we have an entry at the root and union siblings there
 				if rootArr, ok := mergedAccum[root]; ok && rootArr != mergedAccum[id] {
 					mergedAccum[root] = joinTwoSchemas(rootArr, mergedAccum[id])
 					env.logger.Debugf("DSU computeAllocRedirect: merged %s into root %s", id, root)
@@ -2251,22 +2322,33 @@ func isSliceIndex(v any) bool {
 func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oas3.Schema {
 	// Try to extract constant integer index
 	if idx, ok := indexKey.(int); ok {
+		var elem *oas3.Schema
+
 		// Check prefixItems for tuple access
 		if arr.PrefixItems != nil && idx >= 0 && idx < len(arr.PrefixItems) {
 			if schema, ok := derefJSONSchema(newCollapseContext(), arr.PrefixItems[idx]); ok {
-				return schema
+				elem = schema
 			}
 		}
 
 		// Fall through to items for indices beyond prefixItems
-		if arr.Items != nil {
+		if elem == nil && arr.Items != nil {
 			if schema, ok := derefJSONSchema(newCollapseContext(), arr.Items); ok {
-				return schema
+				elem = schema
 			}
 		}
 
-		// No schema for this index
-		return Top()
+		if elem == nil {
+			// No schema for this index
+			return Top()
+		}
+
+		// jq semantics: indexing out of bounds yields null. Only when
+		// minItems PROVES the index exists can null be excluded.
+		if idx >= 0 && arr.MinItems != nil && *arr.MinItems > int64(idx) {
+			return elem
+		}
+		return Union([]*oas3.Schema{elem, ConstNull()}, opts)
 	}
 
 	// Non-constant or unknown index - union all possible element types
@@ -2297,6 +2379,9 @@ func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oa
 	if len(schemas) == 0 {
 		return Top()
 	}
+
+	// Unknown index: may be out of bounds — jq yields null then.
+	schemas = append(schemas, ConstNull())
 
 	return Union(schemas, opts)
 }
@@ -3628,8 +3713,18 @@ func (env *schemaEnv) mergeFrontierByPC(in []*execState) []*execState {
 		byPC[s.pc] = append(byPC[s.pc], s)
 	}
 
+	// Iterate PCs in sorted order: the concatenation order of merged states
+	// feeds the worklist, and downstream accumulator joins are
+	// who-writes-last sensitive. Map order here made outputs flaky.
+	pcs := make([]int, 0, len(byPC))
+	for pc := range byPC {
+		pcs = append(pcs, pc)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(pcs)))
+
 	out := make([]*execState, 0, len(in))
-	for pc, group := range byPC {
+	for _, pc := range pcs {
+		group := byPC[pc]
 		// Only merge at hot PCs (opIter or high fan-in)
 		if !env.shouldMergeAtPC(pc, len(group)) {
 			out = append(out, group...)
