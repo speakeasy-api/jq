@@ -2,6 +2,7 @@ package schemaexec
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -527,14 +528,30 @@ func collapseAnyOfCtx(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, e
 		return result, nil
 	}
 
-	// All branches have the same type - attempt disjunctive merge
+	// All branches have the same type - attempt disjunctive merge.
+	// If any facet cannot be soundly unioned into a single schema (e.g.
+	// differing enums), keep the anyOf structure instead of narrowing.
 	result := branches[0]
+	flattened := true
 	for i := 1; i < len(branches); i++ {
 		merged, err := mergeSchemasMode(result, branches[i], MergeDisjunctive)
+		if errors.Is(err, errCannotFlatten) {
+			flattened = false
+			break
+		}
 		if err != nil {
 			return nil, err
 		}
 		result = merged
+	}
+	if !flattened {
+		kept := cloneSchema(schema)
+		kept.AnyOf = make([]*oas3.JSONSchema[oas3.Referenceable], len(branches))
+		for i, branch := range branches {
+			kept.AnyOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branch)
+		}
+		nctx.memo[schema] = kept
+		return kept, nil
 	}
 
 	collapsed, err := collapseNestedSchemasCtx(ctx, result)
@@ -635,6 +652,95 @@ func collapseNestedSchemasCtx(ctx context.Context, schema *oas3.Schema) (*oas3.S
 	return result, nil
 }
 
+// errCannotFlatten signals that two schemas cannot be soundly merged into a
+// single schema disjunctively (e.g. differing enums/consts/patterns/bounds,
+// for which no facet-level union is implemented). Callers should keep the
+// anyOf structure instead of flattening.
+var errCannotFlatten = errors.New("schemas cannot be flattened disjunctively")
+
+// disjunctiveFacetsMergeable reports whether flattening s1 ∨ s2 into a single
+// schema would preserve all values of both. Facets without an implemented
+// disjunctive union (enum, const, pattern, format, numeric/length/item
+// bounds) must be identical (or absent on both sides) to flatten.
+func disjunctiveFacetsMergeable(s1, s2 *oas3.Schema) bool {
+	// Enum and const have a sound disjunctive union implemented in
+	// mergeDisjunctiveValueFacets; they never force keeping anyOf.
+	eqStr := func(a, b *string) bool {
+		if (a == nil) != (b == nil) {
+			return false
+		}
+		return a == nil || *a == *b
+	}
+	eqF := func(a, b *float64) bool {
+		if (a == nil) != (b == nil) {
+			return false
+		}
+		return a == nil || *a == *b
+	}
+	eqI := func(a, b *int64) bool {
+		if (a == nil) != (b == nil) {
+			return false
+		}
+		return a == nil || *a == *b
+	}
+	if !eqStr(s1.Pattern, s2.Pattern) || !eqStr(s1.Format, s2.Format) {
+		return false
+	}
+	if !eqF(s1.Minimum, s2.Minimum) || !eqF(s1.Maximum, s2.Maximum) || !eqF(s1.MultipleOf, s2.MultipleOf) {
+		return false
+	}
+	if !eqI(s1.MinLength, s2.MinLength) || !eqI(s1.MaxLength, s2.MaxLength) {
+		return false
+	}
+	mm := func(a, b *int64) bool {
+		if (a == nil) != (b == nil) {
+			return false
+		}
+		return a == nil || *a == *b
+	}
+	if !mm(s1.MinItems, s2.MinItems) || !mm(s1.MaxItems, s2.MaxItems) {
+		return false
+	}
+	return true
+}
+
+// mergeDisjunctiveValueFacets computes the union of the enum/const value
+// facets for a disjunctive (anyOf) merge and applies it to result:
+//   - both sides constrained (enum or const): union of the value sets;
+//   - one side unconstrained: it admits a superset, so the merged schema
+//     carries NO value constraint.
+func mergeDisjunctiveValueFacets(result, s1, s2 *oas3.Schema) {
+	valuesOf := func(s *oas3.Schema) []*yaml.Node {
+		if len(s.Enum) > 0 {
+			return s.Enum
+		}
+		if s.Const != nil {
+			return []*yaml.Node{s.Const}
+		}
+		return nil
+	}
+	v1, v2 := valuesOf(s1), valuesOf(s2)
+	result.Const = nil
+	if len(v1) == 0 || len(v2) == 0 {
+		// One branch is value-unconstrained: the union is unconstrained.
+		result.Enum = nil
+		return
+	}
+	merged := make([]*yaml.Node, 0, len(v1)+len(v2))
+	seen := make(map[string]bool, len(v1)+len(v2))
+	for _, n := range append(append([]*yaml.Node{}, v1...), v2...) {
+		if n == nil {
+			continue
+		}
+		key := n.Tag + "\x00" + n.Value
+		if !seen[key] {
+			seen[key] = true
+			merged = append(merged, n)
+		}
+	}
+	result.Enum = merged
+}
+
 // mergePair identifies an in-progress (s1, s2, mode) merge for cycle detection.
 type mergePair struct {
 	a, b *oas3.Schema
@@ -674,6 +780,10 @@ func mergeSchemasModeGuarded(s1, s2 *oas3.Schema, mode MergeMode, inProgress map
 		return cloneSchema(s1), nil
 	}
 
+	if mode == MergeDisjunctive && !disjunctiveFacetsMergeable(s1, s2) {
+		return nil, errCannotFlatten
+	}
+
 	pair := mergePair{a: s1, b: s2, mode: mode}
 	if inProgress[pair] {
 		if mode == MergeConjunctive {
@@ -690,6 +800,13 @@ func mergeSchemasModeGuarded(s1, s2 *oas3.Schema, mode MergeMode, inProgress map
 	defer delete(inProgress, pair)
 
 	result := cloneSchema(s1)
+
+	if mode == MergeDisjunctive {
+		// Union the enum/const value facets (or clear them when one branch
+		// is unconstrained). Without this, flattening anyOf[{const "a"},
+		// {const "b"}] would keep only s1's value — discarding outputs.
+		mergeDisjunctiveValueFacets(result, s1, s2)
+	}
 
 	// Merge type
 	if s2.Type != nil {
@@ -2900,6 +3017,11 @@ func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 				opts.debugf("unionAllObjectValues: additionalProperties UNRESOLVED -> Top")
 			}
 		}
+	} else if opts.Semantics == SchemaSemanticsRaw {
+		// Raw JSON Schema semantics: absent additionalProperties means the
+		// object is OPEN — iteration may yield values of any type beyond the
+		// declared properties.
+		schemas = append(schemas, Top())
 	}
 
 	// TODO: Add patternProperties

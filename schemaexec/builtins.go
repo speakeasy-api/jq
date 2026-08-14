@@ -211,8 +211,14 @@ func builtinKeys(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 		itemSchema = StringType()
 	}
 
-	// If additionalProperties allowed, widen to any string
-	if input.AdditionalProperties != nil && input.AdditionalProperties.Left != nil {
+	// If additionalProperties allowed (schema or boolean true), or the object
+	// is open (absent AP under raw semantics), arbitrary keys are possible.
+	if input.AdditionalProperties != nil {
+		if input.AdditionalProperties.Left != nil ||
+			(input.AdditionalProperties.Right != nil && *input.AdditionalProperties.Right) {
+			itemSchema = StringType()
+		}
+	} else if env.opts.Semantics == SchemaSemanticsRaw {
 		itemSchema = StringType()
 	}
 
@@ -263,12 +269,22 @@ func builtinHas(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 			}
 		}
 
-		// Check additionalProperties
-		if input.AdditionalProperties != nil && input.AdditionalProperties.Left != nil {
-			return []*oas3.Schema{BoolType()}, nil
+		// Check additionalProperties: a schema-valued AP or explicit
+		// additionalProperties: true means the key may exist.
+		if input.AdditionalProperties != nil {
+			if input.AdditionalProperties.Left != nil ||
+				(input.AdditionalProperties.Right != nil && *input.AdditionalProperties.Right) {
+				return []*oas3.Schema{BoolType()}, nil
+			}
+			// additionalProperties: false — definitely doesn't exist
+			return []*oas3.Schema{ConstBool(false)}, nil
 		}
 
-		// Definitely doesn't exist
+		// Absent additionalProperties: closed world under Speakeasy
+		// semantics (key definitely absent), open under raw semantics.
+		if env.opts.Semantics == SchemaSemanticsRaw {
+			return []*oas3.Schema{BoolType()}, nil
+		}
 		return []*oas3.Schema{ConstBool(false)}, nil
 	}
 
@@ -309,10 +325,10 @@ func builtinAdd(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 		return []*oas3.Schema{Bottom()}, nil
 	}
 
-	// Get item type
+	// Get item type ($ref'd items followed via resolvedLeft)
 	var itemType string
-	if input.Items != nil && input.Items.Left != nil {
-		itemType = getType(input.Items.Left)
+	if left := resolvedLeft(input.Items); left != nil {
+		itemType = getType(left)
 	}
 
 	// add on number array -> number

@@ -48,6 +48,17 @@ func ExecSchema(ctx context.Context, code *gojq.Code, input *oas3.Schema, opts S
 		return nil, fmt.Errorf("invalid input schema: %w", err)
 	}
 
+	// Normalize the input up front: collapse allOf/anyOf and follow resolved
+	// $refs while rebuilding child wrappers. Without this, the ROOT schema's
+	// original wrappers reach builtins directly, and code reading the inline
+	// side of a $ref child would see a bare shell (Ref set, no structure).
+	if collapsed, err := collapseAllOf(input); err == nil && collapsed != nil {
+		if collapsed2, err2 := collapseAnyOf(collapsed); err2 == nil && collapsed2 != nil {
+			collapsed = collapsed2
+		}
+		input = collapsed
+	}
+
 	// Create schema VM environment
 	env := newSchemaEnv(ctx, opts)
 

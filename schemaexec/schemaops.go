@@ -393,7 +393,11 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		}
 	}
 
-	// First pass: filter out nil/Bottom
+	// First pass: filter out nil/Bottom. Top branches are NOT decided here:
+	// they flow through dedup (whose fingerprint distinguishes Top from
+	// structured schemas) and subsumption (everything ⊆ Top collapses the
+	// union onto the Top branch), and the final partition below returns Top
+	// if a Top branch survives to that point.
 	filtered := make([]*oas3.Schema, 0, len(schemas))
 	for _, s := range schemas {
 		if s != nil {
@@ -405,8 +409,11 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		return Bottom()
 	}
 
-	// Second pass: if we have multiple schemas and some are empty arrays,
-	// filter out the empty arrays since they contribute nothing to the union
+	// Second pass: if we have multiple schemas and some are empty-array
+	// sentinels, drop the sentinels ONLY when another array branch already
+	// admits the empty array (an array with MinItems absent/0 subsumes []).
+	// A non-array alternative does NOT license dropping []: Union([[],string])
+	// must keep the empty array.
 	if len(filtered) > 1 {
 		hasNonEmptyArray := false
 		hasEmptyArray := false
@@ -414,12 +421,10 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 			if getType(s) == "array" {
 				if s.MaxItems != nil && *s.MaxItems == 0 {
 					hasEmptyArray = true
-				} else {
+				} else if s.MinItems == nil || *s.MinItems == 0 {
+					// This array branch admits [] itself
 					hasNonEmptyArray = true
 				}
-			} else {
-				// Non-array schema, keep it
-				hasNonEmptyArray = true
 			}
 		}
 
@@ -613,7 +618,13 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 			}
 		}
 
-		// If we have exactly one null and one non-null typed schema, merge to nullable
+		// If we have exactly one null and one non-null typed schema, merge to
+		// nullable — but ONLY when the non-null side has no enum/const:
+		// {type: string, enum: ["x"], nullable: true} does not admit null
+		// under enum semantics, so such pairs keep the explicit anyOf.
+		if otherSchema != nil && (len(otherSchema.Enum) > 0 || otherSchema.Const != nil) {
+			otherSchema = nil
+		}
 		if nullSchema != nil && otherSchema != nil {
 			// Clone the non-null schema to avoid mutation
 			result := cloneSchema(otherSchema)
@@ -771,35 +782,11 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 		}
 	}
 
-	// CRITICAL FIX: If merging arrays where some have nested arrays (items=array) and others have objects (items=object),
-	// filter out the nested arrays as they're likely incorrect artifacts from bytecode execution
-	hasNestedArrays := false
-	hasNonArrayItems := false
-	for _, item := range itemSchemas {
-		itemType := getType(item)
-		if itemType == "array" {
-			hasNestedArrays = true
-		} else if itemType != "" {
-			hasNonArrayItems = true
-		}
-	}
-
-	if hasNestedArrays && hasNonArrayItems {
-		// Filter out nested arrays, keep only non-array items
-		filtered := make([]*oas3.Schema, 0, len(itemSchemas))
-		for _, item := range itemSchemas {
-			if getType(item) != "array" {
-				filtered = append(filtered, item)
-			}
-		}
-		if len(filtered) > 0 {
-			if opts.EnableWarnings {
-				opts.debugf("tryMergeArrays: filtered out %d nested arrays, keeping %d non-array items",
-					len(itemSchemas)-len(filtered), len(filtered))
-			}
-			itemSchemas = filtered
-		}
-	}
+	// SOUNDNESS: item schemas are unioned as-is. An earlier heuristic dropped
+	// nested-array item branches as "likely artifacts" when mixed with
+	// non-array items; that discarded possible outputs (an array whose items
+	// may be arrays OR objects is a legitimate shape) and broke the
+	// over-approximation contract.
 
 	// Union the item schemas
 	mergedItems := Union(itemSchemas, opts)
@@ -894,8 +881,28 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 				if propSchema, ok := s.Properties.Get(propName); ok {
 					if left := resolvedLeft(propSchema); left != nil {
 						propSchemas = append(propSchemas, left)
+						continue
 					}
 				}
+			}
+			// Branch does not declare this property. What it admits for the
+			// key depends on additionalProperties and the semantics mode:
+			//  - AP schema: the key may exist with the AP value type;
+			//  - AP true: the key may exist with any value;
+			//  - AP absent: closed under Speakeasy semantics (key absent),
+			//    OPEN under raw JSON Schema semantics (any value possible);
+			//  - AP false: key definitely absent in both modes.
+			// Ignoring this contribution would narrow the merged property to
+			// the declaring branches only, discarding possible values.
+			if s.AdditionalProperties != nil {
+				if apLeft := resolvedLeft(s.AdditionalProperties); apLeft != nil {
+					propSchemas = append(propSchemas, apLeft)
+				} else if s.AdditionalProperties.Right != nil && *s.AdditionalProperties.Right {
+					propSchemas = append(propSchemas, Top())
+				}
+				// AP false: contributes nothing
+			} else if opts.Semantics == SchemaSemanticsRaw {
+				propSchemas = append(propSchemas, Top())
 			}
 		}
 
@@ -1564,13 +1571,13 @@ func mightBeType(s *oas3.Schema, typ oas3.SchemaType) bool {
 		return false // Has types but not this one
 	}
 
-	// No explicit type and no combinators: consult structural inference
-	// (implied types, generator-equivalence contract). If the structure
-	// implies a type, treat it as authoritative; otherwise could be anything.
+	// No explicit type and no combinators: could be anything. Structural
+	// inference (implied types) deliberately does NOT make MightBeX guards
+	// reject here: these guards gate builtins, and a false negative would
+	// prune real outputs (e.g. under raw semantics an untyped schema with
+	// properties still admits strings). Precision for untyped schemas comes
+	// from getType-based navigation dispatch, not from these guards.
 	if len(types) == 0 && s.AnyOf == nil && s.AllOf == nil && s.OneOf == nil {
-		if implied := impliedTypeOf(s); implied != "" {
-			return string(typ) == implied
-		}
 		return true
 	}
 
@@ -1824,13 +1831,25 @@ func schemaFingerprint(s *oas3.Schema) string {
 		parts = append(parts, "type:"+canonicalizeStringSlice(typeStrs))
 	}
 
+	// $ref (unresolved shells must not collide with Top or each other)
+	if s.Ref != nil {
+		parts = append(parts, "ref:"+string(*s.Ref))
+	}
+
 	// Enum
 	if len(s.Enum) > 0 {
 		parts = append(parts, "enum:"+canonicalizeYAMLNodes(s.Enum))
 	}
 
-	// Const (represented via Enum in OAS3)
-	// Already handled above
+	// Const
+	if s.Const != nil {
+		parts = append(parts, "const:"+s.Const.Tag+"|"+s.Const.Value)
+	}
+
+	// Nullable (OAS 3.0-style null admission changes the value set)
+	if s.Nullable != nil && *s.Nullable {
+		parts = append(parts, "nullable:true")
+	}
 
 	// Number constraints
 	if s.Minimum != nil {
@@ -1893,7 +1912,19 @@ func schemaFingerprint(s *oas3.Schema) string {
 		}
 	}
 
-	// AnyOf (for nested unions)
+	// PrefixItems (tuples)
+	if len(s.PrefixItems) > 0 {
+		var piParts []string
+		for _, pi := range s.PrefixItems {
+			if pi.Left != nil {
+				piParts = append(piParts, schemaFingerprint(pi.Left))
+			}
+		}
+		parts = append(parts, "prefixItems:["+strings.Join(piParts, ",")+"]")
+	}
+
+	// Combinators: omitting these would make e.g. a oneOf schema fingerprint
+	// identically to Top, letting dedup discard one of them.
 	if len(s.AnyOf) > 0 {
 		var anyOfParts []string
 		for _, branch := range s.AnyOf {
@@ -1902,6 +1933,27 @@ func schemaFingerprint(s *oas3.Schema) string {
 			}
 		}
 		parts = append(parts, "anyOf:["+canonicalizeStringSlice(anyOfParts)+"]")
+	}
+	if len(s.OneOf) > 0 {
+		var oneOfParts []string
+		for _, branch := range s.OneOf {
+			if branch.Left != nil {
+				oneOfParts = append(oneOfParts, schemaFingerprint(branch.Left))
+			}
+		}
+		parts = append(parts, "oneOf:["+canonicalizeStringSlice(oneOfParts)+"]")
+	}
+	if len(s.AllOf) > 0 {
+		var allOfParts []string
+		for _, branch := range s.AllOf {
+			if branch.Left != nil {
+				allOfParts = append(allOfParts, schemaFingerprint(branch.Left))
+			}
+		}
+		parts = append(parts, "allOf:["+canonicalizeStringSlice(allOfParts)+"]")
+	}
+	if s.Not != nil && s.Not.Left != nil {
+		parts = append(parts, "not:"+schemaFingerprint(s.Not.Left))
 	}
 
 	return "{" + canonicalizeStringSlice(parts) + "}"
@@ -1966,16 +2018,19 @@ func isSubschemaOf(a, b *oas3.Schema) bool {
 			return objectConstraintsSubsumed(a, b)
 		}
 	} else if aType != "" && bType == "" {
-		// B has no type constraint = accepts anything
-		// But this was already handled by isTopSchema check above
-		return true
+		// B has no primary type. That does NOT mean B accepts anything: a
+		// typeless B can carry oneOf/allOf/other constraints that exclude A.
+		// Only a genuinely unconstrained (Top) B subsumes everything.
+		return isTopSchema(b)
 	} else if aType == "" && bType != "" {
 		// A has no type but B requires specific type
 		return false
 	}
 
-	// Both have no explicit type - compare constraints generically
-	return true
+	// Both have no explicit type. A typeless B may still carry combinators
+	// or constraints that exclude A; only a genuinely unconstrained (Top) B
+	// provably subsumes.
+	return isTopSchema(b)
 }
 
 // isUnconstrainedSchema checks if a schema is completely unconstrained (empty schema {})
@@ -2117,9 +2172,11 @@ func arrayConstraintsSubsumed(a, b *oas3.Schema) bool {
 		}
 	}
 
-	// Check items: A.items must be subschema of B.items
-	aHasItems := a.Items != nil && a.Items.Left != nil
-	bHasItems := b.Items != nil && b.Items.Left != nil
+	// Check items: A.items must be subschema of B.items ($refs followed)
+	aItems := resolvedLeft(a.Items)
+	bItems := resolvedLeft(b.Items)
+	aHasItems := aItems != nil
+	bHasItems := bItems != nil
 
 	if aHasItems && !bHasItems {
 		// A has specific items, B doesn't
@@ -2140,7 +2197,7 @@ func arrayConstraintsSubsumed(a, b *oas3.Schema) bool {
 
 	if aHasItems && bHasItems {
 		// Both have items - recursively check
-		if !isSubschemaOf(a.Items.Left, b.Items.Left) {
+		if !isSubschemaOf(aItems, bItems) {
 			return false
 		}
 	}

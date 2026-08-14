@@ -209,3 +209,228 @@ func TestSoundness_RecursiveMergeTerminates(t *testing.T) {
 		t.Fatal("recursive disjunctive merge did not terminate")
 	}
 }
+
+// --- Round C probes: each encodes a narrowing found by adversarial review. ---
+
+// TestSoundness_TopSurvivesDedupAgainstCombinator: Union([oneOf[...], Top])
+// must be Top — dedup fingerprinting must not collide a combinator schema
+// with Top and drop either branch.
+func TestSoundness_TopSurvivesDedupAgainstCombinator(t *testing.T) {
+	oneOf := &oas3.Schema{
+		OneOf: []*oas3.JSONSchema[oas3.Referenceable]{
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](StringType()),
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](BoolType()),
+		},
+	}
+	u := Union([]*oas3.Schema{oneOf, Top()}, DefaultOptions())
+	if !isTopSchema(u) {
+		t.Fatalf("Union with a Top branch must be Top, got %s", schemaTypeSummary(u, 3))
+	}
+}
+
+// TestSoundness_SubsumptionDoesNotAssumeTypelessAcceptsAll: a typeless
+// combinator schema must not be treated as universal in subsumption:
+// Union([oneOf[string,bool], integer]) must keep the integer branch.
+func TestSoundness_SubsumptionDoesNotAssumeTypelessAcceptsAll(t *testing.T) {
+	oneOf := &oas3.Schema{
+		OneOf: []*oas3.JSONSchema[oas3.Referenceable]{
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](StringType()),
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](BoolType()),
+		},
+	}
+	u := Union([]*oas3.Schema{oneOf, IntegerType()}, DefaultOptions())
+	if !mightBeType(u, oas3.SchemaTypeInteger) {
+		t.Fatalf("integer branch was discarded: %s", schemaTypeSummary(u, 3))
+	}
+	// And the combinator branch must survive too.
+	found := false
+	for _, br := range u.AnyOf {
+		if br.Left != nil && len(br.Left.OneOf) > 0 {
+			found = true
+		}
+	}
+	if len(u.OneOf) > 0 {
+		found = true
+	}
+	if !found {
+		t.Fatalf("oneOf branch was discarded: %s", schemaTypeSummary(u, 3))
+	}
+}
+
+// TestSoundness_AnyOfEnumBranchesNotNarrowed: collapsing same-type anyOf
+// branches must union differing const/enum values, not keep only the first.
+func TestSoundness_AnyOfEnumBranchesNotNarrowed(t *testing.T) {
+	branchA := BuildObject(map[string]*oas3.Schema{"x": ConstString("a")}, []string{"x"})
+	branchB := BuildObject(map[string]*oas3.Schema{"x": ConstString("b")}, []string{"x"})
+	in := &oas3.Schema{
+		AnyOf: []*oas3.JSONSchema[oas3.Referenceable]{
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branchA),
+			oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branchB),
+		},
+	}
+	out := execExpr(t, ".x", in)
+	admitsValue := func(s *oas3.Schema, v string) bool {
+		var walk func(s *oas3.Schema) bool
+		walk = func(s *oas3.Schema) bool {
+			if s == nil {
+				return false
+			}
+			if len(s.Enum) == 0 && s.Const == nil && len(s.AnyOf) == 0 && len(s.OneOf) == 0 {
+				return MightBeString(s) // unconstrained string admits any value
+			}
+			for _, n := range s.Enum {
+				if n != nil && n.Value == v {
+					return true
+				}
+			}
+			if s.Const != nil && s.Const.Value == v {
+				return true
+			}
+			for _, br := range s.AnyOf {
+				if br.Left != nil && walk(br.Left) {
+					return true
+				}
+			}
+			for _, br := range s.OneOf {
+				if br.Left != nil && walk(br.Left) {
+					return true
+				}
+			}
+			return false
+		}
+		return walk(s)
+	}
+	if !admitsValue(out, "a") || !admitsValue(out, "b") {
+		t.Fatalf(".x must admit both \"a\" and \"b\", got %s", schemaTypeSummary(out, 3))
+	}
+}
+
+// TestSemantics_RawObjectMergeKeepsOpenWorld: under raw semantics, unioning an
+// open object with an object literal must not pin undeclared properties to the
+// literal's type.
+func TestSemantics_RawObjectMergeKeepsOpenWorld(t *testing.T) {
+	in := ObjectType() // type: object, no properties, no additionalProperties
+
+	q, err := gojq.Parse(`., {"x": "fixed"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultOptions()
+	opts.Semantics = SchemaSemanticsRaw
+	a, err := Analyze(context.Background(), q, in, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The identity branch admits {"x": 0}; a Proven output narrowed to
+	// x:string would exclude it.
+	if a.Verdict == VerdictProven {
+		if props := a.Output.Properties; props != nil {
+			if xs, ok := props.Get("x"); ok && xs.Left != nil && getType(xs.Left) == "string" {
+				t.Fatalf("raw semantics: undeclared x narrowed to string: %s", schemaTypeSummary(a.Output, 3))
+			}
+		}
+	}
+}
+
+// TestSemantics_RawIterationIncludesUndeclared: `.[]` over an object with a
+// declared property but absent additionalProperties must admit more than the
+// declared type under raw semantics.
+func TestSemantics_RawIterationIncludesUndeclared(t *testing.T) {
+	in := BuildObject(map[string]*oas3.Schema{"known": StringType()}, []string{"known"})
+
+	q, err := gojq.Parse(".[]")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultOptions()
+	opts.Semantics = SchemaSemanticsRaw
+	a, err := Analyze(context.Background(), q, in, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Verdict == VerdictProven && getType(a.Output) == "string" {
+		t.Fatalf("raw semantics: iteration excluded undeclared property values: %s", schemaTypeSummary(a.Output, 2))
+	}
+}
+
+// TestSemantics_RawBuiltinGuardsDoNotPrune: `split(",")` on an untyped schema
+// with properties must not be provably broken under raw semantics (the value
+// may legitimately be a string).
+func TestSemantics_RawBuiltinGuardsDoNotPrune(t *testing.T) {
+	in := untypedObject(map[string]*oas3.Schema{"id": StringType()}, []string{"id"})
+	inWrap := BuildObject(map[string]*oas3.Schema{"blob": in}, []string{"blob"})
+
+	q, err := gojq.Parse(`.blob | split(",")`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultOptions()
+	opts.Semantics = SchemaSemanticsRaw
+	a, err := Analyze(context.Background(), q, inWrap, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Verdict == VerdictProvenBroken {
+		t.Fatalf("raw semantics: split on untyped value must not be proven broken")
+	}
+}
+
+// TestSoundness_HasRespectsAdditionalProperties: has("extra") on an object
+// with additionalProperties: true may be true — never provably false.
+func TestSoundness_HasRespectsAdditionalProperties(t *testing.T) {
+	in := BuildObject(map[string]*oas3.Schema{"known": StringType()}, []string{"known"})
+	in.AdditionalProperties = oas3.NewJSONSchemaFromBool(true)
+
+	out := execExpr(t, `has("extra")`, in)
+	if len(out.Enum) == 1 && out.Enum[0].Value == "false" {
+		t.Fatalf(`has("extra") folded to const false despite additionalProperties: true`)
+	}
+}
+
+// TestSoundness_AddResolvesRefItems: add over an array whose items are a
+// $ref'd string schema must produce a string, not the numeric fallback.
+func TestSoundness_AddResolvesRefItems(t *testing.T) {
+	list := loadComponentSchema(t, refItemsDoc, "List")
+	// .items is array of $ref Item (objects) — use map(.name)|add for strings
+	out := runQuery(t, ".items | map(.name) | add", list)
+	if out == nil {
+		t.Fatal("got Bottom")
+	}
+	if getType(out) == "number" || getType(out) == "integer" {
+		t.Fatalf("add fell into numeric fallback on string items: %s", schemaTypeSummary(out, 2))
+	}
+}
+
+// TestSoundness_EmptyArrayNotDroppedAgainstNonArray: Union([[], string]) must
+// keep the empty-array alternative.
+func TestSoundness_EmptyArrayNotDroppedAgainstNonArray(t *testing.T) {
+	zero := int64(0)
+	emptyArr := &oas3.Schema{
+		Type:     oas3.NewTypeFromString(oas3.SchemaTypeArray),
+		MaxItems: &zero,
+	}
+	u := Union([]*oas3.Schema{emptyArr, StringType()}, DefaultOptions())
+	if !mightBeType(u, oas3.SchemaTypeArray) {
+		t.Fatalf("empty-array branch was discarded: %s", schemaTypeSummary(u, 3))
+	}
+}
+
+// TestSoundness_NullableRewriteSkipsEnums: Union([const "x", null]) must still
+// admit null explicitly — {enum:["x"], nullable:true} would not.
+func TestSoundness_NullableRewriteSkipsEnums(t *testing.T) {
+	u := Union([]*oas3.Schema{ConstString("x"), ConstNull()}, DefaultOptions())
+	if u.Nullable != nil && *u.Nullable && len(u.Enum) > 0 {
+		hasNull := false
+		for _, n := range u.Enum {
+			if n != nil && n.Tag == "!!null" {
+				hasNull = true
+			}
+		}
+		if !hasNull {
+			t.Fatalf("nullable+enum without null value excludes null: %s", schemaTypeSummary(u, 2))
+		}
+	}
+	if !mightBeType(u, oas3.SchemaTypeNull) {
+		t.Fatalf("null branch lost: %s", schemaTypeSummary(u, 2))
+	}
+}

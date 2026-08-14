@@ -92,22 +92,28 @@ func TestGetType_UsesImpliedTypes(t *testing.T) {
 	}
 }
 
-// TestMightBeType_RespectsImpliedTypes verifies the MightBeX helpers treat the
-// implied type as authoritative for untyped structural schemas.
-func TestMightBeType_RespectsImpliedTypes(t *testing.T) {
+// TestMightBeType_ConservativeForUntyped verifies the MightBeX helpers stay
+// CONSERVATIVE for untyped schemas: they gate builtins, and a false negative
+// would prune real outputs. (Structural inference narrows navigation dispatch
+// via getType, not these guards.)
+func TestMightBeType_ConservativeForUntyped(t *testing.T) {
 	obj := untypedObject(map[string]*oas3.Schema{"id": StringType()}, nil)
 	if !MightBeObject(obj) {
 		t.Error("untyped-with-properties should might-be object")
 	}
-	if MightBeString(obj) {
-		t.Error("untyped-with-properties should NOT might-be string (generator contract)")
+	if !MightBeString(obj) {
+		t.Error("untyped-with-properties must remain might-be string (guards must not prune)")
 	}
 	arr := untypedArray(StringType())
 	if !MightBeArray(arr) {
 		t.Error("untyped-with-items should might-be array")
 	}
-	if MightBeObject(arr) {
-		t.Error("untyped-with-items should NOT might-be object")
+	if !MightBeObject(arr) {
+		t.Error("untyped-with-items must remain might-be object (guards must not prune)")
+	}
+	// Explicitly typed schemas still gate exactly.
+	if MightBeString(ArrayType(StringType())) {
+		t.Error("typed array should not might-be string")
 	}
 	// Bare schema: could be anything.
 	if !MightBeString(&oas3.Schema{}) || !MightBeObject(&oas3.Schema{}) {
