@@ -159,6 +159,18 @@ func resolvedLeft(js *oas3.JSONSchema[oas3.Referenceable]) *oas3.Schema {
 	return js.Left
 }
 
+// dispatchType returns the type used to dispatch navigation (property access,
+// iteration, indexing) for a schema, honoring the configured SchemaSemantics:
+// Speakeasy mode consults structural inference for untyped schemas, Raw mode
+// requires an explicit type (untyped schemas conservatively widen at the
+// dispatch site).
+func (env *schemaEnv) dispatchType(s *oas3.Schema) string {
+	if env.opts.Semantics == SchemaSemanticsRaw {
+		return getTypeExplicit(s)
+	}
+	return getType(s)
+}
+
 // derefJSONSchema attempts to dereference a JSONSchema wrapper to get the actual Schema.
 // Tries GetResolvedSchema() first for $ref cases, then falls back to inline Left schemas.
 // Uses the provided normCtx for cycle-aware collapsing.
@@ -623,9 +635,28 @@ func collapseNestedSchemasCtx(ctx context.Context, schema *oas3.Schema) (*oas3.S
 	return result, nil
 }
 
+// mergePair identifies an in-progress (s1, s2, mode) merge for cycle detection.
+type mergePair struct {
+	a, b *oas3.Schema
+	mode MergeMode
+}
+
 // mergeSchemasMode deep merges two schemas according to the specified mode.
 // Returns an error if the schemas have incompatible constraints.
 func mergeSchemasMode(s1, s2 *oas3.Schema, mode MergeMode) (*oas3.Schema, error) {
+	return mergeSchemasModeGuarded(s1, s2, mode, make(map[mergePair]bool))
+}
+
+// mergeSchemasModeGuarded is mergeSchemasMode with a pair-keyed in-progress
+// set. Following resolved $refs means merge inputs can be cyclic (recursive
+// component schemas); re-entering the same (s1, s2, mode) pair must terminate.
+// On recurrence we return a conservative over-approximation instead of
+// recursing:
+//   - conjunctive (allOf): s1 without s2's constraints — a superset of the
+//     intersection, hence sound;
+//   - disjunctive (anyOf): an anyOf of both sides, representing the union
+//     without further merging.
+func mergeSchemasModeGuarded(s1, s2 *oas3.Schema, mode MergeMode, inProgress map[mergePair]bool) (*oas3.Schema, error) {
 	// Handle nil cases
 	if s1 == nil && s2 == nil {
 		return nil, nil
@@ -642,6 +673,21 @@ func mergeSchemasMode(s1, s2 *oas3.Schema, mode MergeMode) (*oas3.Schema, error)
 	if s1 == s2 {
 		return cloneSchema(s1), nil
 	}
+
+	pair := mergePair{a: s1, b: s2, mode: mode}
+	if inProgress[pair] {
+		if mode == MergeConjunctive {
+			return cloneSchema(s1), nil
+		}
+		return &oas3.Schema{
+			AnyOf: []*oas3.JSONSchema[oas3.Referenceable]{
+				oas3.NewJSONSchemaFromSchema[oas3.Referenceable](s1),
+				oas3.NewJSONSchemaFromSchema[oas3.Referenceable](s2),
+			},
+		}, nil
+	}
+	inProgress[pair] = true
+	defer delete(inProgress, pair)
 
 	result := cloneSchema(s1)
 
@@ -680,16 +726,24 @@ func mergeSchemasMode(s1, s2 *oas3.Schema, mode MergeMode) (*oas3.Schema, error)
 
 	// Merge properties (union of keys, recursively merge overlapping)
 	if s2.Properties != nil && s2.Properties.Len() > 0 {
-		if result.Properties == nil {
-			result.Properties = sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+		// COPY-ON-WRITE: cloneSchema is shallow, so result.Properties is the
+		// SAME map as s1.Properties. s1 may be a resolved component schema
+		// shared across the document; mutating it in place would corrupt the
+		// input and make results depend on merge order. Build a fresh map.
+		mergedProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+		if result.Properties != nil {
+			for key, prop := range result.Properties.All() {
+				mergedProps.Set(key, prop)
+			}
 		}
+		result.Properties = mergedProps
 
 		for key, prop2 := range s2.Properties.All() {
 			if prop1, exists := result.Properties.Get(key); exists {
 				// Merge the two property schemas ($refs followed via resolvedLeft)
 				left1, left2 := resolvedLeft(prop1), resolvedLeft(prop2)
 				if left1 != nil && left2 != nil {
-					merged, err := mergeSchemasMode(left1, left2, mode)
+					merged, err := mergeSchemasModeGuarded(left1, left2, mode, inProgress)
 					if err != nil {
 						return nil, fmt.Errorf("incompatible property %q: %w", key, err)
 					}
@@ -709,17 +763,21 @@ func mergeSchemasMode(s1, s2 *oas3.Schema, mode MergeMode) (*oas3.Schema, error)
 		// allOf: union of required fields (field required in ANY subschema)
 		if len(s2.Required) > 0 {
 			requiredSet := make(map[string]bool)
+			// Copy before append: the shallow clone shares s1's backing array.
+			merged := make([]string, 0, len(result.Required)+len(s2.Required))
 			for _, r := range result.Required {
+				merged = append(merged, r)
 				requiredSet[r] = true
 			}
 			for _, r := range s2.Required {
 				if !requiredSet[r] {
-					result.Required = append(result.Required, r)
+					merged = append(merged, r)
 					requiredSet[r] = true
 				}
 			}
 			// Sort for determinism
-			sort.Strings(result.Required)
+			sort.Strings(merged)
+			result.Required = merged
 		}
 	} else {
 		// anyOf: intersection of required fields (field required in ALL subschemas)
@@ -753,7 +811,7 @@ func mergeSchemasMode(s1, s2 *oas3.Schema, mode MergeMode) (*oas3.Schema, error)
 			result.Items = s2.Items
 		} else {
 			// Merge the item schemas
-			merged, err := mergeSchemasMode(items1, items2, mode)
+			merged, err := mergeSchemasModeGuarded(items1, items2, mode, inProgress)
 			if err != nil {
 				return nil, fmt.Errorf("incompatible array items: %w", err)
 			}
@@ -1937,11 +1995,11 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 func (env *schemaEnv) addWarning(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 
-	// Warnings are execution diagnostics: they are returned programmatically
-	// on SchemaExecResult.Warnings and only PRINTED when debug tracing is
-	// enabled. The library must be silent on stdout/stderr at the default log
-	// level.
-	env.logger.Debugf("%s", msg)
+	// Warnings are logged at warn level, but the DEFAULT LogLevel is ""
+	// (no logger): the library is silent on stdout/stderr unless a consumer
+	// opts into logging. Warnings always remain available programmatically
+	// on SchemaExecResult.Warnings.
+	env.logger.Warnf("%s", msg)
 
 	// Also collect in warnings array if enabled
 	if env.opts.EnableWarnings {
@@ -2098,7 +2156,7 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 	indexKey := c.value
 	var result *oas3.Schema
 
-	baseType := getType(base)
+	baseType := env.dispatchType(base)
 	switch baseType {
 	case "object":
 		if key, ok := indexKey.(string); ok {
@@ -2164,7 +2222,7 @@ func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, 
 		return []*execState{state}, nil
 	}
 
-	baseType := getType(val)
+	baseType := env.dispatchType(val)
 	var itemSchema *oas3.Schema
 
 	switch baseType {
@@ -3081,33 +3139,37 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 					env.addWarning("materialize: tagged array → canonical %s (items=%s, empty=%v, hasItems=%v, schemaPtr=%s, canonPtr=%s)",
 						allocID, canonicalItems, isEmpty, canonHasItems, schemaPtr, canonPtr)
 				}
-				// Recurse into the canonical array’s items/prefixItems before returning
+				// Recurse into the canonical array’s items/prefixItems before returning.
+				// Children are read via resolvedLeft and original wrappers are kept
+				// when unchanged, so resolved $ref children keep their resolution.
 				arr := *canonical
 				changed := false
 				// Items
-				if arr.Items != nil && arr.Items.Left != nil {
-					newItems := env.materializeArrays(arr.Items.Left, accum, schemaToAlloc, allocRedirect)
-					if newItems != arr.Items.Left {
+				if left := resolvedLeft(arr.Items); left != nil {
+					newItems := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+					if newItems != left {
 						arr.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newItems)
 						changed = true
 					}
 				}
 				// PrefixItems
-				if arr.PrefixItems != nil && len(arr.PrefixItems) > 0 {
+				if len(arr.PrefixItems) > 0 {
 					newPrefix := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(arr.PrefixItems))
+					prefixChanged := false
 					for _, pi := range arr.PrefixItems {
-						if pi != nil && pi.Left != nil {
-							newPi := env.materializeArrays(pi.Left, accum, schemaToAlloc, allocRedirect)
-							newPrefix = append(newPrefix, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newPi))
-							if newPi != pi.Left {
-								changed = true
+						if left := resolvedLeft(pi); left != nil {
+							newPi := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+							if newPi != left {
+								newPrefix = append(newPrefix, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newPi))
+								prefixChanged = true
+								continue
 							}
-						} else {
-							newPrefix = append(newPrefix, pi)
 						}
+						newPrefix = append(newPrefix, pi)
 					}
-					if changed {
+					if prefixChanged {
 						arr.PrefixItems = newPrefix
+						changed = true
 					}
 				}
 				if changed {
@@ -3119,35 +3181,38 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 
 		// Fallback: if this array has empty items, check if it IS a canonical array
 		// (handles arrays created by Union that aren't tagged)
-		hasEmptyItems := (schema.Items == nil || schema.Items.Left == nil || getType(schema.Items.Left) == "")
+		itemsLeft := resolvedLeft(schema.Items)
+		hasEmptyItems := (itemsLeft == nil || getType(itemsLeft) == "")
 		if hasEmptyItems {
 			for allocID, canonical := range accum {
 				if canonical == schema {
 					// This IS a canonical array - recurse into its internals
 					arr := *canonical
 					changed := false
-					if arr.Items != nil && arr.Items.Left != nil {
-						newItems := env.materializeArrays(arr.Items.Left, accum, schemaToAlloc, allocRedirect)
-						if newItems != arr.Items.Left {
+					if left := resolvedLeft(arr.Items); left != nil {
+						newItems := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+						if newItems != left {
 							arr.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newItems)
 							changed = true
 						}
 					}
-					if arr.PrefixItems != nil && len(arr.PrefixItems) > 0 {
+					if len(arr.PrefixItems) > 0 {
 						newPrefix := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(arr.PrefixItems))
+						prefixChanged := false
 						for _, pi := range arr.PrefixItems {
-							if pi != nil && pi.Left != nil {
-								newPi := env.materializeArrays(pi.Left, accum, schemaToAlloc, allocRedirect)
-								newPrefix = append(newPrefix, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newPi))
-								if newPi != pi.Left {
-                                    changed = true
-                                }
-							} else {
-								newPrefix = append(newPrefix, pi)
+							if left := resolvedLeft(pi); left != nil {
+								newPi := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+								if newPi != left {
+									newPrefix = append(newPrefix, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newPi))
+									prefixChanged = true
+									continue
+								}
 							}
+							newPrefix = append(newPrefix, pi)
 						}
-						if changed {
+						if prefixChanged {
 							arr.PrefixItems = newPrefix
+							changed = true
 						}
 					}
 					if env.opts.EnableWarnings {
@@ -3165,28 +3230,30 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 		// Un-tagged array: still recurse into Items/PrefixItems
 		clone := *schema
 		changed := false
-		if clone.Items != nil && clone.Items.Left != nil {
-			newItems := env.materializeArrays(clone.Items.Left, accum, schemaToAlloc)
-			if newItems != clone.Items.Left {
+		if left := resolvedLeft(clone.Items); left != nil {
+			newItems := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+			if newItems != left {
 				clone.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newItems)
 				changed = true
 			}
 		}
-		if clone.PrefixItems != nil && len(clone.PrefixItems) > 0 {
+		if len(clone.PrefixItems) > 0 {
 			newPrefix := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(clone.PrefixItems))
+			prefixChanged := false
 			for _, pi := range clone.PrefixItems {
-				if pi != nil && pi.Left != nil {
-					newPi := env.materializeArrays(pi.Left, accum, schemaToAlloc, allocRedirect)
-					newPrefix = append(newPrefix, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newPi))
-					if newPi != pi.Left {
-						changed = true
+				if left := resolvedLeft(pi); left != nil {
+					newPi := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+					if newPi != left {
+						newPrefix = append(newPrefix, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newPi))
+						prefixChanged = true
+						continue
 					}
-				} else {
-					newPrefix = append(newPrefix, pi)
 				}
+				newPrefix = append(newPrefix, pi)
 			}
-			if changed {
+			if prefixChanged {
 				clone.PrefixItems = newPrefix
+				changed = true
 			}
 		}
 		if changed {
@@ -3201,12 +3268,15 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 		modified := false
 		newProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
 		for k, propSchema := range schema.Properties.All() {
-			if propSchema.Left != nil {
-				materialized := env.materializeArrays(propSchema.Left, accum, schemaToAlloc, allocRedirect)
-				if materialized != propSchema.Left {
+			if left := resolvedLeft(propSchema); left != nil {
+				materialized := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+				if materialized != left {
 					modified = true
+					newProps.Set(k, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](materialized))
+				} else {
+					// Unchanged: keep the original wrapper (and its $ref resolution)
+					newProps.Set(k, propSchema)
 				}
-				newProps.Set(k, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](materialized))
 			} else {
 				newProps.Set(k, propSchema)
 			}
@@ -3223,9 +3293,9 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 			clone.Properties = newProps
 		}
 		// additionalProperties
-		if clone.AdditionalProperties != nil && clone.AdditionalProperties.Left != nil {
-			newAP := env.materializeArrays(clone.AdditionalProperties.Left, accum, schemaToAlloc, allocRedirect)
-			if newAP != clone.AdditionalProperties.Left {
+		if left := resolvedLeft(clone.AdditionalProperties); left != nil {
+			newAP := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+			if newAP != left {
 				clone.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newAP)
 				return &clone
 			}
@@ -3238,19 +3308,19 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 
 	// NEW: Traverse union structures (anyOf, oneOf, allOf)
 	// anyOf
-	if schema.AnyOf != nil && len(schema.AnyOf) > 0 {
+	if len(schema.AnyOf) > 0 {
 		changed := false
 		newAny := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(schema.AnyOf))
 		for _, br := range schema.AnyOf {
-			if br != nil && br.Left != nil {
-				newBr := env.materializeArrays(br.Left, accum, schemaToAlloc, allocRedirect)
-				newAny = append(newAny, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newBr))
-				if newBr != br.Left {
+			if left := resolvedLeft(br); left != nil {
+				newBr := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+				if newBr != left {
+					newAny = append(newAny, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newBr))
 					changed = true
+					continue
 				}
-			} else {
-				newAny = append(newAny, br)
 			}
+			newAny = append(newAny, br)
 		}
 		if changed {
 			clone := *schema
@@ -3259,19 +3329,19 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 		}
 	}
 	// oneOf
-	if schema.OneOf != nil && len(schema.OneOf) > 0 {
+	if len(schema.OneOf) > 0 {
 		changed := false
 		newOne := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(schema.OneOf))
 		for _, br := range schema.OneOf {
-			if br != nil && br.Left != nil {
-				newBr := env.materializeArrays(br.Left, accum, schemaToAlloc, allocRedirect)
-				newOne = append(newOne, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newBr))
-				if newBr != br.Left {
+			if left := resolvedLeft(br); left != nil {
+				newBr := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+				if newBr != left {
+					newOne = append(newOne, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newBr))
 					changed = true
+					continue
 				}
-			} else {
-				newOne = append(newOne, br)
 			}
+			newOne = append(newOne, br)
 		}
 		if changed {
 			clone := *schema
@@ -3280,19 +3350,19 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 		}
 	}
 	// allOf
-	if schema.AllOf != nil && len(schema.AllOf) > 0 {
+	if len(schema.AllOf) > 0 {
 		changed := false
 		newAll := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(schema.AllOf))
 		for _, br := range schema.AllOf {
-			if br != nil && br.Left != nil {
-				newBr := env.materializeArrays(br.Left, accum, schemaToAlloc, allocRedirect)
-				newAll = append(newAll, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newBr))
-				if newBr != br.Left {
+			if left := resolvedLeft(br); left != nil {
+				newBr := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+				if newBr != left {
+					newAll = append(newAll, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newBr))
 					changed = true
+					continue
 				}
-			} else {
-				newAll = append(newAll, br)
 			}
+			newAll = append(newAll, br)
 		}
 		if changed {
 			clone := *schema

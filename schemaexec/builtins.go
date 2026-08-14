@@ -1898,18 +1898,18 @@ func explodeAlternatives(s *oas3.Schema) []*oas3.Schema {
 		return nil
 	}
 
-	// Gather direct union branches if present
+	// Gather direct union branches if present ($refs followed via resolvedLeft)
 	branches := make([]*oas3.Schema, 0, 4)
 	if len(s.AnyOf) > 0 {
 		for _, br := range s.AnyOf {
-			if br != nil && br.Left != nil {
-				branches = append(branches, br.Left)
+			if left := resolvedLeft(br); left != nil {
+				branches = append(branches, left)
 			}
 		}
 	} else if len(s.OneOf) > 0 {
 		for _, br := range s.OneOf {
-			if br != nil && br.Left != nil {
-				branches = append(branches, br.Left)
+			if left := resolvedLeft(br); left != nil {
+				branches = append(branches, left)
 			}
 		}
 	}

@@ -58,6 +58,15 @@ type Analysis struct {
 	// VerdictUnverifiable and VerdictProvenBroken, e.g.
 	// "property access on non-object type at $.anyOf[0]".
 	Causes []string
+
+	// Semantics records the schema interpretation mode the analysis ran
+	// under. Verdicts are only meaningful relative to it: under the default
+	// SchemaSemanticsSpeakeasy, "valid input" means a value as modeled by
+	// Speakeasy's generators (closed objects, implied types), NOT an
+	// arbitrary payload the wire could carry. Under SchemaSemanticsRaw a
+	// missing property is never provably broken without an explicit
+	// additionalProperties: false.
+	Semantics SchemaSemantics
 }
 
 // Analyze symbolically executes a jq query against an input schema and
@@ -83,6 +92,13 @@ type Analysis struct {
 // jq missing-key semantics are respected: optional property access yields
 // null UNIONED with the real types, which stays Proven. Only an output that
 // is null for every input (or has no output at all) is ProvenBroken.
+//
+// Verdicts are relative to opts.Semantics (echoed on Analysis.Semantics).
+// Under the default SchemaSemanticsSpeakeasy, "valid input" means a value as
+// modeled by Speakeasy's generators — objects are closed, so access to an
+// undeclared property is provably null (typo detection). Under
+// SchemaSemanticsRaw, objects without additionalProperties are open and such
+// access is merely Unverifiable.
 func Analyze(ctx context.Context, q *gojq.Query, input *oas3.Schema, opts ...SchemaExecOptions) (*Analysis, error) {
 	opt := DefaultOptions()
 	if len(opts) > 0 {
@@ -106,7 +122,7 @@ func Analyze(ctx context.Context, q *gojq.Query, input *oas3.Schema, opts ...Sch
 		return nil, err
 	}
 
-	analysis := &Analysis{Output: result.Schema}
+	analysis := &Analysis{Output: result.Schema, Semantics: opt.Semantics}
 	analysis.Verdict, analysis.Causes = classifyOutput(result.Schema, env.topCauses)
 	return analysis, nil
 }
@@ -265,5 +281,51 @@ func collectSchemaIssuesPath(schema *oas3.Schema, path string, topCauses map[*oa
 
 	if left := resolvedLeft(schema.UnevaluatedProperties); left != nil {
 		collectSchemaIssuesPath(left, path+".unevaluatedProperties", topCauses, seen, issues)
+	}
+
+	if left := resolvedLeft(schema.UnevaluatedItems); left != nil {
+		collectSchemaIssuesPath(left, path+".unevaluatedItems", topCauses, seen, issues)
+	}
+
+	if schema.PatternProperties != nil {
+		for k, prop := range schema.PatternProperties.All() {
+			if left := resolvedLeft(prop); left != nil {
+				collectSchemaIssuesPath(left, fmt.Sprintf("%s.patternProperties.%s", path, k), topCauses, seen, issues)
+			}
+		}
+	}
+
+	if left := resolvedLeft(schema.PropertyNames); left != nil {
+		collectSchemaIssuesPath(left, path+".propertyNames", topCauses, seen, issues)
+	}
+
+	if schema.DependentSchemas != nil {
+		for k, dep := range schema.DependentSchemas.All() {
+			if left := resolvedLeft(dep); left != nil {
+				collectSchemaIssuesPath(left, fmt.Sprintf("%s.dependentSchemas.%s", path, k), topCauses, seen, issues)
+			}
+		}
+	}
+
+	if left := resolvedLeft(schema.If); left != nil {
+		collectSchemaIssuesPath(left, path+".if", topCauses, seen, issues)
+	}
+	if left := resolvedLeft(schema.Then); left != nil {
+		collectSchemaIssuesPath(left, path+".then", topCauses, seen, issues)
+	}
+	if left := resolvedLeft(schema.Else); left != nil {
+		collectSchemaIssuesPath(left, path+".else", topCauses, seen, issues)
+	}
+
+	if left := resolvedLeft(schema.ContentSchema); left != nil {
+		collectSchemaIssuesPath(left, path+".contentSchema", topCauses, seen, issues)
+	}
+
+	if schema.Defs != nil {
+		for k, def := range schema.Defs.All() {
+			if left := resolvedLeft(def); left != nil {
+				collectSchemaIssuesPath(left, fmt.Sprintf("%s.$defs.%s", path, k), topCauses, seen, issues)
+			}
+		}
 	}
 }

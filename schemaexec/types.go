@@ -10,8 +10,43 @@ type SValue struct {
 	Schema *oas3.Schema
 }
 
+// SchemaSemantics selects how the executor interprets schemas that do not
+// fully specify their shape.
+type SchemaSemantics int
+
+const (
+	// SchemaSemanticsSpeakeasy (the default) targets Speakeasy-processed
+	// OpenAPI documents and mirrors the structural inference Speakeasy's
+	// SDK/CLI generators apply:
+	//   - untyped schemas get an implied type from structure (enum→string,
+	//     const→its scalar type, properties/additionalProperties→object,
+	//     items→array);
+	//   - an object property that is not declared and has no
+	//     additionalProperties is treated as ABSENT (closed world): access
+	//     yields null. "Valid input" means a value as modeled by the
+	//     generator, not an arbitrary API payload.
+	SchemaSemanticsSpeakeasy SchemaSemantics = iota
+
+	// SchemaSemanticsRaw keeps raw JSON Schema semantics at navigation:
+	//   - untyped schemas are NOT implied to a single type when dispatching
+	//     property access/iteration; they conservatively widen to Top;
+	//   - an object property that is not declared and has no
+	//     additionalProperties is treated as OPEN (additionalProperties
+	//     defaults to true in JSON Schema): access yields unknown ∪ null,
+	//     so nothing is ever "provably missing" without an explicit
+	//     additionalProperties: false.
+	// Note: auxiliary type-compatibility guards inside builtins may still
+	// consult structural inference for precision; schemas reaching them have
+	// normally already been widened by raw-mode dispatch.
+	SchemaSemanticsRaw
+)
+
 // SchemaExecOptions configures symbolic execution behavior.
 type SchemaExecOptions struct {
+	// Semantics selects the schema interpretation mode (see SchemaSemantics).
+	// The zero value is SchemaSemanticsSpeakeasy.
+	Semantics SchemaSemantics
+
 	// Limits to prevent combinatorial explosion
 	AnyOfLimit int // Max branches in anyOf before widening (default: 10)
 	EnumLimit  int // Max enum values before widening to plain type (default: 50)
@@ -29,7 +64,7 @@ type SchemaExecOptions struct {
 	WideningLevel int // default: 1
 
 	// Logging configuration
-	LogLevel             string // Log level: "error", "warn", "info", "debug" (default: "warn")
+	LogLevel             string // Log level: "", "error", "warn", "info", "debug". Default "": no output — the library is silent on stdout/stderr unless a level is set.
 	LogMaxEnumValues     int    // Max enum values to show in logs (default: 5)
 	LogMaxProps          int    // Max object properties to show in logs (default: 5)
 	LogStackPreviewDepth int    // Max stack depth to preview in logs (default: 3)
@@ -67,7 +102,8 @@ func DefaultOptions() SchemaExecOptions {
 		EnableWarnings:       true,
 		EnableMemo:           true,
 		WideningLevel:        1,
-		LogLevel:             "warn",
+		LogLevel:             "", // silent by default; set "warn"/"debug" to log
+
 		LogMaxEnumValues:     5,
 		LogMaxProps:          5,
 		LogStackPreviewDepth: 3,

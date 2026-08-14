@@ -139,6 +139,12 @@ func getPropertyWithNull(obj *oas3.Schema, name string, opts SchemaExecOptions) 
 		// Unreachable path: no value produced, do not widen with null
 		return Bottom()
 	}
+	// Unresolved $ref shell (only Ref set): we cannot see the referenced
+	// schema's shape, so answering "missing → null" would discard the
+	// referenced property's values (unsound). Widen instead.
+	if obj.IsReference() {
+		return Top()
+	}
 	// Only apply to objects; for non-object types, jq property access on them will be widened elsewhere.
 	// Consider object shape (properties/additionalProperties) as objects even if 'type' is omitted
 	if getType(obj) != "object" && obj.Properties == nil && obj.AdditionalProperties == nil {
@@ -175,7 +181,15 @@ func getPropertyWithNull(obj *oas3.Schema, name string, opts SchemaExecOptions) 
 		return Union([]*oas3.Schema{Top(), ConstNull()}, opts)
 	}
 
-	// Not declared and no additionalProperties ⇒ definitely missing
+	// Not declared and no additionalProperties.
+	// SchemaSemanticsSpeakeasy (default): closed world — the generator models
+	// exactly the declared properties, so the value is definitely absent and
+	// access yields null. This is what makes typo'd leaves PROVABLY broken.
+	// SchemaSemanticsRaw: additionalProperties defaults to true in JSON
+	// Schema, so the property may exist with any value — unknown ∪ null.
+	if opts.Semantics == SchemaSemanticsRaw {
+		return Union([]*oas3.Schema{Top(), ConstNull()}, opts)
+	}
 	return ConstNull()
 }
 
@@ -441,14 +455,14 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		return filtered[0]
 	}
 
-	// Flatten nested anyOf schemas
+	// Flatten nested anyOf schemas ($ref branches followed via resolvedLeft)
 	flattened := make([]*oas3.Schema, 0, len(filtered)*2)
 	for _, s := range filtered {
 		if len(s.AnyOf) > 0 {
 			// Extract nested anyOf branches
 			for _, branch := range s.AnyOf {
-				if branch.Left != nil {
-					flattened = append(flattened, branch.Left)
+				if left := resolvedLeft(branch); left != nil {
+					flattened = append(flattened, left)
 				}
 			}
 		} else {
@@ -642,13 +656,22 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		return widenUnion(collapsed, opts)
 	}
 
-	// Filter out empty/corrupt schemas before creating anyOf
+	// Partition remaining branches. Soundness rules:
+	// - Bottom branches contribute nothing and are dropped.
+	// - A Top (fully unconstrained) branch dominates: the union admits
+	//   everything, so the result is Top.
+	// - Everything else is kept, INCLUDING schemas with no primary type:
+	//   combinator-bearing schemas (oneOf/allOf/not/...) are valid union
+	//   members, not corrupt. Dropping them would discard possible outputs.
 	validSchemas := make([]*oas3.Schema, 0, len(collapsed))
 	for _, s := range collapsed {
-		// Skip schemas with no type (corrupt/empty)
-		if getType(s) != "" {
-			validSchemas = append(validSchemas, s)
+		if s == nil {
+			continue // Bottom
 		}
+		if isTopSchema(s) {
+			return Top()
+		}
+		validSchemas = append(validSchemas, s)
 	}
 
 	// If only one valid schema remains, return it directly
@@ -657,7 +680,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	}
 
 	if len(validSchemas) == 0 {
-		return Top() // All were corrupt
+		return Top() // Nothing concrete survived; stay conservative
 	}
 
 	// Create anyOf
@@ -869,8 +892,8 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 		for _, s := range schemas {
 			if s.Properties != nil {
 				if propSchema, ok := s.Properties.Get(propName); ok {
-					if propSchema.GetLeft() != nil {
-						propSchemas = append(propSchemas, propSchema.GetLeft())
+					if left := resolvedLeft(propSchema); left != nil {
+						propSchemas = append(propSchemas, left)
 					}
 				}
 			}
@@ -903,36 +926,15 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 		}
 
 		if len(propSchemas) > 0 {
-			// CRITICAL FIX: Filter out unconstrained/unknown schemas before Union to preserve precision
-			// When merging {id: {type: string}} with {id: {}}, keep {type: string}
-			// Empty schemas {} represent "unknown" and should not eliminate concrete schemas
-			filteredSchemas := make([]*oas3.Schema, 0, len(propSchemas))
-			hasConcreteSchema := false
-			unconstrainedCount := 0
-			for _, ps := range propSchemas {
-				if !isUnconstrainedSchema(ps) {
-					filteredSchemas = append(filteredSchemas, ps)
-					hasConcreteSchema = true
-				} else {
-					unconstrainedCount++
-				}
-			}
-			// If all are unconstrained, keep exactly one
-			if !hasConcreteSchema && len(propSchemas) > 0 {
-				filteredSchemas = []*oas3.Schema{propSchemas[0]}
-			}
-
-			// DEBUG: Log when we filter out unconstrained schemas for "value" property
-			if opts.EnableWarnings && propName == "value" && unconstrainedCount > 0 {
-				opts.debugf("tryMergeObjects: property=%s had %d schemas (%d unconstrained, %d concrete)",
-					propName, len(propSchemas), unconstrainedCount, len(filteredSchemas))
-				for i, ps := range propSchemas {
-					opts.debugf("  [%d] type=%s, unconstrained=%v", i, getType(ps), isUnconstrainedSchema(ps))
-				}
-			}
-
-			// Recursively union the property schemas
-			unionSchema := Union(filteredSchemas, opts)
+			// SOUNDNESS: do NOT filter out unconstrained (Top) branches here.
+			// If any execution path leaves this property unconstrained, the
+			// merged property must admit everything — Union's Top-domination
+			// handles that. Dropping Top to "preserve precision" discarded
+			// possible outputs (e.g. {x: <unknown>} merged with {x: "ok"}
+			// silently became {x: "ok"}), which broke the over-approximation
+			// contract and let the Analyze API claim Proven on outputs it
+			// had actually narrowed.
+			unionSchema := Union(propSchemas, opts)
 			// Unwrap single-branch anyOf
 			if len(unionSchema.AnyOf) == 1 && unionSchema.AnyOf[0].GetLeft() != nil {
 				unionSchema = unionSchema.AnyOf[0].GetLeft()
@@ -977,8 +979,8 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 					seenTrue = true
 				}
 			}
-			if s.AdditionalProperties.Left != nil {
-				apSchemas = append(apSchemas, s.AdditionalProperties.Left)
+			if left := resolvedLeft(s.AdditionalProperties); left != nil {
+				apSchemas = append(apSchemas, left)
 			}
 		} else {
 			nilCount++
@@ -1488,8 +1490,20 @@ func impliedTypeOf(s *oas3.Schema) string {
 // getType returns the primary type from a schema.
 // Returns empty string if no type or multiple types.
 // When no explicit type is declared and no combinators are present, the type
-// is structurally implied via impliedTypeOf (generator-equivalence contract).
+// is structurally implied via impliedTypeOf (generator-equivalence contract,
+// SchemaSemanticsSpeakeasy). Dispatch sites that must honor
+// SchemaSemanticsRaw use getTypeExplicit via schemaEnv.dispatchType instead.
 func getType(s *oas3.Schema) string {
+	return getTypeImpl(s, true)
+}
+
+// getTypeExplicit is getType without structural inference: only explicitly
+// declared types (or uniform anyOf branches) are reported.
+func getTypeExplicit(s *oas3.Schema) string {
+	return getTypeImpl(s, false)
+}
+
+func getTypeImpl(s *oas3.Schema, allowImplied bool) string {
 	if s == nil {
 		return ""
 	}
@@ -1498,22 +1512,23 @@ func getType(s *oas3.Schema) string {
 	// ($ref branches are followed via resolvedLeft)
 	if len(s.AnyOf) > 0 {
 		firstType := ""
-		allSame := true
 		for _, branch := range s.AnyOf {
 			if left := resolvedLeft(branch); left != nil {
-				branchType := getType(left)
+				branchType := getTypeImpl(left, allowImplied)
+				if branchType == "" {
+					// Unknown/combinator branch: the union's type is not a
+					// single primary type. Reporting the OTHER branches' type
+					// here would misclassify (and discard) this branch.
+					return ""
+				}
 				if firstType == "" {
 					firstType = branchType
 				} else if firstType != branchType {
-					allSame = false
-					break
+					return "" // Mixed types in anyOf
 				}
 			}
 		}
-		if allSame && firstType != "" {
-			return firstType
-		}
-		return "" // Mixed types in anyOf
+		return firstType
 	}
 
 	types := s.GetType()
@@ -1521,7 +1536,7 @@ func getType(s *oas3.Schema) string {
 		// No explicit type. Fall back to structural inference (implied types),
 		// mirroring the generator. anyOf was handled above; allOf/oneOf are
 		// collapsed by their own paths and must not be second-guessed here.
-		if len(s.AllOf) == 0 && len(s.OneOf) == 0 {
+		if allowImplied && len(s.AllOf) == 0 && len(s.OneOf) == 0 {
 			return impliedTypeOf(s)
 		}
 		return ""
