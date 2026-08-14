@@ -827,3 +827,144 @@ func TestSoundness_AppendKeepsNestedArrayItem(t *testing.T) {
 		t.Fatalf("items must admit both the nested array and the integer, got %s", schemaTypeSummary(items, 3))
 	}
 }
+
+// --- Verdict-round probes ---
+
+// TestSoundness_KeysToEntriesOnArrays: jq defines keys/to_entries on arrays
+// (index keys); they must not be provably broken.
+func TestSoundness_KeysToEntriesOnArrays(t *testing.T) {
+	arr := ArrayType(StringType())
+	a := analyzeExpr(t, "keys", arr)
+	if a.Verdict == VerdictProvenBroken {
+		t.Fatal("keys on array must not be ProvenBroken")
+	}
+	b := analyzeExpr(t, "to_entries", arr)
+	if b.Verdict == VerdictProvenBroken {
+		t.Fatal("to_entries on array must not be ProvenBroken")
+	}
+}
+
+// TestSoundness_ToEntriesPatternProperties: an object whose keys come from
+// patternProperties has entries.
+func TestSoundness_ToEntriesPatternProperties(t *testing.T) {
+	obj := ObjectType()
+	obj.PatternProperties = sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+	obj.PatternProperties.Set("^x$", oas3.NewJSONSchemaFromSchema[oas3.Referenceable](StringType()))
+	obj.AdditionalProperties = oas3.NewJSONSchemaFromBool(false)
+
+	a := analyzeExpr(t, "to_entries | .[]", obj)
+	if a.Verdict == VerdictProvenBroken {
+		t.Fatal("to_entries over pattern-keyed object must not be ProvenBroken")
+	}
+}
+
+// TestSoundness_OneOfSiblingBaseConstraints: sibling properties next to a
+// oneOf must keep contributing to property access.
+func TestSoundness_OneOfSiblingBaseConstraints(t *testing.T) {
+	base := BuildObject(map[string]*oas3.Schema{"x": StringType()}, []string{"x"})
+	base.OneOf = []*oas3.JSONSchema[oas3.Referenceable]{
+		oas3.NewJSONSchemaFromSchema[oas3.Referenceable](&oas3.Schema{}),
+	}
+	a := analyzeExpr(t, ".x", base)
+	if a.Verdict == VerdictProvenBroken {
+		t.Fatalf(".x with sibling properties beside oneOf must not be ProvenBroken")
+	}
+	if !MightBeString(a.Output) {
+		t.Errorf(".x should admit the declared string, got %s", schemaTypeSummary(a.Output, 2))
+	}
+}
+
+// TestSoundness_GetpathSetpathNotProvenBroken: path ops on shapes the model
+// does not fully cover must degrade to Unverifiable, never ProvenBroken.
+func TestSoundness_GetpathSetpathNotProvenBroken(t *testing.T) {
+	obj := BuildObject(map[string]*oas3.Schema{"x": StringType()}, nil) // x optional
+	a := analyzeExpr(t, `getpath(["x"])`, obj)
+	if a.Verdict == VerdictProvenBroken {
+		t.Fatal("getpath on an optional declared property must not be ProvenBroken")
+	}
+
+	b := analyzeExpr(t, `setpath(["x"]; 1)`, ConstNull())
+	if b.Verdict == VerdictProvenBroken {
+		t.Fatal("setpath on null (which creates {x:1}) must not be ProvenBroken")
+	}
+}
+
+// TestSoundness_NullableFlowsThroughOperations: the {type,nullable:true}
+// representation must stay visible to navigation, type, and unions.
+func TestSoundness_NullableFlowsThroughOperations(t *testing.T) {
+	nb := true
+
+	// Property access on a nullable object: null.x → null is possible.
+	innerObj := BuildObject(map[string]*oas3.Schema{"x": StringType()}, []string{"x"})
+	innerObj.Nullable = &nb
+	in := BuildObject(map[string]*oas3.Schema{"o": innerObj}, []string{"o"})
+	a := analyzeExpr(t, ".o.x", in)
+	if !mightBeType(a.Output, oas3.SchemaTypeNull) &&
+		!(a.Output != nil && a.Output.Nullable != nil && *a.Output.Nullable) {
+		t.Fatalf(".o.x on nullable object must admit null, got %s", schemaTypeSummary(a.Output, 2))
+	}
+
+	// type on a nullable string must admit "null".
+	nullableStr := StringType()
+	nullableStr.Nullable = &nb
+	b := analyzeExpr(t, "type", nullableStr)
+	admitsNullStr := false
+	var walk func(s *oas3.Schema)
+	walk = func(s *oas3.Schema) {
+		if s == nil {
+			return
+		}
+		for _, n := range s.Enum {
+			if n != nil && n.Value == "null" {
+				admitsNullStr = true
+			}
+		}
+		for _, br := range s.AnyOf {
+			walk(resolvedLeft(br))
+		}
+	}
+	walk(b.Output)
+	if !admitsNullStr {
+		t.Fatalf("type on nullable string must admit \"null\", got %s", schemaTypeSummary(b.Output, 3))
+	}
+
+	// Union must not subsume a nullable branch into a non-nullable one.
+	c := analyzeExpr(t, "., tostring", nullableStr)
+	if !mightBeType(c.Output, oas3.SchemaTypeNull) &&
+		!(c.Output != nil && c.Output.Nullable != nil && *c.Output.Nullable) {
+		t.Fatalf("union dropped the nullable branch: %s", schemaTypeSummary(c.Output, 3))
+	}
+}
+
+// TestSoundness_EmptyArrayFolds: add/min over a possibly-empty array admit
+// null; a proven-non-empty array does not.
+func TestSoundness_EmptyArrayFolds(t *testing.T) {
+	arr := ArrayType(NumberType())
+	for _, expr := range []string{"add", "min"} {
+		a := analyzeExpr(t, expr, arr)
+		nullable := a.Output != nil && a.Output.Nullable != nil && *a.Output.Nullable
+		if !nullable && !mightBeType(a.Output, oas3.SchemaTypeNull) {
+			t.Errorf("%s over possibly-empty array must admit null, got %s", expr, schemaTypeSummary(a.Output, 2))
+		}
+	}
+
+	one := int64(1)
+	nonEmpty := ArrayType(NumberType())
+	nonEmpty.MinItems = &one
+	b := analyzeExpr(t, "add", nonEmpty)
+	if got := getType(b.Output); got != "number" {
+		t.Errorf("add over minItems:1 number array should be number, got %q", got)
+	}
+}
+
+// TestSoundness_SliceClearsMinItems: .[0:0] can be empty regardless of the
+// source array's minItems.
+func TestSoundness_SliceClearsMinItems(t *testing.T) {
+	three := int64(3)
+	arr := ArrayType(StringType())
+	arr.MinItems = &three
+	a := analyzeExpr(t, ".[0:0]", arr)
+	if a.Output != nil && a.Output.MinItems != nil && *a.Output.MinItems > 0 {
+		t.Fatalf("slice output kept minItems=%d; slices can be empty", *a.Output.MinItems)
+	}
+}

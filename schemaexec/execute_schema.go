@@ -2456,6 +2456,8 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 	indexKey := c.value
 	var result *oas3.Schema
 
+	baseNullable := base != nil && base.Nullable != nil && *base.Nullable
+
 	baseType := env.dispatchType(base)
 	switch baseType {
 	case "object":
@@ -2466,9 +2468,13 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 			result = Top()
 		}
 	case "array":
-		// Array slicing: .[start:end] returns same array type
+		// Array slicing: .[start:end] returns the same item type, but the
+		// slice may be shorter (or empty) than the source — a lower bound on
+		// length does not survive slicing.
 		if isSliceIndex(indexKey) {
-			result = base
+			sliced := cloneSchema(base)
+			sliced.MinItems = nil
+			result = sliced
 		} else {
 			result = getArrayElement(base, indexKey, env.opts)
 		}
@@ -2484,6 +2490,12 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 			// Not a property access; keep existing conservative behavior.
 			result = Top()
 		}
+	}
+
+	// jq: indexing/property access on null yields null. A nullable base can
+	// BE null, so null joins the result.
+	if baseNullable && result != nil && !isTopSchema(result) {
+		result = Union([]*oas3.Schema{result, ConstNull()}, env.opts)
 	}
 
 	state.push(result)

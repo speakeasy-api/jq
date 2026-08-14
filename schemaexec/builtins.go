@@ -151,7 +151,10 @@ func builtinType(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 	}
 
 	if len(types) == 1 {
-		// Single type - return const string
+		// Single type - return const string ("null" joins for nullable)
+		if input.Nullable != nil && *input.Nullable {
+			return []*oas3.Schema{ConstString(string(types[0])), ConstString("null")}, nil
+		}
 		return []*oas3.Schema{ConstString(string(types[0]))}, nil
 	}
 
@@ -174,10 +177,21 @@ func builtinLength(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*
 	return []*oas3.Schema{schema}, nil
 }
 
-// builtinKeys returns an array of string keys.
+// builtinKeys returns an array of string keys (or indices for arrays).
 func builtinKeys(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeObject(input) {
+	// jq: keys on an ARRAY yields the index list [0, 1, ...].
+	if getType(input) == "array" {
+		idx := IntegerType()
+		zero := 0.0
+		idx.Minimum = &zero
+		return []*oas3.Schema{ArrayType(idx)}, nil
+	}
+	if !MightBeObject(input) && !MightBeArray(input) {
 		return []*oas3.Schema{Bottom()}, nil
+	}
+	if getType(input) != "object" {
+		// Could be an object or an array: keys are strings or indices.
+		return []*oas3.Schema{ArrayType(Top())}, nil
 	}
 
 	// Collect known keys
@@ -342,6 +356,16 @@ func builtinAdd(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 		return []*oas3.Schema{Bottom()}, nil
 	}
 
+	// jq: add over an EMPTY array yields null. Unless minItems proves the
+	// array non-empty, null is a possible output.
+	maybeEmpty := input.MinItems == nil || *input.MinItems == 0
+	withEmptyNull := func(result *oas3.Schema) []*oas3.Schema {
+		if maybeEmpty {
+			return []*oas3.Schema{Union([]*oas3.Schema{result, ConstNull()}, env.opts)}
+		}
+		return []*oas3.Schema{result}
+	}
+
 	// Get item type ($ref'd items followed via resolvedLeft)
 	var itemType string
 	if left := resolvedLeft(input.Items); left != nil {
@@ -350,25 +374,25 @@ func builtinAdd(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 
 	// add on number array -> number
 	if itemType == "number" || itemType == "integer" {
-		return []*oas3.Schema{NumberType()}, nil
+		return withEmptyNull(NumberType()), nil
 	}
 
 	// add on string array -> string
 	if itemType == "string" {
-		return []*oas3.Schema{StringType()}, nil
+		return withEmptyNull(StringType()), nil
 	}
 
 	// add on array array -> array (concatenation)
 	if itemType == "array" {
 		if left := resolvedLeft(input.Items); left != nil {
-			return []*oas3.Schema{left}, nil
+			return withEmptyNull(left), nil
 		}
 	}
 
 	// add on object array -> object (merge)
 	if itemType == "object" {
 		if left := resolvedLeft(input.Items); left != nil {
-			return []*oas3.Schema{left}, nil
+			return withEmptyNull(left), nil
 		}
 	}
 
@@ -411,9 +435,15 @@ func builtinMinMax(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*
 		return []*oas3.Schema{Bottom()}, nil
 	}
 
-	// Return item type
-	if input.Items != nil && input.Items.Left != nil {
-		return []*oas3.Schema{input.Items.Left}, nil
+	// jq: min/max of an EMPTY array is null.
+	maybeEmpty := input.MinItems == nil || *input.MinItems == 0
+
+	// Return item type (∪ null when the array may be empty)
+	if left := resolvedLeft(input.Items); left != nil {
+		if maybeEmpty {
+			return []*oas3.Schema{Union([]*oas3.Schema{left, ConstNull()}, env.opts)}, nil
+		}
+		return []*oas3.Schema{left}, nil
 	}
 
 	return []*oas3.Schema{Top()}, nil
@@ -425,8 +455,27 @@ func builtinMinMax(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*
 
 // builtinToEntries converts {a:1, b:2} to [{key:"a", value:1}, {key:"b", value:2}]
 func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeObject(input) {
+	// jq: to_entries on an ARRAY yields [{key: index, value: item}, ...].
+	if getType(input) == "array" {
+		idx := IntegerType()
+		zero := 0.0
+		idx.Minimum = &zero
+		itemVal := Top()
+		if left := resolvedLeft(input.Items); left != nil {
+			itemVal = left
+		}
+		entry := BuildObject(map[string]*oas3.Schema{
+			"key":   idx,
+			"value": itemVal,
+		}, []string{"key", "value"})
+		return []*oas3.Schema{ArrayType(entry)}, nil
+	}
+	if !MightBeObject(input) && !MightBeArray(input) {
 		return []*oas3.Schema{Bottom()}, nil
+	}
+	if getType(input) != "object" {
+		// Could be an object or an array: entry shape unknown.
+		return []*oas3.Schema{ArrayType(Top())}, nil
 	}
 
 	// DEBUG: Log input object structure
@@ -458,7 +507,8 @@ func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 	// unionAllObjectValues returns Top for both an open object (AP true /
 	// raw-mode absent AP) and genuinely unknown values, so the emptiness
 	// decision must come from object closure, not from the value union.
-	noDeclared := input.Properties == nil || input.Properties.Len() == 0
+	noDeclared := (input.Properties == nil || input.Properties.Len() == 0) &&
+		(input.PatternProperties == nil || input.PatternProperties.Len() == 0)
 	apForbids := input.AdditionalProperties == nil ||
 		(input.AdditionalProperties.Right != nil && !*input.AdditionalProperties.Right)
 	openWorld := env.opts.Semantics == SchemaSemanticsRaw && input.AdditionalProperties == nil
@@ -1357,14 +1407,15 @@ func builtinDelpaths(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([
 // builtinGetpath implements getpath(path) - get value at path
 func builtinGetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
 	if len(args) == 0 {
-		return []*oas3.Schema{Bottom()}, nil
+		return []*oas3.Schema{env.NewTopWithCause("getpath: missing path argument")}, nil
 	}
 
 	pathArg := args[0]
 	paths := extractPathsFromSchema(pathArg)
 
 	if len(paths) == 0 {
-		return []*oas3.Schema{Bottom()}, nil
+		// Path argument shape not modeled — absence cannot be proven.
+		return []*oas3.Schema{env.NewTopWithCause("getpath: path argument not modeled; result not proven")}, nil
 	}
 
 	// For single path, navigate and return schema at that location
@@ -1374,14 +1425,38 @@ func builtinGetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 		results[i] = navigatePathInSchema(input, path, env.opts)
 	}
 
-	if len(results) == 1 {
-		return []*oas3.Schema{results[0]}, nil
+	result := results[0]
+	if len(results) > 1 {
+		result = Union(results, env.opts)
 	}
-	return []*oas3.Schema{Union(results, env.opts)}, nil
+	// Path navigation does not yet model optional properties and non-object
+	// receivers faithfully; a Bottom/null-only conclusion here is not
+	// trustworthy enough for hard verdicts. Downgrade to Unverifiable.
+	if isBottomSchema(result) || getType(result) == "null" {
+		return []*oas3.Schema{env.NewTopWithCause("getpath: path navigation not fully modeled; absence not proven")}, nil
+	}
+	return []*oas3.Schema{result}, nil
 }
 
-// builtinSetpath implements setpath(path; value) - set value at path
+// builtinSetpath implements setpath(path; value) - set value at path.
+// Wraps the core implementation with a soundness guard: setpath creates
+// containers on null receivers and extends objects/arrays, behaviors the core
+// does not fully model. A Bottom/null-only conclusion is therefore not
+// trustworthy for hard verdicts and is downgraded to Unverifiable.
 func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	results, err := builtinSetpathInner(input, args, env)
+	if err != nil {
+		return results, err
+	}
+	for i, r := range results {
+		if isBottomSchema(r) || getType(r) == "null" {
+			results[i] = env.NewTopWithCause("setpath: receiver/path shape not fully modeled; result not proven")
+		}
+	}
+	return results, nil
+}
+
+func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
 	if env != nil && env.opts.EnableWarnings {
 		env.logger.Debugf("builtinSetpath: CALLED with %d args", len(args))
 	}

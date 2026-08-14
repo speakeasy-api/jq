@@ -119,9 +119,17 @@ func accessPropertyUnion(obj *oas3.Schema, name string, opts SchemaExecOptions) 
 		}
 	}
 	if len(alts) > 0 {
-		results := make([]*oas3.Schema, 0, len(alts))
+		results := make([]*oas3.Schema, 0, len(alts)+1)
 		for _, a := range alts {
 			results = append(results, getPropertyWithNull(a, name, opts))
+		}
+		// The base schema's own object shape (sibling properties/AP/patterns
+		// next to the combinator) constrains values CONJUNCTIVELY with each
+		// branch. Ignoring it can make a declared-required property read as
+		// provably missing. Over-approximate by unioning the base's answer.
+		if obj.Properties != nil || obj.AdditionalProperties != nil ||
+			(obj.PatternProperties != nil && obj.PatternProperties.Len() > 0) {
+			results = append(results, getPropertyWithNull(obj, name, opts))
 		}
 		return Union(results, opts)
 	}
@@ -630,6 +638,9 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 
 	// NULLABLE OPTIMIZATION: Convert [type, null] to {type: T, nullable: true}
 	// This simplifies anyOf: [{type: string}, {type: null}] → {type: string, nullable: true}
+	// Downstream consumers are nullable-aware: navigation dispatch unions the
+	// result with null, subsumption refuses to drop a nullable branch into a
+	// non-nullable one, and MightBeX guards report null.
 	if len(collapsed) == 2 {
 		var nullSchema *oas3.Schema
 		var otherSchema *oas3.Schema
@@ -642,8 +653,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 			}
 		}
 
-		// If we have exactly one null and one non-null typed schema, merge to
-		// nullable — but ONLY when the non-null side has no enum/const:
+		// Only when the non-null side has no enum/const:
 		// {type: string, enum: ["x"], nullable: true} does not admit null
 		// under enum semantics, so such pairs keep the explicit anyOf.
 		if otherSchema != nil && (len(otherSchema.Enum) > 0 || otherSchema.Const != nil) {
@@ -1598,6 +1608,11 @@ func mightBeType(s *oas3.Schema, typ oas3.SchemaType) bool {
 		return false
 	}
 
+	// OAS 3.0-style nullable admits null regardless of the primary type.
+	if typ == oas3.SchemaTypeNull && s.Nullable != nil && *s.Nullable {
+		return true
+	}
+
 	// Check explicit type
 	types := s.GetType()
 	if len(types) > 0 {
@@ -2102,6 +2117,15 @@ func derefOr[T any](p *T) any {
 func isSubschemaOf(a, b *oas3.Schema) bool {
 	if a == nil || b == nil {
 		return false
+	}
+
+	// A nullable A admits null; unless B also admits null, A ⊄ B. Dropping
+	// the nullable branch would silently discard null outputs.
+	if a.Nullable != nil && *a.Nullable {
+		bAdmitsNull := (b.Nullable != nil && *b.Nullable) || getType(b) == "null" || isTopSchema(b)
+		if !bAdmitsNull {
+			return false
+		}
 	}
 
 	// Handle enum/const cases first (most common in our use case)
