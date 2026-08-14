@@ -102,6 +102,45 @@ Important for precision:
 - **Never discard possible outputs** - it's better to be imprecise than incorrect
 - If you can't prove something won't happen, assume it can
 
+### 1a. Implied Types (deliberate deviation from raw JSON Schema)
+
+Untyped schemas are typed by structural inference (`impliedTypeOf` in
+`schemaops.go`, consulted by `getType`/`mightBeType`):
+
+| Schema structure (no explicit `type`, no combinators) | Implied type |
+|---|---|
+| `enum` present | `string` |
+| `const` present | the const's scalar type |
+| `properties` (non-empty) | `object` |
+| `additionalProperties` present | `object` |
+| `items` present | `array` |
+| otherwise | unknown (Top-like) |
+
+Under raw JSON Schema semantics an untyped schema with `properties` still
+admits strings, numbers, etc., so this inference technically narrows the
+concretization. It is a **deliberate, documented deviation**: this library
+targets Speakeasy-processed OpenAPI documents, and the contract is
+equivalence with the structural inference Speakeasy's SDK/CLI generators
+apply to untyped schemas. Real-world documents routinely omit
+`type: object` on schemas with `properties`; without inference every
+navigation of such schemas widens to Top and the executor is useless on
+exactly the documents it targets. Explicit types and allOf/anyOf/oneOf
+always take precedence — inference only fires when a schema declares no
+types and no combinators.
+
+### 1b. $ref Navigation
+
+Reference resolution state lives on the `JSONSchema` **wrapper** (via
+`GetResolvedSchema()`), not on the inline `Left` schema — for a `$ref`,
+`Left` is a bare shell with only `Ref` set. Any code that reads schema
+children MUST look through the resolved schema first (`resolvedLeft` in
+`execute_schema.go`), and any code that rebuilds child wrappers with
+`NewJSONSchemaFromSchema` MUST pass the resolved schema, or the wrapper's
+resolution caches are silently discarded and downstream navigation sees an
+untyped shell (widening to Top — or worse, misreading a referenced property
+as "definitely missing", which is unsound). `derefJSONSchema` treats an
+unresolved ref shell as a failed dereference so callers widen to Top.
+
 ### 2. Determinism/Stability
 - Union-first, then materialize accumulators (to avoid "who writes last" effects)
 - Deduplicate and merge wherever safe (enums, identical structure)
