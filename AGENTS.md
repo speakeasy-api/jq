@@ -21,7 +21,9 @@ The goal is to answer: "Given an input JSON Schema, what schema describes all po
 ### Precision Where Cheap
 - **Constant folding** for enum-singleton values
 - Merge enum strings/integers and deduplicate unions structurally
-- Filter out completely unconstrained "Top" when merging properties to preserve precision
+- Top DOMINATES unions: if any branch (or merged property branch) is fully
+  unconstrained, the union is Top — filtering Top out to "preserve precision"
+  would discard possible outputs and break soundness
 
 ## Key Files
 
@@ -128,6 +130,15 @@ exactly the documents it targets. Explicit types and allOf/anyOf/oneOf
 always take precedence — inference only fires when a schema declares no
 types and no combinators.
 
+The mode is selectable via `SchemaExecOptions.Semantics`:
+`SchemaSemanticsSpeakeasy` (default) applies the inference at navigation
+dispatch and treats objects without `additionalProperties` as CLOSED
+(undeclared property access yields null — this is what makes typo'd leaves
+provably broken); `SchemaSemanticsRaw` requires explicit types at dispatch
+and treats absent `additionalProperties` as OPEN per JSON Schema, so a
+missing property is never provably broken without an explicit
+`additionalProperties: false`.
+
 ### 1b. $ref Navigation
 
 Reference resolution state lives on the `JSONSchema` **wrapper** (via
@@ -220,12 +231,14 @@ For `del()`, `setpath()`, `getpath()`:
 3. Multiple const results get merged by Union into enum sets
 4. Example: `if .x then "a" else "b" end` → `{type: string, enum: ["a", "b"]}`
 
-### Preserving Precision in Merges
+### Merging Object Properties Across Paths
 
-When merging object properties from multiple execution paths:
-- Filter out **unconstrained Top-like schemas** (empty schemas `{}`)
-- Keep the more **concrete schemas** (lines 371-383)
-- Example: merging `{id: {type: string}}` with `{id: {}}` keeps `{type: string}`
+When merging object properties from multiple execution paths, the property
+schemas are UNIONED — including unconstrained (Top) branches. If any path
+leaves a property unconstrained, the merged property is Top: merging
+`{id: {type: string}}` with `{id: {}}` yields `{id: {}}` (Top dominates).
+Filtering Top out would silently narrow the output and break the
+over-approximation contract (and the Analyze API's Proven verdict).
 
 ## Testing Strategy
 
@@ -310,8 +323,10 @@ Example builtin locations:
 - Set `AnyOfLimit` and `EnumLimit` for tractable merges
 - Enable `EnableWarnings` during development to collect warnings
 - Set `LogLevel` to "debug" for detailed execution tracing (logs to stderr)
+  - "" (default): no output — the library is silent on stdout/stderr;
+    warnings are still returned on `SchemaExecResult.Warnings`
   - "error": Only critical failures
-  - "warn": Warnings about precision loss and unsupported operations (default)
+  - "warn": Warnings about precision loss and unsupported operations
   - "info": High-level execution lifecycle
   - "debug": Per-opcode trace with state, stack, and schema changes
 
