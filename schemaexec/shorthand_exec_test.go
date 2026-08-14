@@ -2,7 +2,6 @@ package schemaexec
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	gojq "github.com/speakeasy-api/jq"
@@ -23,14 +22,13 @@ func TestExecuteShorthand(t *testing.T) {
 		t.Fatalf("RunSchema failed: %v", err)
 	}
 
-	fmt.Printf("Result type: %s\n", getType(result.Schema))
+	t.Logf("Result type: %s", getType(result.Schema))
 	if result.Schema.Properties != nil {
-		fmt.Printf("Properties:\n")
 		for k, v := range result.Schema.Properties.All() {
 			if v.Left != nil {
-				fmt.Printf("  %s: %s\n", k, getType(v.Left))
+				t.Logf("  %s: %s", k, getType(v.Left))
 			}
 		}
 	}
-	fmt.Printf("Warnings: %v\n", result.Warnings)
+	t.Logf("Warnings: %v", result.Warnings)
 }

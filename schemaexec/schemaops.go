@@ -2,9 +2,9 @@ package schemaexec
 
 import (
 	"fmt"
-	"runtime/debug"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 	"github.com/speakeasy-api/openapi/sequencedmap"
@@ -299,17 +299,17 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 			if s != nil && getType(s) == "object" && s.AdditionalProperties != nil && s.AdditionalProperties.Left != nil {
 				apCount++
 				if i < 3 {
-					fmt.Printf("DEBUG Union: schema[%d] (ptr=%p) has AP.Left type=%s\n", i, s, getType(s.AdditionalProperties.Left))
+					opts.debugf("Union: schema[%d] (ptr=%p) has AP.Left type=%s", i, s, getType(s.AdditionalProperties.Left))
 				}
 			}
 		}
 		if apCount > 0 {
-			fmt.Printf("DEBUG Union: %d/%d objects have AP.Left set\n", apCount, len(schemas))
+			opts.debugf("Union: %d/%d objects have AP.Left set", apCount, len(schemas))
 		}
 	}
 	// DEBUG: Track large unions and inspect configs property
 	if opts.EnableWarnings && len(schemas) > 100 {
-		fmt.Printf("DEBUG Union: processing %d input schemas\n", len(schemas))
+		opts.debugf("Union: processing %d input schemas", len(schemas))
 
 		// Count how many have configs property and what it looks like
 		objectCount := 0
@@ -341,7 +341,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		}
 
 		if objectCount > 0 {
-			fmt.Printf("DEBUG Union: of %d objects, configs: %d empty, %d non-empty, %d missing\n",
+			opts.debugf("Union: of %d objects, configs: %d empty, %d non-empty, %d missing",
 				objectCount, configsEmptyCount, configsNonEmptyCount, configsMissingCount)
 		}
 	}
@@ -359,10 +359,10 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 			}
 		}
 		if hasArray && allArrays {
-			fmt.Printf("DEBUG Union: merging %d arrays\n", len(schemas))
+			opts.debugf("Union: merging %d arrays", len(schemas))
 			for i, s := range schemas {
 				if s == nil {
-					fmt.Printf("  [%d] nil schema\n", i)
+					opts.debugf("  [%d] nil schema", i)
 				} else {
 					isEmpty := s.MaxItems != nil && *s.MaxItems == 0
 					hasItems := s.Items != nil && s.Items.Left != nil
@@ -370,7 +370,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 					if hasItems {
 						itemType = getType(s.Items.Left)
 					}
-					fmt.Printf("  [%d] array: empty=%v, hasItems=%v, itemType=%s\n", i, isEmpty, hasItems, itemType)
+					opts.debugf("  [%d] array: empty=%v, hasItems=%v, itemType=%s", i, isEmpty, hasItems, itemType)
 				}
 			}
 		}
@@ -408,7 +408,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 
 		// DEBUG: Show filtering decision
 		if opts.EnableWarnings && hasEmptyArray {
-			fmt.Printf("DEBUG Union: filtering decision - hasEmpty=%v, hasNonEmpty=%v, total=%d schemas\n",
+			opts.debugf("Union: filtering decision - hasEmpty=%v, hasNonEmpty=%v, total=%d schemas",
 				hasEmptyArray, hasNonEmptyArray, len(filtered))
 		}
 
@@ -425,7 +425,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 				}
 			}
 			if opts.EnableWarnings {
-				fmt.Printf("DEBUG Union: filtered out %d empty arrays, keeping %d schemas\n", filteredCount, len(nonEmpty))
+				opts.debugf("Union: filtered out %d empty arrays, keeping %d schemas", filteredCount, len(nonEmpty))
 			}
 			filtered = nonEmpty
 		}
@@ -473,7 +473,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 						if isEmpty {
 							emptyConfigsCount++
 							if idx < 2 {
-								fmt.Printf("DEBUG Union: flattened[%d] EMPTY configs: fp=%s, hasItems=%v\n",
+								opts.debugf("Union: flattened[%d] EMPTY configs: fp=%s, hasItems=%v",
 									idx, fp[:16], hasItems)
 							}
 						} else {
@@ -483,7 +483,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 								if hasItems {
 									itemType = getType(configs.Items.Left)
 								}
-								fmt.Printf("DEBUG Union: flattened[%d] NON-EMPTY configs: fp=%s, hasItems=%v, itemType=%s\n",
+								opts.debugf("Union: flattened[%d] NON-EMPTY configs: fp=%s, hasItems=%v, itemType=%s",
 									idx, fp[:16], hasItems, itemType)
 							}
 						}
@@ -492,7 +492,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 			}
 		}
 		if emptyConfigsCount > 0 || nonEmptyConfigsCount > 0 {
-			fmt.Printf("DEBUG Union: BEFORE dedup - empty configs: %d, non-empty configs: %d, unique fingerprints: %d\n",
+			opts.debugf("Union: BEFORE dedup - empty configs: %d, non-empty configs: %d, unique fingerprints: %d",
 				emptyConfigsCount, nonEmptyConfigsCount, len(fingerprints))
 		}
 	}
@@ -502,7 +502,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 
 	// DEBUG: Track deduplication and check configs arrays AFTER dedup
 	if opts.EnableWarnings && len(schemas) > 100 {
-		fmt.Printf("DEBUG Union: after dedup, have %d schemas (from %d flattened)\n", len(deduped), len(flattened))
+		opts.debugf("Union: after dedup, have %d schemas (from %d flattened)", len(deduped), len(flattened))
 
 		emptyConfigsCount := 0
 		nonEmptyConfigsCount := 0
@@ -520,13 +520,13 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 						if isEmpty {
 							emptyConfigsCount++
 							if idx < 3 {
-								fmt.Printf("DEBUG Union: deduped[%d] has EMPTY configs (maxItems=0, hasItems=%v, itemType=%s)\n",
+								opts.debugf("Union: deduped[%d] has EMPTY configs (maxItems=0, hasItems=%v, itemType=%s)",
 									idx, hasItems, itemType)
 							}
 						} else {
 							nonEmptyConfigsCount++
 							if idx < 3 {
-								fmt.Printf("DEBUG Union: deduped[%d] has NON-EMPTY configs (maxItems=nil, hasItems=%v, itemType=%s)\n",
+								opts.debugf("Union: deduped[%d] has NON-EMPTY configs (maxItems=nil, hasItems=%v, itemType=%s)",
 									idx, hasItems, itemType)
 							}
 						}
@@ -535,7 +535,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 			}
 		}
 		if emptyConfigsCount > 0 || nonEmptyConfigsCount > 0 {
-			fmt.Printf("DEBUG Union: AFTER dedup - empty configs: %d, non-empty configs: %d\n",
+			opts.debugf("Union: AFTER dedup - empty configs: %d, non-empty configs: %d",
 				emptyConfigsCount, nonEmptyConfigsCount)
 		}
 	}
@@ -544,17 +544,17 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	// Try merging objects first to preserve AdditionalProperties
 	if merged := tryMergeObjects(deduped, opts); merged != nil {
 		if opts.EnableWarnings {
-			fmt.Printf("DEBUG Union: early object merge succeeded, returning merged object\n")
+			opts.debugf("Union: early object merge succeeded, returning merged object")
 		}
 		return merged
 	}
 
 	// Remove subsumed schemas (e.g., {type: number, enum: [0]} ⊆ {type: number})
-	collapsed := removeSubsumedSchemas(deduped)
+	collapsed := removeSubsumedSchemas(deduped, opts)
 
 	// DEBUG: Track progression through Union stages
 	if opts.EnableWarnings && len(schemas) > 100 {
-		fmt.Printf("DEBUG Union: after collapse, have %d schemas (from %d initial)\n", len(collapsed), len(schemas))
+		opts.debugf("Union: after collapse, have %d schemas (from %d initial)", len(collapsed), len(schemas))
 	}
 
 	// If only one unique schema after dedup and collapse, return it directly
@@ -562,7 +562,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		// DEBUG: Show what the final collapsed schema looks like
 		if opts.EnableWarnings && len(schemas) > 100 {
 			finalSchema := collapsed[0]
-			fmt.Printf("DEBUG Union: collapsed to single schema of type=%s\n", getType(finalSchema))
+			opts.debugf("Union: collapsed to single schema of type=%s", getType(finalSchema))
 			if getType(finalSchema) == "object" && finalSchema.Properties != nil {
 				if configsProp, ok := finalSchema.Properties.Get("configs"); ok && configsProp.GetLeft() != nil {
 					configs := configsProp.GetLeft()
@@ -573,7 +573,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 						if hasItems {
 							itemType = getType(configs.Items.Left)
 						}
-						fmt.Printf("DEBUG Union: final 'configs' property: empty=%v, hasItems=%v, itemType=%s\n",
+						opts.debugf("Union: final 'configs' property: empty=%v, hasItems=%v, itemType=%s",
 							isEmpty, hasItems, itemType)
 					}
 				}
@@ -628,11 +628,13 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 				}
 				typeCounts[t]++
 			}
-			fmt.Printf("DEBUG Union: exceeding anyOf limit (%d > %d), widening. Types: ", len(collapsed), opts.AnyOfLimit)
+			parts := make([]string, 0, len(typeCounts))
 			for t, count := range typeCounts {
-				fmt.Printf("%s=%d ", t, count)
+				parts = append(parts, fmt.Sprintf("%s=%d", t, count))
 			}
-			fmt.Printf("\n")
+			sort.Strings(parts)
+			opts.debugf("Union: exceeding anyOf limit (%d > %d), widening. Types: %s",
+				len(collapsed), opts.AnyOfLimit, strings.Join(parts, " "))
 		}
 		return widenUnion(collapsed, opts)
 	}
@@ -680,7 +682,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 			}
 		}
 		if hasValueProp {
-			fmt.Printf("DEBUG Union: result is anyOf with %d branches (contains 'value' property)\n", len(anyOf))
+			opts.debugf("Union: result is anyOf with %d branches (contains 'value' property)", len(anyOf))
 		}
 	}
 
@@ -736,7 +738,7 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 		// ArrayType(Bottom()) would create maxItems=0 which means "provably empty"
 		// Instead, we want "array with unknown items" = plain array type with Items unset
 		if opts.EnableWarnings {
-			fmt.Printf("DEBUG tryMergeArrays: len(itemSchemas)==0, returning unconstrained array (not empty)\n")
+			opts.debugf("tryMergeArrays: len(itemSchemas)==0, returning unconstrained array (not empty)")
 		}
 		return &oas3.Schema{
 			Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
@@ -766,7 +768,7 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 		}
 		if len(filtered) > 0 {
 			if opts.EnableWarnings {
-				fmt.Printf("DEBUG tryMergeArrays: filtered out %d nested arrays, keeping %d non-array items\n",
+				opts.debugf("tryMergeArrays: filtered out %d nested arrays, keeping %d non-array items",
 					len(itemSchemas)-len(filtered), len(filtered))
 			}
 			itemSchemas = filtered
@@ -808,7 +810,7 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 			}
 		}
 		if hasConfigs {
-			fmt.Printf("DEBUG tryMergeObjects: merging %d objects with 'configs' property\n", len(schemas))
+			opts.debugf("tryMergeObjects: merging %d objects with 'configs' property", len(schemas))
 		}
 	}
 
@@ -873,7 +875,7 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 
 		// DEBUG: Track what's happening with "configs" property
 		if propName == "configs" && opts.EnableWarnings && len(propSchemas) > 0 {
-			fmt.Printf("DEBUG tryMergeObjects: merging 'configs' property from %d object schemas\n", len(propSchemas))
+			opts.debugf("tryMergeObjects: merging 'configs' property from %d object schemas", len(propSchemas))
 			emptyCount := 0
 			nonEmptyCount := 0
 			for i, ps := range propSchemas {
@@ -889,12 +891,12 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 					} else {
 						nonEmptyCount++
 					}
-					fmt.Printf("  [%d] array: empty=%v, hasItems=%v, itemType=%s\n", i, isEmpty, hasItems, itemType)
+					opts.debugf("  [%d] array: empty=%v, hasItems=%v, itemType=%s", i, isEmpty, hasItems, itemType)
 				} else {
-					fmt.Printf("  [%d] not array: type=%s\n", i, getType(ps))
+					opts.debugf("  [%d] not array: type=%s", i, getType(ps))
 				}
 			}
-			fmt.Printf("  Summary: %d empty, %d non-empty arrays\n", emptyCount, nonEmptyCount)
+			opts.debugf("  Summary: %d empty, %d non-empty arrays", emptyCount, nonEmptyCount)
 		}
 
 		if len(propSchemas) > 0 {
@@ -919,10 +921,10 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 
 			// DEBUG: Log when we filter out unconstrained schemas for "value" property
 			if opts.EnableWarnings && propName == "value" && unconstrainedCount > 0 {
-				fmt.Printf("DEBUG tryMergeObjects: property=%s had %d schemas (%d unconstrained, %d concrete)\n",
+				opts.debugf("tryMergeObjects: property=%s had %d schemas (%d unconstrained, %d concrete)",
 					propName, len(propSchemas), unconstrainedCount, len(filteredSchemas))
 				for i, ps := range propSchemas {
-					fmt.Printf("  [%d] type=%s, unconstrained=%v\n", i, getType(ps), isUnconstrainedSchema(ps))
+					opts.debugf("  [%d] type=%s, unconstrained=%v", i, getType(ps), isUnconstrainedSchema(ps))
 				}
 			}
 
@@ -943,16 +945,16 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 					if hasItems {
 						itemType = getType(unionSchema.Items.Left)
 					}
-					fmt.Printf("DEBUG tryMergeObjects: 'configs' final result: empty=%v, hasItems=%v, itemType=%s\n",
+					opts.debugf("tryMergeObjects: 'configs' final result: empty=%v, hasItems=%v, itemType=%s",
 						isEmpty, hasItems, itemType)
 				} else {
-					fmt.Printf("DEBUG tryMergeObjects: 'configs' final result: type=%s (not array!)\n", getType(unionSchema))
+					opts.debugf("tryMergeObjects: 'configs' final result: type=%s (not array!)", getType(unionSchema))
 				}
 			}
 
 			// DEBUG: Log final schema for "value" property
 			if opts.EnableWarnings && propName == "value" {
-				fmt.Printf("DEBUG tryMergeObjects: property=%s final type=%s, unconstrained=%v\n",
+				opts.debugf("tryMergeObjects: property=%s final type=%s, unconstrained=%v",
 					propName, getType(unionSchema), isUnconstrainedSchema(unionSchema))
 			}
 		}
@@ -980,7 +982,7 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 		}
 	}
 	if opts.EnableWarnings && (len(apSchemas) > 0 || seenTrue) {
-		fmt.Printf("DEBUG tryMergeObjects: AP merge - %d schemas, %d with AP.Left, seenTrue=%v, nilCount=%d\n",
+		opts.debugf("tryMergeObjects: AP merge - %d schemas, %d with AP.Left, seenTrue=%v, nilCount=%d",
 			len(schemas), len(apSchemas), seenTrue, nilCount)
 	}
 	switch {
@@ -995,7 +997,7 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 		}
 		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](mergedAP)
 		if opts.EnableWarnings {
-			fmt.Printf("DEBUG tryMergeObjects: merged AP type=%s schemaCount=%d\n",
+			opts.debugf("tryMergeObjects: merged AP type=%s schemaCount=%d",
 				getType(mergedAP), len(apSchemas))
 		}
 	default:
@@ -1095,7 +1097,7 @@ func deduplicateByFingerprint(schemas []*oas3.Schema) []*oas3.Schema {
 
 // removeSubsumedSchemas removes schemas that are subsumed by (subsets of) other schemas
 // Iterates to fixpoint to handle transitive subsumption
-func removeSubsumedSchemas(schemas []*oas3.Schema) []*oas3.Schema {
+func removeSubsumedSchemas(schemas []*oas3.Schema, opts SchemaExecOptions) []*oas3.Schema {
 	if len(schemas) <= 1 {
 		return schemas
 	}
@@ -1127,7 +1129,7 @@ func removeSubsumedSchemas(schemas []*oas3.Schema) []*oas3.Schema {
 					changed = true
 					// DEBUG: Show subsumption for objects
 					if n == initialCount && iteration == 1 && i < 3 {
-						fmt.Printf("DEBUG subsumption iter=%d: schema[%d] (type=%s) subsumed by schema[%d] (type=%s)\n",
+						opts.debugf("subsumption iter=%d: schema[%d] (type=%s) subsumed by schema[%d] (type=%s)",
 							iteration, i, getType(a), j, getType(b))
 					}
 					break
@@ -1140,7 +1142,7 @@ func removeSubsumedSchemas(schemas []*oas3.Schema) []*oas3.Schema {
 					// DEBUG: Show subsumption for objects with configs
 					if n == initialCount && getType(b) == "object" && b.Properties != nil {
 						if _, ok := b.Properties.Get("configs"); ok {
-							fmt.Printf("DEBUG subsumption iter=%d: schema[%d] subsumed by schema[%d]\n", iteration, j, i)
+							opts.debugf("subsumption iter=%d: schema[%d] subsumed by schema[%d]", iteration, j, i)
 						}
 					}
 				}
@@ -1400,12 +1402,6 @@ func cloneSchema(s *oas3.Schema) *oas3.Schema {
 // BuildObject creates an object schema from property map.
 // Simplified version for Phase 1.
 func BuildObject(props map[string]*oas3.Schema, required []string) *oas3.Schema {
-	// DEBUG: Trace BuildObject calls with unconstrained 'value' property
-	if valProp, ok := props["value"]; ok && isUnconstrainedSchema(valProp) {
-		fmt.Printf("DEBUG BuildObject: building object with UNCONSTRAINED value property!\n")
-		fmt.Printf("  Stack trace: %s\n", string(debug.Stack()))
-	}
-
 	propMap := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
 	keysInOrder := make([]string, 0, len(props))
 	for k := range props {
@@ -2073,36 +2069,17 @@ func stringConstraintsSubsumed(a, b *oas3.Schema) bool {
 
 // arrayConstraintsSubsumed checks if A's array constraints are stricter than or equal to B's
 func arrayConstraintsSubsumed(a, b *oas3.Schema) bool {
-	fmt.Printf("DEBUG arrayConstraintsSubsumed: CALLED\n")
 	// Special case: empty arrays (MaxItems=0) are not subsumed by non-empty arrays
 	// An empty array represents a specific constraint (must be empty), not a general array
 	aIsEmpty := a.MaxItems != nil && *a.MaxItems == 0
 	bIsEmpty := b.MaxItems != nil && *b.MaxItems == 0
 
-	// DEBUG: Log empty array checks
-	logArraySubsumption := aIsEmpty || bIsEmpty
-	if logArraySubsumption {
-		aHasItems := a.Items != nil && a.Items.Left != nil
-		bHasItems := b.Items != nil && b.Items.Left != nil
-		var aItemType, bItemType string
-		if aHasItems {
-			aItemType = getType(a.Items.Left)
-		}
-		if bHasItems {
-			bItemType = getType(b.Items.Left)
-		}
-		fmt.Printf("DEBUG arrayConstraintsSubsumed: aEmpty=%v (items=%v, itemType=%s), bEmpty=%v (items=%v, itemType=%s)\n",
-			aIsEmpty, aHasItems, aItemType, bIsEmpty, bHasItems, bItemType)
-	}
-
 	if aIsEmpty && !bIsEmpty {
 		// A is empty array, B is not - A is NOT subsumed by B
-		fmt.Printf("DEBUG arrayConstraintsSubsumed: returning FALSE (A empty, B not)\n")
 		return false
 	}
 	if !aIsEmpty && bIsEmpty {
 		// A is non-empty, B is empty - A is NOT subsumed by B
-		fmt.Printf("DEBUG arrayConstraintsSubsumed: returning FALSE (A not empty, B empty)\n")
 		return false
 	}
 	// If both empty or both non-empty, continue with normal checks
@@ -2164,17 +2141,6 @@ func arrayConstraintsSubsumed(a, b *oas3.Schema) bool {
 
 // objectConstraintsSubsumed checks if A's object constraints are stricter than or equal to B's
 func objectConstraintsSubsumed(a, b *oas3.Schema) bool {
-	// DEBUG: Track configs property comparisons
-	debugConfigs := false
-	if a.Properties != nil && b.Properties != nil {
-		if _, aHas := a.Properties.Get("configs"); aHas {
-			if _, bHas := b.Properties.Get("configs"); bHas {
-				debugConfigs = true
-				fmt.Printf("DEBUG objectConstraintsSubsumed: comparing objects with 'configs' property\n")
-			}
-		}
-	}
-
 	// Check required: B.required ⊆ A.required (B cannot require more than A)
 	for _, req := range b.Required {
 		found := false
@@ -2185,9 +2151,6 @@ func objectConstraintsSubsumed(a, b *oas3.Schema) bool {
 			}
 		}
 		if !found {
-			if debugConfigs {
-				fmt.Printf("DEBUG objectConstraintsSubsumed: B requires '%s' but A doesn't -> FALSE\n", req)
-			}
 			return false
 		}
 	}
@@ -2199,22 +2162,7 @@ func objectConstraintsSubsumed(a, b *oas3.Schema) bool {
 				if b.Properties != nil {
 					if bProp, ok := b.Properties.Get(propName); ok && bProp.Left != nil {
 						// Both have this property: check subsumption
-						if debugConfigs && propName == "configs" {
-							aConfigsType := getType(aProp.Left)
-							bConfigsType := getType(bProp.Left)
-							aIsEmpty := aProp.Left.MaxItems != nil && *aProp.Left.MaxItems == 0
-							bIsEmpty := bProp.Left.MaxItems != nil && *bProp.Left.MaxItems == 0
-							fmt.Printf("DEBUG objectConstraintsSubsumed: before check - A(type=%s, empty=%v) vs B(type=%s, empty=%v)\n",
-								aConfigsType, aIsEmpty, bConfigsType, bIsEmpty)
-						}
-						propSubsumed := isSubschemaOf(aProp.Left, bProp.Left)
-						if debugConfigs && propName == "configs" {
-							fmt.Printf("DEBUG objectConstraintsSubsumed: configs property subsumption check = %v\n", propSubsumed)
-						}
-						if !propSubsumed {
-							if debugConfigs && propName == "configs" {
-								fmt.Printf("DEBUG objectConstraintsSubsumed: configs NOT subsumed -> returning FALSE\n")
-							}
+						if !isSubschemaOf(aProp.Left, bProp.Left) {
 							return false
 						}
 					}
@@ -2253,23 +2201,14 @@ func objectConstraintsSubsumed(a, b *oas3.Schema) bool {
 	case bForbids:
 		// B forbids: A must forbid too
 		if !aForbids {
-			if debugConfigs {
-				fmt.Printf("DEBUG objectConstraintsSubsumed: B forbids additional properties but A doesn't -> FALSE\n")
-			}
 			return false
 		}
 	case bSchema:
 		// B allows schema S: A must forbid OR allow T with T ⊆ S
 		if aAllowAny {
-			if debugConfigs {
-				fmt.Printf("DEBUG objectConstraintsSubsumed: B has AP schema but A allows any -> FALSE\n")
-			}
 			return false
 		}
 		if aSchema && !isSubschemaOf(aAP.Left, bAP.Left) {
-			if debugConfigs {
-				fmt.Printf("DEBUG objectConstraintsSubsumed: A.AP schema not subsumed by B.AP schema -> FALSE\n")
-			}
 			return false
 		}
 		// aForbids is fine (stricter than B)
@@ -2434,17 +2373,12 @@ func refineVarRefs(st *execState, old, nw *oas3.Schema) {
 	if st == nil || old == nil || nw == nil {
 		return
 	}
-	reboundCount := 0
-	stackReboundCount := 0
-
 	// Rebind scope variables
 	for i := range st.scopes {
 		frame := st.scopes[i]
 		for k, v := range frame {
 			if v == old {
 				frame[k] = nw
-				reboundCount++
-				fmt.Printf("DEBUG refineVarRefs: rebound var '%s' from %p to %p\n", k, old, nw)
 			}
 		}
 	}
@@ -2453,18 +2387,6 @@ func refineVarRefs(st *execState, old, nw *oas3.Schema) {
 	for i := range st.stack {
 		if st.stack[i].Schema == old {
 			st.stack[i].Schema = nw
-			stackReboundCount++
-			fmt.Printf("DEBUG refineVarRefs: rebound stack[%d] from %p to %p\n", i, old, nw)
-		} else {
-			// DEBUG: Show why this stack entry wasn't rebound
-			fmt.Printf("DEBUG refineVarRefs: stack[%d] NOT rebound (stack ptr=%p, old ptr=%p, same=%v)\n",
-				i, st.stack[i].Schema, old, st.stack[i].Schema == old)
 		}
-	}
-
-	if reboundCount == 0 && stackReboundCount == 0 {
-		fmt.Printf("DEBUG refineVarRefs: NO variables or stack refs rebound (old ptr=%p not found)\n", old)
-	} else {
-		fmt.Printf("DEBUG refineVarRefs: rebound %d vars, %d stack refs\n", reboundCount, stackReboundCount)
 	}
 }

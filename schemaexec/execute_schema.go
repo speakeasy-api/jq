@@ -119,6 +119,10 @@ func newSchemaEnv(ctx context.Context, opts SchemaExecOptions) *schemaEnv {
 	// Generate unique execution ID
 	execID := fmt.Sprintf("e%d", time.Now().UnixNano()%1000000)
 
+	// Attach the resolved logger to the options copy so package-level schema
+	// operations (Union, merges, ...) can log through it.
+	opts.logger = logger
+
 	return &schemaEnv{
 		ctx:      ctx,
 		opts:     opts,
@@ -925,7 +929,7 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 			if outputSchema != nil {
 				// DEBUG: Show stack state at terminal
 				if env.opts.EnableWarnings {
-					fmt.Printf("DEBUG Terminal state: stack length=%d, top ptr=%p, top type=%s\n",
+					env.logger.Debugf("Terminal state: stack length=%d, top ptr=%p, top type=%s",
 						len(state.stack), outputSchema, getType(outputSchema))
 					if getType(outputSchema) == "object" {
 						hasAP := outputSchema.AdditionalProperties != nil && outputSchema.AdditionalProperties.Left != nil
@@ -933,10 +937,10 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 						if hasAP {
 							apType = getType(outputSchema.AdditionalProperties.Left)
 						}
-						fmt.Printf("DEBUG Terminal object: hasAP=%v, apType=%s\n", hasAP, apType)
+						env.logger.Debugf("Terminal object: hasAP=%v, apType=%s", hasAP, apType)
 					}
 					for i, sv := range state.stack {
-						fmt.Printf("DEBUG Terminal stack[%d]: ptr=%p, type=%s\n", i, sv.Schema, getType(sv.Schema))
+						env.logger.Debugf("Terminal stack[%d]: ptr=%p, type=%s", i, sv.Schema, getType(sv.Schema))
 					}
 				}
 				outputs = append(outputs, outputSchema)
@@ -1337,7 +1341,7 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 			target, ok := bestByFP[varFP]
 			if !ok || target == "" {
 				if env.opts.EnableWarnings {
-					fmt.Printf("DEBUG computeAllocRedirect(intent): no rank-2 alloc for fp=%s... (var=%s)\n",
+					env.logger.Debugf("computeAllocRedirect(intent): no rank-2 alloc for fp=%s... (var=%s)",
 						varFP[:min(16, len(varFP))], varKey)
 				}
 				continue
@@ -1355,7 +1359,7 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 					}
 					redirect[allocID] = target
 					if env.opts.EnableWarnings {
-						fmt.Printf("DEBUG computeAllocRedirect(intent): var=%s fp=%s... redirect %s -> %s\n",
+						env.logger.Debugf("computeAllocRedirect(intent): var=%s fp=%s... redirect %s -> %s",
 							varKey, varFP[:min(16, len(varFP))], allocID, target)
 					}
 				}
@@ -1380,7 +1384,7 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 						}
 						redirect[allocID] = target
 						if env.opts.EnableWarnings {
-							fmt.Printf("DEBUG computeAllocRedirect(alloc-intent): var=%s alloc=%s fp=%s... redirect %s -> %s\n",
+							env.logger.Debugf("computeAllocRedirect(alloc-intent): var=%s alloc=%s fp=%s... redirect %s -> %s",
 								varKey, allocID, fp[:min(16, len(fp))], allocID, target)
 						}
 					}
@@ -1467,7 +1471,7 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 					}
 					redirect[allocID] = best
 					if env.opts.EnableWarnings {
-						fmt.Printf("DEBUG computeAllocRedirect(group): var=%s redirecting %s -> %s (groupBestRank=%d, group=%s)\n",
+						env.logger.Debugf("computeAllocRedirect(group): var=%s redirecting %s -> %s (groupBestRank=%d, group=%s)",
 							varKey, allocID, best, bestRank, groupRoot)
 					}
 				}
@@ -1484,17 +1488,17 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 				continue
 			}
 			if root != id {
-				fmt.Printf("TRACE DSU computeAllocRedirect: redirect %s -> %s (DSU root)\n", id, root)
+				env.logger.Debugf("DSU computeAllocRedirect: redirect %s -> %s (DSU root)", id, root)
 				redirect[id] = root
 			}
 			// Ensure we have an entry at the root and union siblings there
 			if root != id {
 				if rootArr, ok := mergedAccum[root]; ok && rootArr != mergedAccum[id] {
 					mergedAccum[root] = joinTwoSchemas(rootArr, mergedAccum[id])
-					fmt.Printf("TRACE DSU computeAllocRedirect: merged %s into root %s\n", id, root)
+					env.logger.Debugf("DSU computeAllocRedirect: merged %s into root %s", id, root)
 				} else if _, ok := mergedAccum[root]; !ok {
 					mergedAccum[root] = mergedAccum[id]
-					fmt.Printf("TRACE DSU computeAllocRedirect: created root entry %s from %s\n", root, id)
+					env.logger.Debugf("DSU computeAllocRedirect: created root entry %s from %s", root, id)
 				}
 			}
 		}
@@ -1564,7 +1568,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 							if canonHasItems {
 								itemType = getType(canonical.Items.Left)
 							}
-							fmt.Printf("DEBUG opStore: var='%s', accumKey=%s - storing canonical instead of stale (valEmpty=%v, canonEmpty=%v, canonHasItems=%v, itemType=%s)\n",
+							env.logger.Debugf("opStore: var='%s', accumKey=%s - storing canonical instead of stale (valEmpty=%v, canonEmpty=%v, canonHasItems=%v, itemType=%s)",
 								key, accumKey, valEmpty, canonEmpty, canonHasItems, itemType)
 						}
 						finalVal = canonical  // Store canonical, not stale reference!
@@ -1583,7 +1587,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 					itemType = getType(finalVal.Items.Left)
 				}
 				accumPtr := fmt.Sprintf("%p", next.accum)
-				fmt.Printf("DEBUG opStore: STORED var='%s' - empty=%v, hasItems=%v, itemType=%s, accumPtr=%s\n",
+				env.logger.Debugf("opStore: STORED var='%s' - empty=%v, hasItems=%v, itemType=%s, accumPtr=%s",
 					key, isEmpty, hasItems, itemType, accumPtr)
 			}
 
@@ -1611,7 +1615,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 							next.allocDesiredFP[accumKey] = fp
 							next.recordVarAlloc(key, accumKey)
 							next.varDesiredItemFP[key] = fp
-							fmt.Printf("DEBUG opStore: lifted pointer-intent to new alloc %s for var=%s, fp=%s...\n",
+							env.logger.Debugf("opStore: lifted pointer-intent to new alloc %s for var=%s, fp=%s...",
 								accumKey, key, fp[:min(20, len(fp))])
 						}
 					}
@@ -1633,7 +1637,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 							if _, hasAllocFP := next.allocDesiredFP[ak]; !hasAllocFP {
 								next.allocDesiredFP[ak] = fp
 								next.varDesiredItemFP[key] = fp
-								fmt.Printf("DEBUG opStore: lifted pointer-intent to existing alloc %s for var=%s, fp=%s...\n",
+								env.logger.Debugf("opStore: lifted pointer-intent to existing alloc %s for var=%s, fp=%s...",
 									ak, key, fp[:min(20, len(fp))])
 							}
 						}
@@ -1654,7 +1658,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 								prevOrigin.PC == currOrigin.PC && prevOrigin.Context == currOrigin.Context {
 
 								// Union classes
-								fmt.Printf("TRACE DSU opStore: var=%s union %s with %s (same origin PC=%d, ctx=%s)\n",
+								env.logger.Debugf("DSU opStore: var=%s union %s with %s (same origin PC=%d, ctx=%s)",
 									key, priorID, currID, currOrigin.PC, currOrigin.Context)
 								next.dsu.Union(priorID, currID)
 								root := next.dsu.Find(currID)
@@ -1679,7 +1683,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 									next.schemaToAlloc[merged] = root
 									// Store canonical back to the variable (preserve pointer identity)
 									next.storeVar(key, merged)
-									fmt.Printf("TRACE DSU opStore: merged arrays to root=%s\n", root)
+									env.logger.Debugf("DSU opStore: merged arrays to root=%s", root)
 								}
 
 								// Lattice-join cardinality into the root key
@@ -1697,7 +1701,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 									}
 									next.allocCardinality[root] = joined
 									if joined != nil && joined.MinItems != nil {
-										fmt.Printf("TRACE DSU opStore: joined cardinality to root=%s MinItems=%d\n",
+										env.logger.Debugf("DSU opStore: joined cardinality to root=%s MinItems=%d",
 											root, *joined.MinItems)
 									}
 								}
@@ -1736,17 +1740,17 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 							accumPtr := fmt.Sprintf("%p", next.accum)
 							valPtr := fmt.Sprintf("%p", val)
 							canonPtr := fmt.Sprintf("%p", canonical)
-							fmt.Printf("DEBUG opLoad: var='%s', accumKey=%s - origEmpty=%v, canonEmpty=%v, hasItems=%v, itemType=%s, samePtr=%v, accumPtr=%s, valPtr=%s, canonPtr=%s\n",
+							env.logger.Debugf("opLoad: var='%s', accumKey=%s - origEmpty=%v, canonEmpty=%v, hasItems=%v, itemType=%s, samePtr=%v, accumPtr=%s, valPtr=%s, canonPtr=%s",
 								key, accumKey, origEmpty, canonEmpty, canonHasItems, itemType, samePtr, accumPtr, valPtr, canonPtr)
 						}
 						// Use the canonical (mutated) version, not the original
 						finalVal = canonical
 						if env.opts.EnableWarnings && canonHasItems {
 							finalPtr := fmt.Sprintf("%p", finalVal)
-							fmt.Printf("DEBUG opLoad: PUSHING non-empty canonical to stack, ptr=%s\n", finalPtr)
+							env.logger.Debugf("opLoad: PUSHING non-empty canonical to stack, ptr=%s", finalPtr)
 						}
 					} else if env.opts.EnableWarnings {
-						fmt.Printf("DEBUG opLoad: var='%s' tagged as %s but NOT in accum\n", key, accumKey)
+						env.logger.Debugf("opLoad: var='%s' tagged as %s but NOT in accum", key, accumKey)
 					}
 				} else if env.opts.EnableWarnings {
 					isEmpty := val.MaxItems != nil && *val.MaxItems == 0
@@ -1755,7 +1759,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 					if hasItems {
 						itemType = getType(val.Items.Left)
 					}
-					fmt.Printf("DEBUG opLoad: loading var='%s' (not tagged) - empty=%v, hasItems=%v, itemType=%s\n",
+					env.logger.Debugf("opLoad: loading var='%s' (not tagged) - empty=%v, hasItems=%v, itemType=%s",
 						key, isEmpty, hasItems, itemType)
 				}
 			}
@@ -1933,8 +1937,11 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 func (env *schemaEnv) addWarning(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 
-	// Always log warnings via logger
-	env.logger.Warnf("%s", msg)
+	// Warnings are execution diagnostics: they are returned programmatically
+	// on SchemaExecResult.Warnings and only PRINTED when debug tracing is
+	// enabled. The library must be silent on stdout/stderr at the default log
+	// level.
+	env.logger.Debugf("%s", msg)
 
 	// Also collect in warnings array if enabled
 	if env.opts.EnableWarnings {
@@ -2228,7 +2235,7 @@ func (env *schemaEnv) execObjectMulti(state *execState, c *codeOp) ([]*execState
 			if env.opts.EnableWarnings {
 				afterEmpty := val.MaxItems != nil && *val.MaxItems == 0
 				afterHasItems := val.Items != nil && val.Items.Left != nil
-				fmt.Printf("DEBUG opObject: materialized array for property; before(empty=%v,hasItems=%v) → after(empty=%v,hasItems=%v)\n",
+				env.logger.Debugf("opObject: materialized array for property; before(empty=%v,hasItems=%v) → after(empty=%v,hasItems=%v)",
 					beforeEmpty, beforeHasItems, afterEmpty, afterHasItems)
 			}
 		}
@@ -2249,7 +2256,7 @@ func (env *schemaEnv) execObjectMulti(state *execState, c *codeOp) ([]*execState
 					itemType = getType(val.Items.Left)
 				}
 				valPtr := fmt.Sprintf("%p", val)
-				fmt.Printf("DEBUG opObject: configs POPPED - empty=%v, hasItems=%v, itemType=%s, ptr=%s\n",
+				env.logger.Debugf("opObject: configs POPPED - empty=%v, hasItems=%v, itemType=%s, ptr=%s",
 					isEmpty, hasItems, itemType, valPtr)
 			}
 		}
@@ -2395,7 +2402,7 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 				targetArray = candidate
 				fromVar = true
 				if env.opts.EnableWarnings {
-					fmt.Printf("DEBUG execAppendMulti: resolved stack array to variable '%s' by pointer\n", key)
+					env.logger.Debugf("execAppendMulti: resolved stack array to variable '%s' by pointer", key)
 				}
 			} else {
 				targetArray = candidate
@@ -2458,7 +2465,7 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 		valType := getType(val)
 		accumPtr := fmt.Sprintf("%p", state.accum)
 		canonPtr := fmt.Sprintf("%p", canonicalArr)
-		fmt.Printf("DEBUG execAppendMulti: accumKey=%s, wasEmpty=%v, appending type=%s, accumPtr=%s, canonPtr=%s\n",
+		env.logger.Debugf("execAppendMulti: accumKey=%s, wasEmpty=%v, appending type=%s, accumPtr=%s, canonPtr=%s",
 			accumKey, wasEmpty, valType, accumPtr, canonPtr)
 	}
 
@@ -2498,7 +2505,7 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 		if priorType == "array" && valType != "" && valType != "array" {
 			// Prior is nested array, val is not an array - use val only
 			if env.opts.EnableWarnings {
-				fmt.Printf("DEBUG execAppendMulti: prior items is nested array (type=%s), val is %s - using val only\n",
+				env.logger.Debugf("execAppendMulti: prior items is nested array (type=%s), val is %s - using val only",
 					priorType, valType)
 			}
 			unionedItems = val
@@ -2519,7 +2526,7 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 		if env.opts.EnableWarnings && accumKey != "" {
 			unionedType := getType(unionedItems)
 			isNil := unionedItems == nil
-			fmt.Printf("DEBUG execAppendMulti: setting items on %s - unionedItems type=%s, isNil=%v\n",
+			env.logger.Debugf("execAppendMulti: setting items on %s - unionedItems type=%s, isNil=%v",
 				accumKey, unionedType, isNil)
 		}
 
@@ -2543,7 +2550,7 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 			state.allocDesiredFP[accumKey] = fp
 			// Record pointer-intent for the canonical array
 			state.recordSchemaFP(canonicalArr, unionedItems)
-			fmt.Printf("DEBUG execAppendMulti: recorded allocDesiredFP[%s] = %s...\n",
+			env.logger.Debugf("execAppendMulti: recorded allocDesiredFP[%s] = %s...",
 				accumKey, fp[:min(20, len(fp))])
 		}
 
@@ -2555,7 +2562,7 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 			if afterItems {
 				afterItemType = getType(canonicalArr.Items.Left)
 			}
-			fmt.Printf("DEBUG execAppendMulti: AFTER mutation %s - empty=%v, hasItems=%v, itemType=%s\n",
+			env.logger.Debugf("execAppendMulti: AFTER mutation %s - empty=%v, hasItems=%v, itemType=%s",
 				accumKey, afterEmpty, afterItems, afterItemType)
 		}
 	}
@@ -2565,7 +2572,7 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 	if fromVar && key != "" && accumKey != "" {
 		state.storeVar(key, canonicalArr)
 		if env.opts.EnableWarnings {
-			fmt.Printf("DEBUG execAppendMulti: updated variable frame %s with canonical ptr=%p\n", key, canonicalArr)
+			env.logger.Debugf("execAppendMulti: updated variable frame %s with canonical ptr=%p", key, canonicalArr)
 		}
 	}
 
@@ -2702,7 +2709,7 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 		if (funcName == "setpath" || funcName == "_setpath") && len(results) == 1 && results[0] != nil {
 			refineVarRefs(state, input, results[0])
 			if env.opts.EnableWarnings {
-				fmt.Printf("DEBUG execCallMulti: rebinding vars after %s (old ptr=%p, new ptr=%p)\n",
+				env.logger.Debugf("execCallMulti: rebinding vars after %s (old ptr=%p, new ptr=%p)",
 					funcName, input, results[0])
 			}
 		}
@@ -2808,13 +2815,13 @@ func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 			if schema, ok := derefJSONSchema(newCollapseContext(), v); ok {
 				schemas = append(schemas, schema)
 				if opts.EnableWarnings {
-					fmt.Printf("DEBUG unionAllObjectValues: property %s type=%s\n", k, getType(schema))
+					opts.debugf("unionAllObjectValues: property %s type=%s", k, getType(schema))
 				}
 			} else {
 				// Unresolved reference in property - widen conservatively
 				schemas = append(schemas, Top())
 				if opts.EnableWarnings {
-					fmt.Printf("DEBUG unionAllObjectValues: property %s UNRESOLVED -> Top\n", k)
+					opts.debugf("unionAllObjectValues: property %s UNRESOLVED -> Top", k)
 				}
 			}
 		}
@@ -2825,14 +2832,14 @@ func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 		if schema, ok := derefJSONSchema(newCollapseContext(), obj.AdditionalProperties); ok {
 			schemas = append(schemas, schema)
 			if opts.EnableWarnings {
-				fmt.Printf("DEBUG unionAllObjectValues: additionalProperties type=%s, unconstrained=%v\n",
+				opts.debugf("unionAllObjectValues: additionalProperties type=%s, unconstrained=%v",
 					getType(schema), isUnconstrainedSchema(schema))
 			}
 		} else {
 			// Unresolved reference in additionalProperties - widen conservatively
 			schemas = append(schemas, Top())
 			if opts.EnableWarnings {
-				fmt.Printf("DEBUG unionAllObjectValues: additionalProperties UNRESOLVED -> Top\n")
+				opts.debugf("unionAllObjectValues: additionalProperties UNRESOLVED -> Top")
 			}
 		}
 	}
@@ -2841,14 +2848,14 @@ func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 
 	if len(schemas) == 0 {
 		if opts.EnableWarnings {
-			fmt.Printf("DEBUG unionAllObjectValues: no schemas found -> Top\n")
+			opts.debugf("unionAllObjectValues: no schemas found -> Top")
 		}
 		return Top() // Unknown object values
 	}
 
 	result := Union(schemas, opts)
 	if opts.EnableWarnings {
-		fmt.Printf("DEBUG unionAllObjectValues: union result type=%s, unconstrained=%v (from %d schemas)\n",
+		opts.debugf("unionAllObjectValues: union result type=%s, unconstrained=%v (from %d schemas)",
 			getType(result), isUnconstrainedSchema(result), len(schemas))
 	}
 	return result
@@ -3057,7 +3064,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 				if redirectTo, ok := allocRedirect[allocID]; ok {
 					finalAllocID = redirectTo
 					if env.opts.EnableWarnings {
-						fmt.Printf("DEBUG materialize: redirecting %s -> %s for array lookup\n", allocID, redirectTo)
+						env.logger.Debugf("materialize: redirecting %s -> %s for array lookup", allocID, redirectTo)
 					}
 				}
 			}
@@ -3356,7 +3363,7 @@ func (env *schemaEnv) mergeFrontierByPC(in []*execState) []*execState {
 				// Linear-time merge: fold all states using join (LUB)
 				merged := partition[0]
 				for i := 1; i < len(partition); i++ {
-					merged = joinState(merged, partition[i])
+					merged = joinState(merged, partition[i], env.opts)
 				}
 				out = append(out, merged)
 				continue
@@ -3384,7 +3391,7 @@ func (env *schemaEnv) mergeFrontierByPC(in []*execState) []*execState {
 			for len(kept) > 1 {
 				a := kept[0]
 				b := kept[1]
-				merged := joinState(a, b)
+				merged := joinState(a, b, env.opts)
 				kept = append([]*execState{merged}, kept[2:]...)
 			}
 
@@ -3487,7 +3494,7 @@ func accumMapsEqualByIdentity(m1, m2 map[string]*oas3.Schema) bool {
 // joinState merges two states using lattice join (LUB).
 // When scope keys differ, union them and treat missing keys as if they were present
 // with the value from the other state (join with implicit "undefined" = keep existing).
-func joinState(a, b *execState) *execState {
+func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 	if a.pc != b.pc {
 		panic("joinState: PC mismatch")
 	}
@@ -3717,7 +3724,7 @@ func joinState(a, b *execState) *execState {
 				if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" || k == "[9 1]" || k == "[10 0]" {
 					aEmpty := getType(aVal) == "array" && aVal.MaxItems != nil && *aVal.MaxItems == 0
 					bEmpty := getType(bVal) == "array" && bVal.MaxItems != nil && *bVal.MaxItems == 0
-					fmt.Printf("DEBUG scope-merge: var=%s aHas=%v bHas=%v aType=%s bType=%s aEmpty=%v bEmpty=%v\n",
+					opts.debugf("scope-merge: var=%s aHas=%v bHas=%v aType=%s bType=%s aEmpty=%v bEmpty=%v",
 						k, aHas, bHas, getType(aVal), getType(bVal), aEmpty, bEmpty)
 				}
 
@@ -3734,7 +3741,7 @@ func joinState(a, b *execState) *execState {
 							ob := b.allocOrigin[bAlloc]
 							if oa != nil && ob != nil && oa.PC == ob.PC && oa.Context == ob.Context {
 								// Same origin => union classes
-								fmt.Printf("TRACE DSU joinState(diff-accum): var=%s union %s with %s (same origin PC=%d, ctx=%s)\n",
+								opts.debugf("DSU joinState(diff-accum): var=%s union %s with %s (same origin PC=%d, ctx=%s)",
 									k, aAlloc, bAlloc, oa.PC, oa.Context)
 								a.dsu.Union(aAlloc, bAlloc)
 								root := a.dsu.Find(aAlloc)
@@ -3745,7 +3752,7 @@ func joinState(a, b *execState) *execState {
 									merged.accum[root] = joined
 									merged.schemaToAlloc[joined] = root
 									mergedScope[k] = joined
-									fmt.Printf("TRACE DSU joinState(diff-accum): merged to root=%s\n", root)
+									opts.debugf("DSU joinState(diff-accum): merged to root=%s", root)
 								}
 
 								// Lattice-join cardinality under root
@@ -3768,7 +3775,7 @@ func joinState(a, b *execState) *execState {
 								if joinedCard != nil {
 									merged.allocCardinality[root] = joinedCard
 									if joinedCard.MinItems != nil {
-										fmt.Printf("TRACE DSU joinState(diff-accum): cardinality root=%s MinItems=%d\n",
+										opts.debugf("DSU joinState(diff-accum): cardinality root=%s MinItems=%d",
 											root, *joinedCard.MinItems)
 									}
 								}
@@ -3788,7 +3795,7 @@ func joinState(a, b *execState) *execState {
 
 						// DEBUG: Check isEmpty for tracked vars
 						if k == "[9 1]" || k == "[10 0]" || k == "[10 2]" {
-							fmt.Printf("DEBUG scope-merge (diff-accum): var=%s isEmpty(a)=%v isEmpty(b)=%v\n", k, isEmpty(aVal), isEmpty(bVal))
+							opts.debugf("scope-merge (diff-accum): var=%s isEmpty(a)=%v isEmpty(b)=%v", k, isEmpty(aVal), isEmpty(bVal))
 						}
 
 						// Prefer non-empty over empty, regardless of tagging
@@ -3799,7 +3806,7 @@ func joinState(a, b *execState) *execState {
 							if bTagged {
 								mergedAccum[bAlloc] = bVal
 							}
-							fmt.Printf("DEBUG scope-merge (diff-accum): var=%s preferring non-empty b over empty a (bTagged=%v, bAlloc=%s)\n", k, bTagged, bAlloc)
+							opts.debugf("scope-merge (diff-accum): var=%s preferring non-empty b over empty a (bTagged=%v, bAlloc=%s)", k, bTagged, bAlloc)
 							continue
 						}
 						if isEmpty(bVal) && !isEmpty(aVal) {
@@ -3808,7 +3815,7 @@ func joinState(a, b *execState) *execState {
 							if aTagged {
 								mergedAccum[aAlloc] = aVal
 							}
-							fmt.Printf("DEBUG scope-merge (diff-accum): var=%s preferring non-empty a over empty b (aTagged=%v, aAlloc=%s)\n", k, aTagged, aAlloc)
+							opts.debugf("scope-merge (diff-accum): var=%s preferring non-empty a over empty b (aTagged=%v, aAlloc=%s)", k, aTagged, aAlloc)
 							continue
 						}
 
@@ -3827,7 +3834,7 @@ func joinState(a, b *execState) *execState {
 									merged.accum[bAlloc] = canonical
 								}
 								if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" {
-									fmt.Printf("DEBUG scope-merge Case1: var=%s aAlloc=%s bAlloc=%s → canonical\n", k, aAlloc, bAlloc)
+									opts.debugf("scope-merge Case1: var=%s aAlloc=%s bAlloc=%s → canonical", k, aAlloc, bAlloc)
 								}
 								continue
 							}
@@ -3846,7 +3853,7 @@ func joinState(a, b *execState) *execState {
 									merged.accum[bAlloc] = canonical
 								}
 								if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" {
-									fmt.Printf("DEBUG scope-merge Case2a: var=%s aAlloc=%s bAlloc=%s → canonical from a\n", k, aAlloc, bAlloc)
+									opts.debugf("scope-merge Case2a: var=%s aAlloc=%s bAlloc=%s → canonical from a", k, aAlloc, bAlloc)
 								}
 								continue
 							}
@@ -3863,7 +3870,7 @@ func joinState(a, b *execState) *execState {
 									merged.accum[aAlloc] = canonical
 								}
 								if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" {
-									fmt.Printf("DEBUG scope-merge Case2b: var=%s aAlloc=%s bAlloc=%s → canonical from b\n", k, aAlloc, bAlloc)
+									opts.debugf("scope-merge Case2b: var=%s aAlloc=%s bAlloc=%s → canonical from b", k, aAlloc, bAlloc)
 								}
 								continue
 							}
@@ -3892,7 +3899,7 @@ func joinState(a, b *execState) *execState {
 									}
 								}
 								if propagated {
-									fmt.Printf("DEBUG Case3 (diff-accum): propagated intent to new alloc %s for var=%s\n", id, k)
+									opts.debugf("Case3 (diff-accum): propagated intent to new alloc %s for var=%s", id, k)
 								}
 							}
 							// Propagate pointer-intent to the joined pointer
@@ -3925,7 +3932,7 @@ func joinState(a, b *execState) *execState {
 						if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" {
 							joinedEmpty := joined.MaxItems != nil && *joined.MaxItems == 0
 							joinedHasItems := joined.Items != nil && joined.Items.Left != nil
-							fmt.Printf("DEBUG scope-merge Case3: var=%s aAlloc=%s bAlloc=%s → joined (empty=%v, hasItems=%v)\n",
+							opts.debugf("scope-merge Case3: var=%s aAlloc=%s bAlloc=%s → joined (empty=%v, hasItems=%v)",
 								k, aAlloc, bAlloc, joinedEmpty, joinedHasItems)
 						}
 						continue
@@ -4044,9 +4051,9 @@ func joinState(a, b *execState) *execState {
 				if canonical, exists := merged.accum[aAlloc]; exists {
 					// Verify the canonical is tagged in merged.schemaToAlloc
 					if taggedAlloc, isTagged := merged.schemaToAlloc[canonical]; isTagged {
-						fmt.Printf("DEBUG joinState: preserving canonical ptr for allocID=%s (stack pos %d), canonical IS tagged as %s\n", aAlloc, i, taggedAlloc)
+						opts.debugf("joinState: preserving canonical ptr for allocID=%s (stack pos %d), canonical IS tagged as %s", aAlloc, i, taggedAlloc)
 					} else {
-						fmt.Printf("DEBUG joinState: preserving canonical ptr for allocID=%s (stack pos %d), canonical NOT TAGGED! Re-tagging now.\n", aAlloc, i)
+						opts.debugf("joinState: preserving canonical ptr for allocID=%s (stack pos %d), canonical NOT TAGGED! Re-tagging now.", aAlloc, i)
 						merged.schemaToAlloc[canonical] = aAlloc
 					}
 					merged.stack[i] = SValue{Schema: canonical}
@@ -4083,7 +4090,7 @@ func joinState(a, b *execState) *execState {
 			if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" || k == "[9 1]" || k == "[10 0]" {
 				aEmpty := getType(aVal) == "array" && aVal.MaxItems != nil && *aVal.MaxItems == 0
 				bEmpty := getType(bVal) == "array" && bVal.MaxItems != nil && *bVal.MaxItems == 0
-				fmt.Printf("DEBUG scope-merge (same-accum): var=%s aHas=%v bHas=%v aType=%s bType=%s aEmpty=%v bEmpty=%v\n",
+				opts.debugf("scope-merge (same-accum): var=%s aHas=%v bHas=%v aType=%s bType=%s aEmpty=%v bEmpty=%v",
 					k, aHas, bHas, getType(aVal), getType(bVal), aEmpty, bEmpty)
 			}
 
@@ -4099,7 +4106,7 @@ func joinState(a, b *execState) *execState {
 						ob := b.allocOrigin[bAlloc]
 						if oa != nil && ob != nil && oa.PC == ob.PC && oa.Context == ob.Context {
 							// Same origin => union classes
-							fmt.Printf("TRACE DSU joinState(same-accum): var=%s union %s with %s (same origin PC=%d, ctx=%s)\n",
+							opts.debugf("DSU joinState(same-accum): var=%s union %s with %s (same origin PC=%d, ctx=%s)",
 								k, aAlloc, bAlloc, oa.PC, oa.Context)
 							a.dsu.Union(aAlloc, bAlloc)
 							root := a.dsu.Find(aAlloc)
@@ -4110,7 +4117,7 @@ func joinState(a, b *execState) *execState {
 								merged.accum[root] = joined
 								merged.schemaToAlloc[joined] = root
 								mergedScope[k] = joined
-								fmt.Printf("TRACE DSU joinState(same-accum): merged to root=%s\n", root)
+								opts.debugf("DSU joinState(same-accum): merged to root=%s", root)
 							}
 
 							// Lattice-join cardinality under root
@@ -4133,7 +4140,7 @@ func joinState(a, b *execState) *execState {
 							if joinedCard != nil {
 								merged.allocCardinality[root] = joinedCard
 								if joinedCard.MinItems != nil {
-									fmt.Printf("TRACE DSU joinState(same-accum): cardinality root=%s MinItems=%d\n",
+									opts.debugf("DSU joinState(same-accum): cardinality root=%s MinItems=%d",
 										root, *joinedCard.MinItems)
 								}
 							}
@@ -4153,7 +4160,7 @@ func joinState(a, b *execState) *execState {
 
 					// DEBUG: Check isEmpty for tracked vars
 					if k == "[9 1]" || k == "[10 0]" || k == "[10 2]" {
-						fmt.Printf("DEBUG scope-merge: var=%s isEmpty(a)=%v isEmpty(b)=%v\n", k, isEmpty(aVal), isEmpty(bVal))
+						opts.debugf("scope-merge: var=%s isEmpty(a)=%v isEmpty(b)=%v", k, isEmpty(aVal), isEmpty(bVal))
 					}
 
 					// Prefer non-empty over empty, regardless of tagging
@@ -4164,7 +4171,7 @@ func joinState(a, b *execState) *execState {
 						if bTagged {
 							merged.accum[bAlloc] = bVal
 						}
-						fmt.Printf("DEBUG scope-merge (same-accum): var=%s preferring non-empty b over empty a (bTagged=%v, bAlloc=%s)\n", k, bTagged, bAlloc)
+						opts.debugf("scope-merge (same-accum): var=%s preferring non-empty b over empty a (bTagged=%v, bAlloc=%s)", k, bTagged, bAlloc)
 						continue
 					}
 					if isEmpty(bVal) && !isEmpty(aVal) {
@@ -4173,7 +4180,7 @@ func joinState(a, b *execState) *execState {
 						if aTagged {
 							merged.accum[aAlloc] = aVal
 						}
-						fmt.Printf("DEBUG scope-merge (same-accum): var=%s preferring non-empty a over empty b (aTagged=%v, aAlloc=%s)\n", k, aTagged, aAlloc)
+						opts.debugf("scope-merge (same-accum): var=%s preferring non-empty a over empty b (aTagged=%v, aAlloc=%s)", k, aTagged, aAlloc)
 						continue
 					}
 
@@ -4248,7 +4255,7 @@ func joinState(a, b *execState) *execState {
 								}
 							}
 							if propagated {
-								fmt.Printf("DEBUG Case3 (same-accum): propagated intent to new alloc %s for var=%s\n", id, k)
+								opts.debugf("Case3 (same-accum): propagated intent to new alloc %s for var=%s", id, k)
 							}
 							// Propagate pointer-intent to the joined pointer
 							if merged.schemaFPIntent == nil {

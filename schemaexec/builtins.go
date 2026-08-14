@@ -408,7 +408,7 @@ func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 			apType = getType(input.AdditionalProperties.Left)
 		}
 		inputPtr := fmt.Sprintf("%p", input)
-		fmt.Printf("DEBUG builtinToEntries: input ptr=%s, %d properties, additionalProperties=%v (type=%s)\n",
+		env.logger.Debugf("builtinToEntries: input ptr=%s, %d properties, additionalProperties=%v (type=%s)",
 			inputPtr, propCount, hasAP, apType)
 	}
 
@@ -417,7 +417,7 @@ func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 
 	// DEBUG: Log what unionAllObjectValues returned
 	if env.opts.EnableWarnings {
-		fmt.Printf("DEBUG builtinToEntries: unionAllObjectValues returned type=%s, unconstrained=%v\n",
+		env.logger.Debugf("builtinToEntries: unionAllObjectValues returned type=%s, unconstrained=%v",
 			getType(valueSchema), isUnconstrainedSchema(valueSchema))
 	}
 
@@ -426,7 +426,7 @@ func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 	// to_entries on an empty object produces an empty array (no entries).
 	if isUnconstrainedSchema(valueSchema) {
 		if env.opts.EnableWarnings {
-			fmt.Printf("DEBUG builtinToEntries: unconstrained object -> returning EMPTY array (maxItems=0)\n")
+			env.logger.Debugf("builtinToEntries: unconstrained object -> returning EMPTY array (maxItems=0)")
 		}
 		// Return empty array - no entries, so maxItems=0 and Items=nil
 		// Call ArrayType(nil) which creates an empty array
@@ -434,7 +434,7 @@ func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 	}
 
 	if env.opts.EnableWarnings {
-		fmt.Printf("DEBUG builtinToEntries: valueSchema is constrained (type=%s), building entry object\n", getType(valueSchema))
+		env.logger.Debugf("builtinToEntries: valueSchema is constrained (type=%s), building entry object", getType(valueSchema))
 	}
 
 	entrySchema := BuildObject(map[string]*oas3.Schema{
@@ -450,7 +450,7 @@ func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 		if resultHasItems {
 			itemType = getType(result.Items.Left)
 		}
-		fmt.Printf("DEBUG builtinToEntries: returning array - empty=%v, hasItems=%v, itemType=%s\n",
+		env.logger.Debugf("builtinToEntries: returning array - empty=%v, hasItems=%v, itemType=%s",
 			resultIsEmpty, resultHasItems, itemType)
 	}
 
@@ -1347,7 +1347,7 @@ func builtinGetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 // builtinSetpath implements setpath(path; value) - set value at path
 func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
 	if env != nil && env.opts.EnableWarnings {
-		fmt.Printf("DEBUG builtinSetpath: CALLED with %d args\n", len(args))
+		env.logger.Debugf("builtinSetpath: CALLED with %d args", len(args))
 	}
 
 	if len(args) < 2 {
@@ -1364,22 +1364,22 @@ func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 		if hasPrefixItems {
 			prefixLen = len(pathArg.PrefixItems)
 		}
-		fmt.Printf("DEBUG builtinSetpath: pathArg is array, hasPrefixItems=%v, prefixLen=%d\n", hasPrefixItems, prefixLen)
+		env.logger.Debugf("builtinSetpath: pathArg is array, hasPrefixItems=%v, prefixLen=%d", hasPrefixItems, prefixLen)
 	}
 
 	if MightBeObject(input) && MightBeArray(pathArg) && pathArg.PrefixItems != nil && len(pathArg.PrefixItems) == 1 {
 		if seg := pathArg.PrefixItems[0]; seg != nil && seg.Left != nil {
 			if env != nil && env.opts.EnableWarnings {
-				fmt.Printf("DEBUG builtinSetpath: checking seg.Left type=%s, MightBeString=%v\n", getType(seg.Left), MightBeString(seg.Left))
+				env.logger.Debugf("builtinSetpath: checking seg.Left type=%s, MightBeString=%v", getType(seg.Left), MightBeString(seg.Left))
 			}
 			if MightBeString(seg.Left) {
 				constVal, isConst := extractConstString(seg.Left)
 				if env != nil && env.opts.EnableWarnings {
-					fmt.Printf("DEBUG builtinSetpath: extractConstString returned '%s', isConst=%v\n", constVal, isConst)
+					env.logger.Debugf("builtinSetpath: extractConstString returned '%s', isConst=%v", constVal, isConst)
 				}
 				if !isConst {
 					if env != nil && env.opts.EnableWarnings {
-						fmt.Printf("DEBUG builtinSetpath: tuple[0] is non-const string -> dynamic key; updating additionalProperties\n")
+						env.logger.Debugf("builtinSetpath: tuple[0] is non-const string -> dynamic key; updating additionalProperties")
 					}
 					return []*oas3.Schema{setDynamicProperty(input, valueArg, env.opts)}, nil
 				}
@@ -1390,25 +1390,25 @@ func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 	paths := extractPathsFromSchema(pathArg)
 	if env != nil && env.opts.EnableWarnings {
 		pathType := getType(pathArg)
-		fmt.Printf("DEBUG builtinSetpath: extracted %d paths from pathArg (type=%s)\n", len(paths), pathType)
+		env.logger.Debugf("builtinSetpath: extracted %d paths from pathArg (type=%s)", len(paths), pathType)
 	}
 
 	if len(paths) == 0 {
 		// DEBUG: Log when setpath no-ops due to non-const path
 		if env != nil && env.opts.EnableWarnings {
-			fmt.Printf("DEBUG builtinSetpath: no const paths extracted, checking for wildcard case\n")
+			env.logger.Debugf("builtinSetpath: no const paths extracted, checking for wildcard case")
 		}
 
 		// HANDLE EMPTY-PATH SENTINEL: Some upstream builders collapse non-const segments to an "empty array" (maxItems=0).
 		// Treat this as a dynamic string-key update on objects so reduce .[] as $c ({}; .[$c.name] = $c.value) can proceed.
 		if MightBeArray(pathArg) && pathArg.MaxItems != nil && *pathArg.MaxItems == 0 && MightBeObject(input) {
 			if env != nil && env.opts.EnableWarnings {
-				fmt.Printf("DEBUG builtinSetpath: empty path tuple treated as dynamic string key; updating additionalProperties\n")
-				fmt.Printf("DEBUG builtinSetpath: calling setDynamicProperty now...\n")
+				env.logger.Debugf("builtinSetpath: empty path tuple treated as dynamic string key; updating additionalProperties")
+				env.logger.Debugf("builtinSetpath: calling setDynamicProperty now...")
 			}
 			result := setDynamicProperty(input, valueArg, env.opts)
 			if env != nil && env.opts.EnableWarnings {
-				fmt.Printf("DEBUG builtinSetpath: setDynamicProperty returned, hasAP=%v\n",
+				env.logger.Debugf("builtinSetpath: setDynamicProperty returned, hasAP=%v",
 					result.AdditionalProperties != nil && result.AdditionalProperties.Left != nil)
 			}
 			return []*oas3.Schema{result}, nil
@@ -1421,7 +1421,7 @@ func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 			// Check if this is a path array with string-typed items
 			if MightBeString(pathItems) && MightBeObject(input) {
 				if env != nil && env.opts.EnableWarnings {
-					fmt.Printf("DEBUG builtinSetpath: detected wildcard string key pattern (non-empty), updating additionalProperties\n")
+					env.logger.Debugf("builtinSetpath: detected wildcard string key pattern (non-empty), updating additionalProperties")
 				}
 				return []*oas3.Schema{setDynamicProperty(input, valueArg, env.opts)}, nil
 			}
@@ -1443,7 +1443,7 @@ func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 	afterFP := schemaFingerprint(result)
 	if afterFP == beforeFP && MightBeObject(input) {
 		if env != nil && env.opts.EnableWarnings {
-			fmt.Printf("DEBUG builtinSetpath: static set had no effect; treating path as dynamic string key and updating additionalProperties\n")
+			env.logger.Debugf("builtinSetpath: static set had no effect; treating path as dynamic string key and updating additionalProperties")
 		}
 		return []*oas3.Schema{setDynamicProperty(input, valueArg, env.opts)}, nil
 	}
@@ -1461,7 +1461,7 @@ func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 			// Treat a fresh accumulator {} (no properties, no AP before static set) as dynamic-key target
 			if inputPropCount == 0 && !inputHasAP {
 				if env != nil && env.opts.EnableWarnings {
-					fmt.Printf("DEBUG builtinSetpath: widening additionalProperties for single-string path into fresh object; value type=%s\n", getType(valueArg))
+					env.logger.Debugf("builtinSetpath: widening additionalProperties for single-string path into fresh object; value type=%s", getType(valueArg))
 				}
 				// Preserve accumulator pointer identity for fresh objects
 				// This ensures the original accumulator pointer gets AP, not just the cloned result
@@ -2214,7 +2214,7 @@ func concatArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema 
 				bType = "array<any>"
 			}
 		}
-		fmt.Printf("DEBUG concatArraySchemas: %s + %s\n", aType, bType)
+		opts.debugf("concatArraySchemas: %s + %s", aType, bType)
 	}
 
 	if aIsEmpty && bIsEmpty {
@@ -2274,10 +2274,10 @@ func concatArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema 
 		} else {
 			mergedItemsType = "nil"
 		}
-		fmt.Printf("DEBUG concatArraySchemas: mergedItems type=%s, result: empty=%v, hasItems=%v, itemType=%s\n",
+		opts.debugf("concatArraySchemas: mergedItems type=%s, result: empty=%v, hasItems=%v, itemType=%s",
 			mergedItemsType, resultIsEmpty, resultHasItems, resultItemType)
 		if resultIsEmpty {
-			fmt.Printf("DEBUG concatArraySchemas: WARNING - produced empty array from non-empty inputs!\n")
+			opts.debugf("concatArraySchemas: WARNING - produced empty array from non-empty inputs!")
 		}
 	}
 

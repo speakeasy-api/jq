@@ -34,6 +34,21 @@ type SchemaExecOptions struct {
 	LogMaxProps          int    // Max object properties to show in logs (default: 5)
 	LogStackPreviewDepth int    // Max stack depth to preview in logs (default: 3)
 	LogSchemaDeltas      bool   // If true, include schema deltas in debug logs (default: true)
+
+	// logger is the resolved Logger for this execution. It is attached by
+	// newSchemaEnv (from LogLevel) so that package-level schema operations
+	// receiving options can emit diagnostics through the Logger interface.
+	// When nil (options not created by an execution), diagnostics are dropped:
+	// the library must be silent on stdout/stderr by default.
+	logger Logger
+}
+
+// debugf routes diagnostic output from options-carrying helpers through the
+// configured logger. No-op when no logger is attached.
+func (o SchemaExecOptions) debugf(format string, args ...any) {
+	if o.logger != nil {
+		o.logger.Debugf(format, args...)
+	}
 }
 
 // SchemaExecResult contains the output schema and diagnostic information.
