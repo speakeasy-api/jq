@@ -1431,8 +1431,65 @@ func BuildObject(props map[string]*oas3.Schema, required []string) *oas3.Schema 
 // HELPERS
 // ============================================================================
 
+// impliedTypeOf infers a schema's type from its structure when no explicit
+// `type` is declared.
+//
+// DELIBERATE DEVIATION FROM RAW JSON SCHEMA SEMANTICS: under JSON Schema, an
+// untyped schema with `properties` still admits strings, numbers, etc. This
+// library targets Speakeasy-processed OpenAPI documents, and the contract is
+// equivalence with what Speakeasy's SDK/CLI generators assume. The rules below
+// EXACTLY mirror the structural inference those generators apply to untyped
+// schemas:
+//
+//  1. has enum                 → string
+//  2. has const                → inferred from the const's scalar type
+//  3. has properties (len > 0) → object
+//  4. has additionalProperties → object
+//  5. has items                → array
+//  6. otherwise                → "" (unknown / any)
+//
+// Callers must only consult this when the schema has no explicit types and no
+// allOf/anyOf/oneOf (combinators are handled by their own collapse paths,
+// matching the generator's precedence).
+func impliedTypeOf(s *oas3.Schema) string {
+	if s == nil {
+		return ""
+	}
+	if len(s.Enum) > 0 {
+		// Untyped enums are handled as string enums by the generator.
+		return "string"
+	}
+	if s.Const != nil {
+		var constValue any
+		if err := s.Const.Decode(&constValue); err == nil && constValue != nil {
+			switch constValue.(type) {
+			case bool:
+				return "boolean"
+			case float64:
+				return "number"
+			case string:
+				return "string"
+			case int:
+				return "integer"
+			}
+		}
+	}
+	if s.Properties != nil && s.Properties.Len() > 0 {
+		return "object"
+	}
+	if s.AdditionalProperties != nil {
+		return "object"
+	}
+	if s.Items != nil {
+		return "array"
+	}
+	return ""
+}
+
 // getType returns the primary type from a schema.
 // Returns empty string if no type or multiple types.
+// When no explicit type is declared and no combinators are present, the type
+// is structurally implied via impliedTypeOf (generator-equivalence contract).
 func getType(s *oas3.Schema) string {
 	if s == nil {
 		return ""
@@ -1461,6 +1518,12 @@ func getType(s *oas3.Schema) string {
 
 	types := s.GetType()
 	if len(types) == 0 {
+		// No explicit type. Fall back to structural inference (implied types),
+		// mirroring the generator. anyOf was handled above; allOf/oneOf are
+		// collapsed by their own paths and must not be second-guessed here.
+		if len(s.AllOf) == 0 && len(s.OneOf) == 0 {
+			return impliedTypeOf(s)
+		}
 		return ""
 	}
 	if len(types) > 1 {
@@ -1486,8 +1549,13 @@ func mightBeType(s *oas3.Schema, typ oas3.SchemaType) bool {
 		return false // Has types but not this one
 	}
 
-	// No explicit type - could be anything
+	// No explicit type and no combinators: consult structural inference
+	// (implied types, generator-equivalence contract). If the structure
+	// implies a type, treat it as authoritative; otherwise could be anything.
 	if len(types) == 0 && s.AnyOf == nil && s.AllOf == nil && s.OneOf == nil {
+		if implied := impliedTypeOf(s); implied != "" {
+			return string(typ) == implied
+		}
 		return true
 	}
 
