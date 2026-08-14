@@ -131,6 +131,30 @@ func newSchemaEnv(ctx context.Context, opts SchemaExecOptions) *schemaEnv {
 	}
 }
 
+// resolvedLeft returns the concrete schema a wrapper denotes, following the
+// wrapper's resolved $ref (populated by openapi.ResolveAllReferences) before
+// falling back to the inline Left schema.
+//
+// IMPORTANT: reference resolution state lives on the WRAPPER
+// (JSONSchema[Referenceable]), not on the inline Left schema. For a $ref, Left
+// is a bare "$ref shell" (only Ref set). Rebuilding wrappers with
+// NewJSONSchemaFromSchema(child.Left) discards the wrapper's resolution caches,
+// so any code that reconstructs child wrappers MUST look through the resolved
+// schema first, or $ref children degrade into shells that read as untyped
+// downstream (widening to Top, or worse, "definitely missing" in property
+// lookups).
+func resolvedLeft(js *oas3.JSONSchema[oas3.Referenceable]) *oas3.Schema {
+	if js == nil {
+		return nil
+	}
+	if resolved := js.GetResolvedSchema(); resolved != nil {
+		if s := resolved.GetLeft(); s != nil {
+			return s
+		}
+	}
+	return js.Left
+}
+
 // derefJSONSchema attempts to dereference a JSONSchema wrapper to get the actual Schema.
 // Tries GetResolvedSchema() first for $ref cases, then falls back to inline Left schemas.
 // Uses the provided normCtx for cycle-aware collapsing.
@@ -159,6 +183,15 @@ func derefJSONSchema(ctx context.Context, js *oas3.JSONSchema[oas3.Referenceable
 	// This handles schemas created by wrapping with NewJSONSchemaFromSchema.
 	if js.Left != nil {
 		s := js.Left
+		if s.IsReference() {
+			// Unresolved $ref shell: the wrapper has no resolution state and
+			// the inline schema is just a pointer (Ref set, no structure).
+			// Treating it as an inline schema would make it read as untyped —
+			// or as "definitely missing" in property lookups, which is
+			// UNSOUND (discards the referenced schema's values). Report
+			// failure so callers widen to Top instead.
+			return nil, false
+		}
 		collapsed, err := collapseAllOfCtx(ctx, s)
 		if err != nil {
 			return s, true
@@ -283,12 +316,12 @@ func collapseAllOfCtx(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, e
 		return collapsed, nil
 	}
 
-	// Extract and dereference all allOf subschemas
+	// Extract and dereference all allOf subschemas ($refs followed via resolvedLeft)
 	subschemas := make([]*oas3.Schema, 0, len(schema.AllOf))
 	for _, schemaOrRef := range schema.AllOf {
-		if schemaOrRef.Left != nil {
+		if left := resolvedLeft(schemaOrRef); left != nil {
 			// Recursively collapse the subschema
-			collapsed, err := collapseAllOfCtx(ctx, schemaOrRef.Left)
+			collapsed, err := collapseAllOfCtx(ctx, left)
 			if err != nil {
 				return nil, err
 			}
@@ -399,12 +432,12 @@ func collapseAnyOfCtx(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, e
 		return collapsed, nil
 	}
 
-	// Extract and collapse all anyOf subschemas
+	// Extract and collapse all anyOf subschemas ($refs followed via resolvedLeft)
 	subschemas := make([]*oas3.Schema, 0, len(schema.AnyOf))
 	for _, schemaOrRef := range schema.AnyOf {
-		if schemaOrRef.Left != nil {
+		if left := resolvedLeft(schemaOrRef); left != nil {
 			// First collapse allOf within this branch, then anyOf
-			collapsed, err := collapseAllOfCtx(ctx, schemaOrRef.Left)
+			collapsed, err := collapseAllOfCtx(ctx, left)
 			if err != nil {
 				return nil, err
 			}
@@ -509,12 +542,18 @@ func collapseNestedSchemasCtx(ctx context.Context, schema *oas3.Schema) (*oas3.S
 
 	result := cloneSchema(schema)
 
+	// NOTE: child wrappers are read via resolvedLeft (not .Left) so that $ref
+	// children are followed to their resolved targets BEFORE the wrapper is
+	// rebuilt. Rebuilding from the raw Left would keep only the "$ref shell"
+	// (Ref set, no structure) and permanently discard the wrapper-level
+	// resolution caches. See resolvedLeft.
+
 	// Collapse properties
 	if result.Properties != nil && result.Properties.Len() > 0 {
 		newProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
 		for key, prop := range result.Properties.All() {
-			if prop != nil && prop.Left != nil {
-				collapsed, err := collapseAllOfCtx(ctx, prop.Left)
+			if left := resolvedLeft(prop); left != nil {
+				collapsed, err := collapseAllOfCtx(ctx, left)
 				if err != nil {
 					return nil, err
 				}
@@ -531,8 +570,8 @@ func collapseNestedSchemasCtx(ctx context.Context, schema *oas3.Schema) (*oas3.S
 	}
 
 	// Collapse array items
-	if result.Items != nil && result.Items.Left != nil {
-		collapsed, err := collapseAllOfCtx(ctx, result.Items.Left)
+	if left := resolvedLeft(result.Items); left != nil {
+		collapsed, err := collapseAllOfCtx(ctx, left)
 		if err != nil {
 			return nil, err
 		}
@@ -544,8 +583,8 @@ func collapseNestedSchemasCtx(ctx context.Context, schema *oas3.Schema) (*oas3.S
 	}
 
 	// Collapse additionalProperties
-	if result.AdditionalProperties != nil && result.AdditionalProperties.Left != nil {
-		collapsed, err := collapseAllOfCtx(ctx, result.AdditionalProperties.Left)
+	if left := resolvedLeft(result.AdditionalProperties); left != nil {
+		collapsed, err := collapseAllOfCtx(ctx, left)
 		if err != nil {
 			return nil, err
 		}
@@ -560,8 +599,8 @@ func collapseNestedSchemasCtx(ctx context.Context, schema *oas3.Schema) (*oas3.S
 	if len(result.AnyOf) > 0 {
 		newAnyOf := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(result.AnyOf))
 		for _, branch := range result.AnyOf {
-			if branch.Left != nil {
-				collapsed, err := collapseAllOfCtx(ctx, branch.Left)
+			if left := resolvedLeft(branch); left != nil {
+				collapsed, err := collapseAllOfCtx(ctx, left)
 				if err != nil {
 					return nil, err
 				}
@@ -643,9 +682,10 @@ func mergeSchemasMode(s1, s2 *oas3.Schema, mode MergeMode) (*oas3.Schema, error)
 
 		for key, prop2 := range s2.Properties.All() {
 			if prop1, exists := result.Properties.Get(key); exists {
-				// Merge the two property schemas
-				if prop1 != nil && prop1.Left != nil && prop2 != nil && prop2.Left != nil {
-					merged, err := mergeSchemasMode(prop1.Left, prop2.Left, mode)
+				// Merge the two property schemas ($refs followed via resolvedLeft)
+				left1, left2 := resolvedLeft(prop1), resolvedLeft(prop2)
+				if left1 != nil && left2 != nil {
+					merged, err := mergeSchemasMode(left1, left2, mode)
 					if err != nil {
 						return nil, fmt.Errorf("incompatible property %q: %w", key, err)
 					}
@@ -703,13 +743,13 @@ func mergeSchemasMode(s1, s2 *oas3.Schema, mode MergeMode) (*oas3.Schema, error)
 		}
 	}
 
-	// Merge array items
-	if s2.Items != nil && s2.Items.Left != nil {
-		if result.Items == nil || result.Items.Left == nil {
+	// Merge array items ($refs followed via resolvedLeft)
+	if items2 := resolvedLeft(s2.Items); items2 != nil {
+		if items1 := resolvedLeft(result.Items); items1 == nil {
 			result.Items = s2.Items
 		} else {
 			// Merge the item schemas
-			merged, err := mergeSchemasMode(result.Items.Left, s2.Items.Left, mode)
+			merged, err := mergeSchemasMode(items1, items2, mode)
 			if err != nil {
 				return nil, fmt.Errorf("incompatible array items: %w", err)
 			}
