@@ -35,9 +35,8 @@ const (
 	//     defaults to true in JSON Schema): access yields unknown ∪ null,
 	//     so nothing is ever "provably missing" without an explicit
 	//     additionalProperties: false.
-	// Note: auxiliary type-compatibility guards inside builtins may still
-	// consult structural inference for precision; schemas reaching them have
-	// normally already been widened by raw-mode dispatch.
+	// Builtins conservatively widen when an operand has only an implied type,
+	// because raw JSON Schema still permits values of every other JSON type.
 	SchemaSemanticsRaw
 )
 
@@ -80,6 +79,11 @@ type SchemaExecOptions struct {
 	// When nil (options not created by an execution), diagnostics are dropped:
 	// the library must be silent on stdout/stderr by default.
 	logger Logger
+
+	// norm is shared by every schema operation in one execution. Keeping it
+	// here lets package-level helpers that only receive options reuse the same
+	// normalized graph and preserve pointer identity.
+	norm *normCtx
 }
 
 // normalizeOptions fills numeric safety limits that cannot use zero during an

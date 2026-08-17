@@ -285,3 +285,61 @@ func TestImpliedTypes_BareSchemaStillWidens(t *testing.T) {
 		t.Errorf(".x on bare schema: got %s, want Top", schemaTypeSummary(out, 2))
 	}
 }
+
+func TestRawSemanticsBuiltinsWidenImpliedOperands(t *testing.T) {
+	input := untypedObject(map[string]*oas3.Schema{"x": StringType()}, []string{"x"})
+	for _, expr := range []string{`keys`, `length`, `type`, `to_entries`, `has("x")`, `add`} {
+		t.Run(expr, func(t *testing.T) {
+			query, err := gojq.Parse(expr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts := DefaultOptions()
+			opts.Semantics = SchemaSemanticsRaw
+			analysis, err := Analyze(context.Background(), query, input, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if analysis.Verdict != VerdictUnverifiable || !isTopSchema(analysis.Output) {
+				t.Fatalf("raw result = %s (%s), want caused Top", schemaTypeSummary(analysis.Output, 2), analysis.Verdict)
+			}
+			if len(analysis.Causes) == 0 || analysis.Causes[0] != "raw semantics: builtin applied to untyped schema at $" {
+				t.Fatalf("causes = %v", analysis.Causes)
+			}
+		})
+	}
+}
+
+func TestSpeakeasySemanticsBuiltinsKeepImpliedPrecision(t *testing.T) {
+	input := untypedObject(map[string]*oas3.Schema{"x": StringType()}, []string{"x"})
+	tests := []struct {
+		expr     string
+		wantType string
+		verdict  Verdict
+	}{
+		{expr: `keys`, wantType: "array", verdict: VerdictProven},
+		{expr: `length`, wantType: "number", verdict: VerdictProven},
+		{expr: `type`, wantType: "string", verdict: VerdictProven},
+		{expr: `to_entries`, wantType: "array", verdict: VerdictProven},
+		{expr: `has("x")`, wantType: "boolean", verdict: VerdictProven},
+		{expr: `add`, verdict: VerdictUnverifiable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.expr, func(t *testing.T) {
+			query, err := gojq.Parse(tt.expr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			analysis, err := Analyze(context.Background(), query, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if analysis.Verdict != tt.verdict {
+				t.Fatalf("verdict = %s, want %s; output=%s", analysis.Verdict, tt.verdict, schemaTypeSummary(analysis.Output, 2))
+			}
+			if tt.wantType != "" && getType(analysis.Output) != tt.wantType {
+				t.Fatalf("type = %q, want %q", getType(analysis.Output), tt.wantType)
+			}
+		})
+	}
+}

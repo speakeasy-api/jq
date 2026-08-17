@@ -1069,7 +1069,7 @@ func flattenSchemaRecursive(schema *oas3.Schema, depth int, opts SchemaExecOptio
 
 	// Add items schema
 	if schema.Items != nil {
-		if item, ok := derefJSONSchema(newCollapseContext(), schema.Items); !ok {
+		if item, ok := derefJSONSchema(collapseContextForOptions(opts), schema.Items); !ok {
 			items = append(items, Top())
 		} else if item != nil {
 			items = append(items, item)
@@ -1731,8 +1731,22 @@ func (env *schemaEnv) callBuiltin(name string, input *oas3.Schema, args []*oas3.
 		// Unknown or special builtin
 		return nil, fmt.Errorf("builtin %s not implemented", name)
 	}
+	if env.opts.Semantics == SchemaSemanticsRaw {
+		if rawBuiltinOperandNeedsWidening(input) {
+			return []*oas3.Schema{env.NewTopWithCause("raw semantics: builtin applied to untyped schema")}, nil
+		}
+		for _, arg := range args {
+			if rawBuiltinOperandNeedsWidening(arg) {
+				return []*oas3.Schema{env.NewTopWithCause("raw semantics: builtin applied to untyped schema")}, nil
+			}
+		}
+	}
 
 	return fn(input, args, env)
+}
+
+func rawBuiltinOperandNeedsWidening(schema *oas3.Schema) bool {
+	return schema != nil && getTypeExplicit(schema) == "" && impliedTypeOf(schema) != ""
 }
 
 // isBuiltin checks if a name is a known builtin.

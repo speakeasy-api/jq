@@ -165,7 +165,7 @@ func getPropertyWithNull(obj *oas3.Schema, name string, opts SchemaExecOptions) 
 	if obj.Properties != nil {
 		if js, ok := obj.Properties.Get(name); ok && js != nil {
 			var prop *oas3.Schema
-			if p, ok := derefJSONSchema(newCollapseContext(), js); ok {
+			if p, ok := derefJSONSchema(collapseContextForOptions(opts), js); ok {
 				prop = p
 			} else {
 				prop = Top()
@@ -190,7 +190,7 @@ func getPropertyWithNull(obj *oas3.Schema, name string, opts SchemaExecOptions) 
 				return Union([]*oas3.Schema{Top(), ConstNull()}, opts)
 			}
 			if re.MatchString(name) {
-				if ps, ok := derefJSONSchema(newCollapseContext(), pjs); ok {
+				if ps, ok := derefJSONSchema(collapseContextForOptions(opts), pjs); ok {
 					return Union([]*oas3.Schema{ps, ConstNull()}, opts)
 				}
 				return Union([]*oas3.Schema{Top(), ConstNull()}, opts)
@@ -202,7 +202,7 @@ func getPropertyWithNull(obj *oas3.Schema, name string, opts SchemaExecOptions) 
 
 	// AdditionalProperties?
 	if obj.AdditionalProperties != nil {
-		if ap, ok := derefJSONSchema(newCollapseContext(), obj.AdditionalProperties); ok {
+		if ap, ok := derefJSONSchema(collapseContextForOptions(opts), obj.AdditionalProperties); ok {
 			return Union([]*oas3.Schema{ap, ConstNull()}, opts)
 		}
 		// If boolean flag present and false, property cannot exist → definitely null
@@ -308,12 +308,12 @@ func arrayElementUnion(arr *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 
 	candidates := make([]*oas3.Schema, 0, len(arr.PrefixItems)+1)
 	for _, item := range arr.PrefixItems {
-		if schema, ok := derefJSONSchema(newCollapseContext(), item); ok && schema != nil {
+		if schema, ok := derefJSONSchema(collapseContextForOptions(opts), item); ok && schema != nil {
 			candidates = append(candidates, schema)
 		}
 	}
 	if arr.Items != nil {
-		if schema, ok := derefJSONSchema(newCollapseContext(), arr.Items); !ok {
+		if schema, ok := derefJSONSchema(collapseContextForOptions(opts), arr.Items); !ok {
 			candidates = append(candidates, Top())
 		} else if schema != nil {
 			candidates = append(candidates, schema)
@@ -374,7 +374,7 @@ func GetProperty(obj *oas3.Schema, key string, opts SchemaExecOptions) *oas3.Sch
 	if obj.Properties != nil {
 		if propSchema, ok := obj.Properties.Get(key); ok {
 			// Dereference the property schema (handles both inline and $ref)
-			if schema, ok := derefJSONSchema(newCollapseContext(), propSchema); ok {
+			if schema, ok := derefJSONSchema(collapseContextForOptions(opts), propSchema); ok {
 				return schema
 			}
 			// Unresolved reference - widen conservatively
@@ -384,7 +384,7 @@ func GetProperty(obj *oas3.Schema, key string, opts SchemaExecOptions) *oas3.Sch
 
 	// Check additionalProperties
 	if obj.AdditionalProperties != nil {
-		if schema, ok := derefJSONSchema(newCollapseContext(), obj.AdditionalProperties); ok {
+		if schema, ok := derefJSONSchema(collapseContextForOptions(opts), obj.AdditionalProperties); ok {
 			return schema
 		}
 		// Unresolved reference in additionalProperties - widen conservatively
@@ -1619,9 +1619,18 @@ func getTypeExplicit(s *oas3.Schema) string {
 }
 
 func getTypeImpl(s *oas3.Schema, allowImplied bool) string {
+	return getTypeImplSeen(s, allowImplied, make(map[*oas3.Schema]bool))
+}
+
+func getTypeImplSeen(s *oas3.Schema, allowImplied bool, seen map[*oas3.Schema]bool) string {
 	if s == nil {
 		return ""
 	}
+	if seen[s] {
+		return ""
+	}
+	seen[s] = true
+	defer delete(seen, s)
 
 	// Check anyOf - if all branches have same type, return it
 	// ($ref branches are followed via resolvedLeft)
@@ -1629,7 +1638,7 @@ func getTypeImpl(s *oas3.Schema, allowImplied bool) string {
 		firstType := ""
 		for _, branch := range s.AnyOf {
 			if left := resolvedLeft(branch); left != nil {
-				branchType := getTypeImpl(left, allowImplied)
+				branchType := getTypeImplSeen(left, allowImplied, seen)
 				if branchType == "" {
 					// Unknown/combinator branch: the union's type is not a
 					// single primary type. Reporting the OTHER branches' type
@@ -2180,9 +2189,27 @@ func derefOr[T any](p *T) any {
 // isSubschemaOf checks if schema A is a subschema of (subsumed by) schema B
 // Returns true if every instance that validates against A also validates against B
 func isSubschemaOf(a, b *oas3.Schema) bool {
+	return isSubschemaOfSeen(a, b, make(map[subschemaPair]bool))
+}
+
+type subschemaPair struct {
+	a *oas3.Schema
+	b *oas3.Schema
+}
+
+func isSubschemaOfSeen(a, b *oas3.Schema, seen map[subschemaPair]bool) bool {
 	if a == nil || b == nil {
 		return false
 	}
+	if a == b {
+		return true
+	}
+	pair := subschemaPair{a: a, b: b}
+	if seen[pair] {
+		return false
+	}
+	seen[pair] = true
+	defer delete(seen, pair)
 
 	// A nullable A admits null; unless B also admits null, A ⊄ B. Dropping
 	// the nullable branch would silently discard null outputs.
@@ -2261,9 +2288,9 @@ func isSubschemaOf(a, b *oas3.Schema) bool {
 		case oas3.SchemaTypeString:
 			return stringConstraintsSubsumed(a, b)
 		case oas3.SchemaTypeArray:
-			return arrayConstraintsSubsumed(a, b)
+			return arrayConstraintsSubsumed(a, b, seen)
 		case oas3.SchemaTypeObject:
-			return objectConstraintsSubsumed(a, b)
+			return objectConstraintsSubsumed(a, b, seen)
 		}
 	} else if aType != "" && bType == "" {
 		// B has no primary type. That does NOT mean B accepts anything: a
@@ -2401,7 +2428,7 @@ func stringConstraintsSubsumed(a, b *oas3.Schema) bool {
 }
 
 // arrayConstraintsSubsumed checks if A's array constraints are stricter than or equal to B's
-func arrayConstraintsSubsumed(a, b *oas3.Schema) bool {
+func arrayConstraintsSubsumed(a, b *oas3.Schema, seen map[subschemaPair]bool) bool {
 	// Special case: empty arrays (MaxItems=0) are not subsumed by non-empty arrays
 	// An empty array represents a specific constraint (must be empty), not a general array
 	aIsEmpty := a.MaxItems != nil && *a.MaxItems == 0
@@ -2456,7 +2483,7 @@ func arrayConstraintsSubsumed(a, b *oas3.Schema) bool {
 
 	if aHasItems && bHasItems {
 		// Both have items - recursively check
-		if !isSubschemaOf(aItems, bItems) {
+		if !isSubschemaOfSeen(aItems, bItems, seen) {
 			return false
 		}
 	}
@@ -2475,7 +2502,7 @@ func arrayConstraintsSubsumed(a, b *oas3.Schema) bool {
 }
 
 // objectConstraintsSubsumed checks if A's object constraints are stricter than or equal to B's
-func objectConstraintsSubsumed(a, b *oas3.Schema) bool {
+func objectConstraintsSubsumed(a, b *oas3.Schema, seen map[subschemaPair]bool) bool {
 	// Check required: B.required ⊆ A.required (B cannot require more than A)
 	for _, req := range b.Required {
 		found := false
@@ -2497,7 +2524,7 @@ func objectConstraintsSubsumed(a, b *oas3.Schema) bool {
 				if b.Properties != nil {
 					if bProp, ok := b.Properties.Get(propName); ok && bProp.Left != nil {
 						// Both have this property: check subsumption
-						if !isSubschemaOf(aProp.Left, bProp.Left) {
+						if !isSubschemaOfSeen(aProp.Left, bProp.Left, seen) {
 							return false
 						}
 					}
@@ -2543,7 +2570,7 @@ func objectConstraintsSubsumed(a, b *oas3.Schema) bool {
 		if aAllowAny {
 			return false
 		}
-		if aSchema && !isSubschemaOf(aAP.Left, bAP.Left) {
+		if aSchema && !isSubschemaOfSeen(aAP.Left, bAP.Left, seen) {
 			return false
 		}
 		// aForbids is fine (stricter than B)

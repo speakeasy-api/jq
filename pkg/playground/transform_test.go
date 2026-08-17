@@ -118,6 +118,41 @@ components:
 	}
 }
 
+func TestSymbolicExecuteJQRecursiveSchema(t *testing.T) {
+	oasYAML := `openapi: 3.1.0
+info:
+  title: Recursive schema
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    Node:
+      type: object
+      x-speakeasy-transform-from-api:
+        jq: '.'
+      properties:
+        name:
+          type: string
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+      required: [name, children]
+`
+
+	result, err := SymbolicExecuteJQ(oasYAML)
+	if err != nil {
+		t.Fatalf("SymbolicExecuteJQ: %v", err)
+	}
+	if !strings.Contains(result, "children:") || !strings.Contains(result, "items:") {
+		t.Fatalf("recursive output lost array shape:\n%s", result)
+	}
+	var decoded map[string]any
+	if err := yaml.Unmarshal([]byte(result), &decoded); err != nil {
+		t.Fatalf("output is not finite valid YAML: %v", err)
+	}
+}
+
 func TestSymbolicExecuteJQ_UserInput(t *testing.T) {
 	oasYAML := `openapi: 3.1.0
 info:

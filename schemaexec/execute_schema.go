@@ -33,6 +33,7 @@ type schemaEnv struct {
 	// Tracks why a Top schema was created during execution.
 	// Keyed by the exact Top() schema pointer identity.
 	topCauses map[*oas3.Schema]string
+	norm      *normCtx
 }
 
 // NewTopWithCause creates a Top schema and records the reason why it was created.
@@ -123,6 +124,10 @@ func newSchemaEnv(ctx context.Context, opts SchemaExecOptions) *schemaEnv {
 	// Attach the resolved logger to the options copy so package-level schema
 	// operations (Union, merges, ...) can log through it.
 	opts.logger = logger
+	if opts.norm == nil {
+		opts.norm = newNormCtx(ctx)
+	}
+	opts.norm.logger = logger
 
 	return &schemaEnv{
 		ctx:      ctx,
@@ -133,7 +138,12 @@ func newSchemaEnv(ctx context.Context, opts SchemaExecOptions) *schemaEnv {
 		logger:   logger,
 		execID:   execID,
 		strict:   opts.StrictMode,
+		norm:     opts.norm,
 	}
+}
+
+func (env *schemaEnv) normalizationContext() context.Context {
+	return withNormCtx(env.ctx, env.norm)
 }
 
 // resolvedLeft returns the concrete schema a wrapper denotes, following the
@@ -211,13 +221,9 @@ func derefJSONSchema(ctx context.Context, js *oas3.JSONSchema[oas3.Referenceable
 	// 1) Try GetResolvedSchema() first (handles $refs after ResolveAllReferences).
 	if resolved := js.GetResolvedSchema(); resolved != nil {
 		if schema := resolved.GetLeft(); schema != nil {
-			collapsed, err := collapseAllOfCtx(ctx, schema)
+			collapsed, err := normalizeSchema(ctx, schema)
 			if err != nil {
-				return schema, true
-			}
-			collapsed, err = collapseAnyOfCtx(ctx, collapsed)
-			if err != nil {
-				return collapsed, true
+				return nil, false
 			}
 			return collapsed, true
 		}
@@ -236,13 +242,9 @@ func derefJSONSchema(ctx context.Context, js *oas3.JSONSchema[oas3.Referenceable
 			// failure so callers widen to Top instead.
 			return nil, false
 		}
-		collapsed, err := collapseAllOfCtx(ctx, s)
+		collapsed, err := normalizeSchema(ctx, s)
 		if err != nil {
-			return s, true
-		}
-		collapsed, err = collapseAnyOfCtx(ctx, collapsed)
-		if err != nil {
-			return collapsed, true
+			return nil, false
 		}
 		return collapsed, true
 	}
@@ -270,18 +272,26 @@ const (
 
 // normCtx holds state for cycle-safe schema normalization (collapse operations)
 type normCtx struct {
-	inProgress map[*oas3.Schema]struct{}     // Cycle detection: schemas currently being processed
-	memo       map[*oas3.Schema]*oas3.Schema // Memoization for DAG sharing
-	depth      int                           // Current recursion depth
-	maxDepth   int                           // Maximum depth guard
+	ctx        context.Context
+	memo       map[*oas3.Schema]*oas3.Schema
+	normalized map[*oas3.Schema]struct{}
+	logger     Logger
 }
 
-func newNormCtx() *normCtx {
+func newNormCtx(ctx context.Context) *normCtx {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &normCtx{
-		inProgress: make(map[*oas3.Schema]struct{}, 64),
+		ctx:        ctx,
 		memo:       make(map[*oas3.Schema]*oas3.Schema, 256),
-		depth:      0,
-		maxDepth:   10000, // Guard against pathological cases
+		normalized: make(map[*oas3.Schema]struct{}, 256),
+	}
+}
+
+func (nctx *normCtx) debugf(format string, args ...any) {
+	if nctx != nil && nctx.logger != nil {
+		nctx.logger.Debugf(format, args...)
 	}
 }
 
@@ -305,381 +315,343 @@ func getNormCtx(ctx context.Context) *normCtx {
 
 // newCollapseContext creates a new context with normalization state for collapse operations
 func newCollapseContext() context.Context {
-	return withNormCtx(context.Background(), newNormCtx())
+	ctx := context.Background()
+	return withNormCtx(ctx, newNormCtx(ctx))
+}
+
+func collapseContextForOptions(opts SchemaExecOptions) context.Context {
+	if opts.norm == nil {
+		return newCollapseContext()
+	}
+	return withNormCtx(opts.norm.ctx, opts.norm)
 }
 
 // collapseAllOf recursively collapses allOf constraints in a schema by deep merging.
-// Returns the collapsed schema or an error if schemas are incompatible.
+// Merge conflicts widen the affected schema to Top; context cancellation is
+// the only normalization error returned to the caller.
 func collapseAllOf(schema *oas3.Schema) (*oas3.Schema, error) {
-	return collapseAllOfCtx(newCollapseContext(), schema)
+	return normalizeSchema(newCollapseContext(), schema)
 }
 
-// collapseAllOfCtx is the cycle-aware implementation of collapseAllOf
+// collapseAllOfCtx is retained for callers and tests that use the historical
+// helper name. All normalization now happens in one traversal.
 func collapseAllOfCtx(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, error) {
-	nctx := getNormCtx(ctx)
-	if nctx == nil {
-		// No normalization context, create one
-		nctx = newNormCtx()
-		ctx = withNormCtx(ctx, nctx)
-	}
-	if schema == nil {
-		return nil, nil
-	}
-
-	// Check memo (DAG sharing)
-	if result, ok := nctx.memo[schema]; ok {
-		return result, nil
-	}
-
-	// Check for cycle (in-progress)
-	if _, inProgress := nctx.inProgress[schema]; inProgress {
-		// Cycle detected: return schema as-is to break recursion
-		return schema, nil
-	}
-
-	// Depth guard
-	nctx.depth++
-	if nctx.depth > nctx.maxDepth {
-		nctx.depth--
-		return schema, nil // Too deep, return as-is
-	}
-	defer func() { nctx.depth-- }()
-
-	// Mark in-progress
-	nctx.inProgress[schema] = struct{}{}
-	defer delete(nctx.inProgress, schema)
-
-	// If no allOf, process nested schemas and return
-	if len(schema.AllOf) == 0 {
-		// Recursively collapse nested schemas
-		collapsed, err := collapseNestedSchemasCtx(ctx, schema)
-		if err != nil {
-			return nil, err
-		}
-		nctx.memo[schema] = collapsed
-		return collapsed, nil
-	}
-
-	// Extract and dereference all allOf subschemas ($refs followed via resolvedLeft)
-	subschemas := make([]*oas3.Schema, 0, len(schema.AllOf))
-	for _, schemaOrRef := range schema.AllOf {
-		if value, ok := resolvedBooleanSchema(schemaOrRef); ok {
-			if !value {
-				result := Bottom()
-				nctx.memo[schema] = result
-				return result, nil
-			}
-			continue // true is the identity for conjunction
-		}
-		if left := resolvedLeft(schemaOrRef); left != nil {
-			// Recursively collapse the subschema
-			collapsed, err := collapseAllOfCtx(ctx, left)
-			if err != nil {
-				return nil, err
-			}
-			subschemas = append(subschemas, collapsed)
-		}
-	}
-
-	// Handle empty allOf (should not happen but be safe)
-	if len(subschemas) == 0 {
-		// Empty allOf means unconstrained (Top)
-		base := cloneSchema(schema)
-		base.AllOf = nil
-		result, err := collapseNestedSchemasCtx(ctx, base)
-		if err != nil {
-			return nil, err
-		}
-		nctx.memo[schema] = result
-		return result, nil
-	}
-
-	// Handle single allOf subschema (identity case)
-	if len(subschemas) == 1 {
-		// Merge the single subschema with the parent schema (if any parent constraints exist)
-		base := cloneSchema(schema)
-		base.AllOf = nil
-		merged, err := mergeSchemas(base, subschemas[0])
-		if err != nil {
-			return nil, err
-		}
-		result, err := collapseNestedSchemasCtx(ctx, merged)
-		if err != nil {
-			return nil, err
-		}
-		nctx.memo[schema] = result
-		return result, nil
-	}
-
-	// Merge all subschemas together
-	base := cloneSchema(schema)
-	base.AllOf = nil
-
-	result := base
-	for _, sub := range subschemas {
-		merged, err := mergeSchemas(result, sub)
-		if err != nil {
-			return nil, err
-		}
-		result = merged
-	}
-
-	collapsed, err := collapseNestedSchemasCtx(ctx, result)
-	if err != nil {
-		return nil, err
-	}
-	nctx.memo[schema] = collapsed
-	return collapsed, nil
+	return normalizeSchema(ctx, schema)
 }
 
 // collapseAnyOf recursively collapses anyOf constraints in a schema by disjunctive merging.
 // Returns the collapsed schema or Bottom if anyOf is empty.
 // Keeps anyOf structure if branches have incompatible types.
 func collapseAnyOf(schema *oas3.Schema) (*oas3.Schema, error) {
-	return collapseAnyOfCtx(newCollapseContext(), schema)
+	return normalizeSchema(newCollapseContext(), schema)
 }
 
-// collapseAnyOfCtx is the cycle-aware implementation of collapseAnyOf
+// collapseAnyOfCtx is retained for callers and tests that use the historical
+// helper name. All normalization now happens in one traversal.
 func collapseAnyOfCtx(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, error) {
+	return normalizeSchema(ctx, schema)
+}
+
+// normalizeSchema collapses allOf and anyOf while rebuilding every reachable
+// child wrapper in a single memoized traversal. The result shell is registered
+// before descent, so recursive inputs become recursive normalized graphs.
+func normalizeSchema(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, error) {
 	nctx := getNormCtx(ctx)
 	if nctx == nil {
-		nctx = newNormCtx()
+		nctx = newNormCtx(ctx)
 		ctx = withNormCtx(ctx, nctx)
 	}
 	if schema == nil {
 		return nil, nil
 	}
-
-	// Check memo (DAG sharing)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, ok := nctx.normalized[schema]; ok {
+		return schema, nil
+	}
 	if result, ok := nctx.memo[schema]; ok {
 		return result, nil
 	}
 
-	// Check for cycle (in-progress)
-	if _, inProgress := nctx.inProgress[schema]; inProgress {
-		// Cycle detected: return schema as-is to break recursion
-		return schema, nil
+	result := new(oas3.Schema)
+	nctx.memo[schema] = result
+	nctx.normalized[result] = struct{}{}
+	*result = *schema
+
+	if err := normalizeSchemaChildren(ctx, result); err != nil {
+		return nil, err
+	}
+	bottom, err := collapseNormalizedCombinators(ctx, result, nctx)
+	if err != nil {
+		return nil, err
+	}
+	if bottom {
+		nctx.memo[schema] = nil
+		return nil, nil
+	}
+	return result, nil
+}
+
+func normalizeSchemaChildren(ctx context.Context, schema *oas3.Schema) error {
+	var err error
+	normalize := func(js *oas3.JSONSchema[oas3.Referenceable]) *oas3.JSONSchema[oas3.Referenceable] {
+		if err != nil || js == nil {
+			return js
+		}
+		var normalized *oas3.JSONSchema[oas3.Referenceable]
+		normalized, err = normalizeJSONSchema(ctx, js)
+		return normalized
 	}
 
-	// Depth guard
-	nctx.depth++
-	if nctx.depth > nctx.maxDepth {
-		nctx.depth--
-		return schema, nil // Too deep, return as-is
+	normalizeSlice := func(src []*oas3.JSONSchema[oas3.Referenceable]) []*oas3.JSONSchema[oas3.Referenceable] {
+		if src == nil {
+			return nil
+		}
+		result := make([]*oas3.JSONSchema[oas3.Referenceable], len(src))
+		for i, js := range src {
+			result[i] = normalize(js)
+		}
+		return result
 	}
-	defer func() { nctx.depth-- }()
 
-	// Mark in-progress
-	nctx.inProgress[schema] = struct{}{}
-	defer delete(nctx.inProgress, schema)
+	normalizeMap := func(src *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]]) *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]] {
+		if src == nil {
+			return nil
+		}
+		result := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+		for key, js := range src.All() {
+			result.Set(key, normalize(js))
+		}
+		return result
+	}
 
-	// If no anyOf, process nested schemas and return
+	schema.Properties = normalizeMap(schema.Properties)
+	schema.PatternProperties = normalizeMap(schema.PatternProperties)
+	schema.DependentSchemas = normalizeMap(schema.DependentSchemas)
+	schema.Defs = normalizeMap(schema.Defs)
+	schema.Items = normalize(schema.Items)
+	schema.PrefixItems = normalizeSlice(schema.PrefixItems)
+	schema.Contains = normalize(schema.Contains)
+	schema.AdditionalProperties = normalize(schema.AdditionalProperties)
+	schema.PropertyNames = normalize(schema.PropertyNames)
+	schema.UnevaluatedItems = normalize(schema.UnevaluatedItems)
+	schema.UnevaluatedProperties = normalize(schema.UnevaluatedProperties)
+	schema.ContentSchema = normalize(schema.ContentSchema)
+	schema.AllOf = normalizeSlice(schema.AllOf)
+	schema.AnyOf = normalizeSlice(schema.AnyOf)
+	// oneOf and not remain combinators: their children are resolved and
+	// normalized branch-wise, but their semantics are not collapsed here.
+	// TODO: Collapse oneOf and not if the executor needs that precision.
+	schema.OneOf = normalizeSlice(schema.OneOf)
+	schema.Not = normalize(schema.Not)
+	schema.If = normalize(schema.If)
+	schema.Then = normalize(schema.Then)
+	schema.Else = normalize(schema.Else)
+	return err
+}
+
+func normalizeJSONSchema(ctx context.Context, js *oas3.JSONSchema[oas3.Referenceable]) (*oas3.JSONSchema[oas3.Referenceable], error) {
+	if value, ok := resolvedBooleanSchema(js); ok {
+		return oas3.NewJSONSchemaFromBool(value), nil
+	}
+	left := resolvedLeft(js)
+	if left == nil {
+		return js, nil
+	}
+	if left.IsReference() && (js == nil || js.GetResolvedSchema() == nil) {
+		return js, nil
+	}
+	normalized, err := normalizeSchema(ctx, left)
+	if err != nil {
+		return nil, err
+	}
+	if normalized == nil {
+		return oas3.NewJSONSchemaFromBool(false), nil
+	}
+	return oas3.NewJSONSchemaFromSchema[oas3.Referenceable](normalized), nil
+}
+
+func collapseNormalizedCombinators(ctx context.Context, schema *oas3.Schema, nctx *normCtx) (bool, error) {
+	if len(schema.AllOf) > 0 {
+		base := cloneSchema(schema)
+		base.AllOf = nil
+		merged := base
+		for _, branch := range schema.AllOf {
+			if value, ok := resolvedBooleanSchema(branch); ok {
+				if !value {
+					return true, nil
+				}
+				continue
+			}
+			left := resolvedLeft(branch)
+			if left == nil {
+				continue
+			}
+			var err error
+			merged, err = mergeSchemas(merged, left)
+			if err != nil {
+				nctx.debugf("normalization: allOf merge widened to Top: %v", err)
+				*schema = oas3.Schema{}
+				return false, nil
+			}
+			if err := markNormalizedGraph(ctx, merged, nctx, make(map[*oas3.Schema]bool)); err != nil {
+				return false, err
+			}
+		}
+		*schema = *merged
+	}
+
 	if len(schema.AnyOf) == 0 {
-		// Recursively collapse nested schemas
-		collapsed, err := collapseNestedSchemasCtx(ctx, schema)
-		if err != nil {
-			return nil, err
-		}
-		nctx.memo[schema] = collapsed
-		return collapsed, nil
+		return false, nil
 	}
-
-	// Extract and collapse all anyOf subschemas ($refs followed via resolvedLeft)
-	subschemas := make([]*oas3.Schema, 0, len(schema.AnyOf))
-	for _, schemaOrRef := range schema.AnyOf {
-		if left := resolvedLeft(schemaOrRef); left != nil {
-			// First collapse allOf within this branch, then anyOf
-			collapsed, err := collapseAllOfCtx(ctx, left)
-			if err != nil {
-				return nil, err
-			}
-			collapsed, err = collapseAnyOfCtx(ctx, collapsed)
-			if err != nil {
-				return nil, err
-			}
-			subschemas = append(subschemas, collapsed)
-		}
-	}
-
-	// Handle empty anyOf - unsatisfiable schema (Bottom)
-	if len(subschemas) == 0 {
-		result := Bottom()
-		nctx.memo[schema] = result
-		return result, nil
-	}
-
-	// Distribute base constraints into each branch
 	base := cloneSchema(schema)
 	base.AnyOf = nil
-
-	branches := make([]*oas3.Schema, 0, len(subschemas))
-	for _, sub := range subschemas {
-		// Merge base with this branch using allOf semantics
-		merged, err := mergeSchemas(base, sub)
+	branches := make([]*oas3.Schema, 0, len(schema.AnyOf))
+	for _, branch := range schema.AnyOf {
+		if value, ok := resolvedBooleanSchema(branch); ok {
+			if !value {
+				continue
+			}
+			branch = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Top())
+		}
+		left := resolvedLeft(branch)
+		if left == nil {
+			continue
+		}
+		merged, err := mergeSchemas(base, left)
 		if err != nil {
-			return nil, err
+			nctx.debugf("normalization: conjunctive anyOf branch merge widened to Top: %v", err)
+			*schema = oas3.Schema{}
+			return false, nil
+		}
+		if err := markNormalizedGraph(ctx, merged, nctx, make(map[*oas3.Schema]bool)); err != nil {
+			return false, err
 		}
 		branches = append(branches, merged)
 	}
-
-	// Check if any branch is Top - if so, result is Top
+	if len(branches) == 0 {
+		return true, nil
+	}
 	for _, branch := range branches {
 		if isTopSchema(branch) {
-			result := Top()
-			nctx.memo[schema] = result
-			return result, nil
+			*schema = oas3.Schema{}
+			return false, nil
 		}
 	}
-
-	// Handle single anyOf subschema (identity case after base merge)
 	if len(branches) == 1 {
-		result, err := collapseNestedSchemasCtx(ctx, branches[0])
-		if err != nil {
-			return nil, err
-		}
-		nctx.memo[schema] = result
-		return result, nil
+		*schema = *branches[0]
+		return false, nil
 	}
 
-	// Try to flatten anyOf if all branches share the same type
 	commonType := getType(branches[0])
 	allSameType := commonType != ""
-	for i := 1; i < len(branches); i++ {
-		t := getType(branches[i])
-		if t != commonType {
+	for _, branch := range branches[1:] {
+		if getType(branch) != commonType {
 			allSameType = false
 			break
 		}
 	}
-
 	if !allSameType {
-		// Cannot flatten - keep anyOf structure with normalized branches
-		result := cloneSchema(schema)
-		result.AnyOf = make([]*oas3.JSONSchema[oas3.Referenceable], len(branches))
-		for i, branch := range branches {
-			result.AnyOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branch)
-		}
-		nctx.memo[schema] = result
-		return result, nil
+		setAnyOfBranches(schema, base, branches)
+		return false, nil
 	}
 
-	// All branches have the same type - attempt disjunctive merge.
-	// If any facet cannot be soundly unioned into a single schema (e.g.
-	// differing enums), keep the anyOf structure instead of narrowing.
-	result := branches[0]
+	merged := branches[0]
 	flattened := true
 	for i := 1; i < len(branches); i++ {
-		merged, err := mergeSchemasMode(result, branches[i], MergeDisjunctive)
-		if errors.Is(err, errCannotFlatten) {
+		var err error
+		merged, err = mergeSchemasMode(merged, branches[i], MergeDisjunctive)
+		if err != nil {
+			if !errors.Is(err, errCannotFlatten) {
+				nctx.debugf("normalization: disjunctive merge kept anyOf branches: %v", err)
+			}
 			flattened = false
 			break
 		}
-		if err != nil {
-			return nil, err
+		if err := markNormalizedGraph(ctx, merged, nctx, make(map[*oas3.Schema]bool)); err != nil {
+			return false, err
 		}
-		result = merged
 	}
 	if !flattened {
-		kept := cloneSchema(schema)
-		kept.AnyOf = make([]*oas3.JSONSchema[oas3.Referenceable], len(branches))
-		for i, branch := range branches {
-			kept.AnyOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branch)
-		}
-		nctx.memo[schema] = kept
-		return kept, nil
+		setAnyOfBranches(schema, base, branches)
+		return false, nil
 	}
-
-	collapsed, err := collapseNestedSchemasCtx(ctx, result)
-	if err != nil {
-		return nil, err
-	}
-	nctx.memo[schema] = collapsed
-	return collapsed, nil
+	*schema = *merged
+	return false, nil
 }
 
-// collapseNestedSchemasCtx is the cycle-aware implementation of collapseNestedSchemas
-func collapseNestedSchemasCtx(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, error) {
-	if schema == nil {
-		return nil, nil
+func markNormalizedGraph(ctx context.Context, schema *oas3.Schema, nctx *normCtx, seen map[*oas3.Schema]bool) error {
+	if schema == nil || seen[schema] {
+		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, ok := nctx.normalized[schema]; ok {
+		return nil
+	}
+	seen[schema] = true
+	nctx.normalized[schema] = struct{}{}
 
-	result := cloneSchema(schema)
-
-	// NOTE: child wrappers are read via resolvedLeft (not .Left) so that $ref
-	// children are followed to their resolved targets BEFORE the wrapper is
-	// rebuilt. Rebuilding from the raw Left would keep only the "$ref shell"
-	// (Ref set, no structure) and permanently discard the wrapper-level
-	// resolution caches. See resolvedLeft.
-
-	// Collapse properties
-	if result.Properties != nil && result.Properties.Len() > 0 {
-		newProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
-		for key, prop := range result.Properties.All() {
-			if left := resolvedLeft(prop); left != nil {
-				collapsed, err := collapseAllOfCtx(ctx, left)
-				if err != nil {
-					return nil, err
-				}
-				collapsed, err = collapseAnyOfCtx(ctx, collapsed)
-				if err != nil {
-					return nil, err
-				}
-				newProps.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](collapsed))
-			} else {
-				newProps.Set(key, prop)
+	visit := func(js *oas3.JSONSchema[oas3.Referenceable]) error {
+		if js == nil || js.Left == nil {
+			return nil
+		}
+		return markNormalizedGraph(ctx, js.Left, nctx, seen)
+	}
+	visitSlice := func(schemas []*oas3.JSONSchema[oas3.Referenceable]) error {
+		for _, js := range schemas {
+			if err := visit(js); err != nil {
+				return err
 			}
 		}
-		result.Properties = newProps
+		return nil
 	}
-
-	// Collapse array items
-	if left := resolvedLeft(result.Items); left != nil {
-		collapsed, err := collapseAllOfCtx(ctx, left)
-		if err != nil {
-			return nil, err
+	visitMap := func(schemas *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]]) error {
+		if schemas == nil {
+			return nil
 		}
-		collapsed, err = collapseAnyOfCtx(ctx, collapsed)
-		if err != nil {
-			return nil, err
-		}
-		result.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](collapsed)
-	}
-
-	// Collapse additionalProperties
-	if left := resolvedLeft(result.AdditionalProperties); left != nil {
-		collapsed, err := collapseAllOfCtx(ctx, left)
-		if err != nil {
-			return nil, err
-		}
-		collapsed, err = collapseAnyOfCtx(ctx, collapsed)
-		if err != nil {
-			return nil, err
-		}
-		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](collapsed)
-	}
-
-	// Collapse anyOf branches
-	if len(result.AnyOf) > 0 {
-		newAnyOf := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(result.AnyOf))
-		for _, branch := range result.AnyOf {
-			if left := resolvedLeft(branch); left != nil {
-				collapsed, err := collapseAllOfCtx(ctx, left)
-				if err != nil {
-					return nil, err
-				}
-				collapsed, err = collapseAnyOfCtx(ctx, collapsed)
-				if err != nil {
-					return nil, err
-				}
-				newAnyOf = append(newAnyOf, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](collapsed))
+		for _, js := range schemas.All() {
+			if err := visit(js); err != nil {
+				return err
 			}
 		}
-		result.AnyOf = newAnyOf
+		return nil
 	}
 
-	// TODO: Collapse oneOf, not if needed
+	for _, schemas := range []*sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]]{
+		schema.Properties, schema.PatternProperties, schema.DependentSchemas, schema.Defs,
+	} {
+		if err := visitMap(schemas); err != nil {
+			return err
+		}
+	}
+	for _, schemas := range [][]*oas3.JSONSchema[oas3.Referenceable]{
+		schema.PrefixItems, schema.AllOf, schema.AnyOf, schema.OneOf,
+	} {
+		if err := visitSlice(schemas); err != nil {
+			return err
+		}
+	}
+	for _, js := range []*oas3.JSONSchema[oas3.Referenceable]{
+		schema.Items, schema.Contains, schema.AdditionalProperties, schema.PropertyNames,
+		schema.UnevaluatedItems, schema.UnevaluatedProperties, schema.ContentSchema,
+		schema.Not, schema.If, schema.Then, schema.Else,
+	} {
+		if err := visit(js); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-	return result, nil
+func setAnyOfBranches(schema, base *oas3.Schema, branches []*oas3.Schema) {
+	*schema = *base
+	schema.AnyOf = make([]*oas3.JSONSchema[oas3.Referenceable], len(branches))
+	for i, branch := range branches {
+		schema.AnyOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branch)
+	}
 }
 
 // errCannotFlatten signals that two schemas cannot be soundly merged into a
@@ -2390,14 +2362,14 @@ func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oa
 
 		// Check prefixItems for tuple access
 		if arr.PrefixItems != nil && idx >= 0 && idx < len(arr.PrefixItems) {
-			if schema, ok := derefJSONSchema(newCollapseContext(), arr.PrefixItems[idx]); ok {
+			if schema, ok := derefJSONSchema(collapseContextForOptions(opts), arr.PrefixItems[idx]); ok {
 				elem = schema
 			}
 		}
 
 		// Fall through to items for indices beyond prefixItems
 		if elem == nil && arr.Items != nil {
-			if schema, ok := derefJSONSchema(newCollapseContext(), arr.Items); ok {
+			if schema, ok := derefJSONSchema(collapseContextForOptions(opts), arr.Items); ok {
 				elem = schema
 			}
 		}
@@ -2421,7 +2393,7 @@ func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oa
 	// Add all prefixItems
 	if arr.PrefixItems != nil {
 		for _, item := range arr.PrefixItems {
-			if schema, ok := derefJSONSchema(newCollapseContext(), item); ok {
+			if schema, ok := derefJSONSchema(collapseContextForOptions(opts), item); ok {
 				schemas = append(schemas, schema)
 			} else {
 				// Unresolved reference in tuple element - widen conservatively
@@ -2432,7 +2404,7 @@ func getArrayElement(arr *oas3.Schema, indexKey any, opts SchemaExecOptions) *oa
 
 	// Add items schema
 	if arr.Items != nil {
-		if schema, ok := derefJSONSchema(newCollapseContext(), arr.Items); ok {
+		if schema, ok := derefJSONSchema(collapseContextForOptions(opts), arr.Items); ok {
 			schemas = append(schemas, schema)
 		} else {
 			// Unresolved reference in items - widen conservatively
@@ -3318,7 +3290,7 @@ func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 	// Add all property values
 	if obj.Properties != nil {
 		for k, v := range obj.Properties.All() {
-			if schema, ok := derefJSONSchema(newCollapseContext(), v); ok {
+			if schema, ok := derefJSONSchema(collapseContextForOptions(opts), v); ok {
 				schemas = append(schemas, schema)
 				if opts.EnableWarnings {
 					opts.debugf("unionAllObjectValues: property %s type=%s", k, getType(schema))
@@ -3335,7 +3307,7 @@ func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 
 	// Add additionalProperties
 	if obj.AdditionalProperties != nil {
-		if schema, ok := derefJSONSchema(newCollapseContext(), obj.AdditionalProperties); ok {
+		if schema, ok := derefJSONSchema(collapseContextForOptions(opts), obj.AdditionalProperties); ok {
 			schemas = append(schemas, schema)
 			if opts.EnableWarnings {
 				opts.debugf("unionAllObjectValues: additionalProperties type=%s, unconstrained=%v",
@@ -3522,6 +3494,9 @@ func (env *schemaEnv) validateStrictResult(schema *oas3.Schema) error {
 
 // isTopSchema checks if a schema is Top using both pointer identity and structural checks.
 func isTopSchema(s *oas3.Schema) bool {
+	if s == nil {
+		return false
+	}
 	// Pointer identity check
 	if s == Top() {
 		return true
@@ -3582,9 +3557,18 @@ func isBottomSchema(s *oas3.Schema) bool {
 // their final accumulated versions using schema pointer tagging.
 // EXTENDED: now also traverses anyOf/oneOf/allOf and Array Items/PrefixItems.
 func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*oas3.Schema, schemaToAlloc map[*oas3.Schema]string, redirect ...map[string]string) *oas3.Schema {
+	return env.materializeArraysSeen(schema, accum, schemaToAlloc, make(map[*oas3.Schema]bool), redirect...)
+}
+
+func (env *schemaEnv) materializeArraysSeen(schema *oas3.Schema, accum map[string]*oas3.Schema, schemaToAlloc map[*oas3.Schema]string, seen map[*oas3.Schema]bool, redirect ...map[string]string) *oas3.Schema {
 	if schema == nil {
 		return nil
 	}
+	if seen[schema] {
+		return schema
+	}
+	seen[schema] = true
+	defer delete(seen, schema)
 
 	// Apply allocID redirect if provided
 	var allocRedirect map[string]string
@@ -3626,7 +3610,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 				changed := false
 				// Items
 				if left := resolvedLeft(arr.Items); left != nil {
-					newItems := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+					newItems := env.materializeArraysSeen(left, accum, schemaToAlloc, seen, allocRedirect)
 					if newItems != left {
 						arr.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newItems)
 						changed = true
@@ -3638,7 +3622,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 					prefixChanged := false
 					for _, pi := range arr.PrefixItems {
 						if left := resolvedLeft(pi); left != nil {
-							newPi := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+							newPi := env.materializeArraysSeen(left, accum, schemaToAlloc, seen, allocRedirect)
 							if newPi != left {
 								newPrefix = append(newPrefix, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newPi))
 								prefixChanged = true
@@ -3670,7 +3654,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 					arr := *canonical
 					changed := false
 					if left := resolvedLeft(arr.Items); left != nil {
-						newItems := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+						newItems := env.materializeArraysSeen(left, accum, schemaToAlloc, seen, allocRedirect)
 						if newItems != left {
 							arr.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newItems)
 							changed = true
@@ -3681,7 +3665,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 						prefixChanged := false
 						for _, pi := range arr.PrefixItems {
 							if left := resolvedLeft(pi); left != nil {
-								newPi := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+								newPi := env.materializeArraysSeen(left, accum, schemaToAlloc, seen, allocRedirect)
 								if newPi != left {
 									newPrefix = append(newPrefix, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newPi))
 									prefixChanged = true
@@ -3711,7 +3695,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 		clone := *schema
 		changed := false
 		if left := resolvedLeft(clone.Items); left != nil {
-			newItems := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+			newItems := env.materializeArraysSeen(left, accum, schemaToAlloc, seen, allocRedirect)
 			if newItems != left {
 				clone.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newItems)
 				changed = true
@@ -3722,7 +3706,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 			prefixChanged := false
 			for _, pi := range clone.PrefixItems {
 				if left := resolvedLeft(pi); left != nil {
-					newPi := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+					newPi := env.materializeArraysSeen(left, accum, schemaToAlloc, seen, allocRedirect)
 					if newPi != left {
 						newPrefix = append(newPrefix, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newPi))
 						prefixChanged = true
@@ -3749,7 +3733,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 		newProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
 		for k, propSchema := range schema.Properties.All() {
 			if left := resolvedLeft(propSchema); left != nil {
-				materialized := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+				materialized := env.materializeArraysSeen(left, accum, schemaToAlloc, seen, allocRedirect)
 				if materialized != left {
 					modified = true
 					newProps.Set(k, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](materialized))
@@ -3774,7 +3758,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 		}
 		// additionalProperties
 		if left := resolvedLeft(clone.AdditionalProperties); left != nil {
-			newAP := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+			newAP := env.materializeArraysSeen(left, accum, schemaToAlloc, seen, allocRedirect)
 			if newAP != left {
 				clone.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newAP)
 				return &clone
@@ -3793,7 +3777,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 		newAny := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(schema.AnyOf))
 		for _, br := range schema.AnyOf {
 			if left := resolvedLeft(br); left != nil {
-				newBr := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+				newBr := env.materializeArraysSeen(left, accum, schemaToAlloc, seen, allocRedirect)
 				if newBr != left {
 					newAny = append(newAny, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newBr))
 					changed = true
@@ -3814,7 +3798,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 		newOne := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(schema.OneOf))
 		for _, br := range schema.OneOf {
 			if left := resolvedLeft(br); left != nil {
-				newBr := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+				newBr := env.materializeArraysSeen(left, accum, schemaToAlloc, seen, allocRedirect)
 				if newBr != left {
 					newOne = append(newOne, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newBr))
 					changed = true
@@ -3835,7 +3819,7 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 		newAll := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(schema.AllOf))
 		for _, br := range schema.AllOf {
 			if left := resolvedLeft(br); left != nil {
-				newBr := env.materializeArrays(left, accum, schemaToAlloc, allocRedirect)
+				newBr := env.materializeArraysSeen(left, accum, schemaToAlloc, seen, allocRedirect)
 				if newBr != left {
 					newAll = append(newAll, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newBr))
 					changed = true

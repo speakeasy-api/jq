@@ -56,22 +56,21 @@ func ExecSchema(ctx context.Context, code *gojq.Code, input *oas3.Schema, opts S
 		return nil, fmt.Errorf("invalid input schema: %w", err)
 	}
 
-	// Normalize the input up front: collapse allOf/anyOf and follow resolved
-	// $refs while rebuilding child wrappers. Without this, the ROOT schema's
-	// original wrappers reach builtins directly, and code reading the inline
-	// side of a $ref child would see a bare shell (Ref set, no structure).
-	if collapsed, err := collapseAllOf(input); err == nil && collapsed != nil {
-		if collapsed2, err2 := collapseAnyOf(collapsed); err2 == nil && collapsed2 != nil {
-			collapsed = collapsed2
-		}
-		input = collapsed
-	}
-
 	// Create schema VM environment
 	env := newSchemaEnv(ctx, opts)
 
+	// Normalize the complete reachable graph once for this execution. The
+	// environment's memo is reused by navigation and builtin helpers.
+	normalized, err := normalizeSchema(env.normalizationContext(), input)
+	if err != nil {
+		return nil, fmt.Errorf("normalize input schema: %w", err)
+	}
+	if normalized == nil {
+		return &SchemaExecResult{Schema: Bottom()}, nil
+	}
+
 	// Execute bytecode on the input schema
-	return env.execute(code, input)
+	return env.execute(code, normalized)
 }
 
 // Helper methods that will be used by the VM in Phase 2

@@ -11,6 +11,7 @@ import (
 	"github.com/speakeasy-api/openapi/extensions"
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 	"github.com/speakeasy-api/openapi/openapi"
+	"github.com/speakeasy-api/openapi/sequencedmap"
 	"github.com/speakeasy-api/openapi/yml"
 )
 
@@ -134,6 +135,8 @@ func transformSchema(schema *oas3.JSONSchema[oas3.Referenceable], location strin
 	if result.Schema == nil {
 		return fmt.Errorf("symbolic execution produced no output schema")
 	}
+
+	result.Schema = schemaForSerialization(result.Schema, 100)
 
 	// Ensure all nested properties are properly initialized
 	ensurePropertiesInitialized(result.Schema)
@@ -370,6 +373,8 @@ func transformSchemaWithExtension(schema *oas3.JSONSchema[oas3.Referenceable], l
 		return fmt.Errorf("symbolic execution produced no output schema")
 	}
 
+	result.Schema = schemaForSerialization(result.Schema, 100)
+
 	// Ensure all nested properties are properly initialized
 	ensurePropertiesInitialized(result.Schema)
 
@@ -409,9 +414,17 @@ func transformSchemaWithExtension(schema *oas3.JSONSchema[oas3.Referenceable], l
 
 // ensurePropertiesInitialized recursively ensures all Properties in a schema are properly initialized as JSONSchemas
 func ensurePropertiesInitialized(schema *oas3.Schema) {
+	ensurePropertiesInitializedSeen(schema, make(map[*oas3.Schema]bool))
+}
+
+func ensurePropertiesInitializedSeen(schema *oas3.Schema, seen map[*oas3.Schema]bool) {
 	if schema == nil {
 		return
 	}
+	if seen[schema] {
+		return
+	}
+	seen[schema] = true
 
 	// If Properties exist, ensure each property is properly wrapped as a JSONSchema
 	if schema.Properties != nil && schema.Properties.Len() > 0 {
@@ -427,7 +440,7 @@ func ensurePropertiesInitialized(schema *oas3.Schema) {
 				continue
 			}
 			// Recursively ensure nested properties are initialized
-			ensurePropertiesInitialized(propSchema)
+			ensurePropertiesInitializedSeen(propSchema, seen)
 
 			// Recreate the JSONSchema to ensure it's properly initialized
 			newProp := oas3.NewJSONSchemaFromSchema[oas3.Referenceable](propSchema)
@@ -439,7 +452,7 @@ func ensurePropertiesInitialized(schema *oas3.Schema) {
 	if schema.Items != nil {
 		itemSchema := schema.Items.GetLeft()
 		if itemSchema != nil {
-			ensurePropertiesInitialized(itemSchema)
+			ensurePropertiesInitializedSeen(itemSchema, seen)
 			schema.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](itemSchema)
 		}
 	}
@@ -447,7 +460,7 @@ func ensurePropertiesInitialized(schema *oas3.Schema) {
 	if schema.AdditionalProperties != nil {
 		addSchema := schema.AdditionalProperties.GetLeft()
 		if addSchema != nil {
-			ensurePropertiesInitialized(addSchema)
+			ensurePropertiesInitializedSeen(addSchema, seen)
 			schema.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](addSchema)
 		}
 	}
@@ -460,7 +473,7 @@ func ensurePropertiesInitialized(schema *oas3.Schema) {
 			}
 			innerSchema := allOfSchema.GetLeft()
 			if innerSchema != nil {
-				ensurePropertiesInitialized(innerSchema)
+				ensurePropertiesInitializedSeen(innerSchema, seen)
 				schema.AllOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](innerSchema)
 			}
 		}
@@ -473,7 +486,7 @@ func ensurePropertiesInitialized(schema *oas3.Schema) {
 			}
 			innerSchema := anyOfSchema.GetLeft()
 			if innerSchema != nil {
-				ensurePropertiesInitialized(innerSchema)
+				ensurePropertiesInitializedSeen(innerSchema, seen)
 				schema.AnyOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](innerSchema)
 			}
 		}
@@ -486,9 +499,88 @@ func ensurePropertiesInitialized(schema *oas3.Schema) {
 			}
 			innerSchema := oneOfSchema.GetLeft()
 			if innerSchema != nil {
-				ensurePropertiesInitialized(innerSchema)
+				ensurePropertiesInitializedSeen(innerSchema, seen)
 				schema.OneOf[i] = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](innerSchema)
 			}
 		}
 	}
+}
+
+// schemaForSerialization clones a schema graph and replaces recursive
+// back-edges or paths beyond maxDepth with an unconstrained schema. The
+// executor can retain cycles for analysis, while emitted OpenAPI remains a
+// finite, sound over-approximation that standard YAML encoders can marshal.
+func schemaForSerialization(schema *oas3.Schema, maxDepth int) *oas3.Schema {
+	active := make(map[*oas3.Schema]bool)
+	var clone func(*oas3.Schema, int) *oas3.Schema
+	wrap := func(js *oas3.JSONSchema[oas3.Referenceable], depth int) *oas3.JSONSchema[oas3.Referenceable] {
+		if js == nil {
+			return nil
+		}
+		if js.Right != nil {
+			return oas3.NewJSONSchemaFromBool(*js.Right)
+		}
+		if js.Left == nil {
+			return js
+		}
+		return oas3.NewJSONSchemaFromSchema[oas3.Referenceable](clone(js.Left, depth))
+	}
+
+	cloneSlice := func(src []*oas3.JSONSchema[oas3.Referenceable], depth int) []*oas3.JSONSchema[oas3.Referenceable] {
+		if src == nil {
+			return nil
+		}
+		result := make([]*oas3.JSONSchema[oas3.Referenceable], len(src))
+		for i, js := range src {
+			result[i] = wrap(js, depth)
+		}
+		return result
+	}
+
+	cloneMap := func(src *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]], depth int) *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]] {
+		if src == nil {
+			return nil
+		}
+		result := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+		for key, js := range src.All() {
+			result.Set(key, wrap(js, depth))
+		}
+		return result
+	}
+
+	clone = func(src *oas3.Schema, depth int) *oas3.Schema {
+		if src == nil {
+			return nil
+		}
+		if depth <= 0 || active[src] {
+			return &oas3.Schema{}
+		}
+		active[src] = true
+		defer delete(active, src)
+
+		result := *src
+		nextDepth := depth - 1
+		result.Properties = cloneMap(src.Properties, nextDepth)
+		result.PatternProperties = cloneMap(src.PatternProperties, nextDepth)
+		result.DependentSchemas = cloneMap(src.DependentSchemas, nextDepth)
+		result.Defs = cloneMap(src.Defs, nextDepth)
+		result.Items = wrap(src.Items, nextDepth)
+		result.PrefixItems = cloneSlice(src.PrefixItems, nextDepth)
+		result.Contains = wrap(src.Contains, nextDepth)
+		result.AdditionalProperties = wrap(src.AdditionalProperties, nextDepth)
+		result.PropertyNames = wrap(src.PropertyNames, nextDepth)
+		result.UnevaluatedItems = wrap(src.UnevaluatedItems, nextDepth)
+		result.UnevaluatedProperties = wrap(src.UnevaluatedProperties, nextDepth)
+		result.ContentSchema = wrap(src.ContentSchema, nextDepth)
+		result.AllOf = cloneSlice(src.AllOf, nextDepth)
+		result.AnyOf = cloneSlice(src.AnyOf, nextDepth)
+		result.OneOf = cloneSlice(src.OneOf, nextDepth)
+		result.Not = wrap(src.Not, nextDepth)
+		result.If = wrap(src.If, nextDepth)
+		result.Then = wrap(src.Then, nextDepth)
+		result.Else = wrap(src.Else, nextDepth)
+		return &result
+	}
+
+	return clone(schema, maxDepth)
 }
