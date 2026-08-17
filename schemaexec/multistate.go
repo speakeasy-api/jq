@@ -272,14 +272,6 @@ func (s *execState) recordDesiredFP(key string, items *oas3.Schema) {
 	}
 }
 
-// fingerprint computes a hash of this state for memoization.
-// Uses proper schema fingerprinting to handle nested structures, enums, and circular references.
-// Includes: pc, depth, callstack, full stack with schema fingerprints, scope bindings with schema fingerprints, and path mode.
-func (s *execState) fingerprint() uint64 {
-	// Use the new fingerprinting helper from fingerprint.go
-	return fingerprintStateHelper(s, defaultFingerprinter)
-}
-
 // push pushes a schema onto the stack.
 func (s *execState) push(schema *oas3.Schema) {
 	s.stack = append(s.stack, SValue{Schema: schema})
@@ -372,16 +364,14 @@ func newExecState(input *oas3.Schema) *execState {
 
 // stateWorklist manages the queue of states to execute.
 type stateWorklist struct {
-	states       []*execState
-	seen         map[uint64]bool // Memoization: fingerprint → visited
-	nextStateID  int             // Monotonic counter for state IDs
+	states      []*execState
+	nextStateID int // Monotonic counter for state IDs
 }
 
 // newStateWorklist creates a new worklist.
 func newStateWorklist() *stateWorklist {
 	return &stateWorklist{
 		states:      make([]*execState, 0, 32),
-		seen:        make(map[uint64]bool),
 		nextStateID: 1, // Start from 1 (0 is reserved for root)
 	}
 }
@@ -409,15 +399,4 @@ func (w *stateWorklist) isEmpty() bool {
 	return len(w.states) == 0
 }
 
-// hasSeen checks if we've seen this state before (memoization).
-func (w *stateWorklist) hasSeen(state *execState) bool {
-	fp := state.fingerprint()
-	return w.seen[fp]
-}
-
-// markSeen marks a state as visited.
-func (w *stateWorklist) markSeen(state *execState) {
-	fp := state.fingerprint()
-	w.seen[fp] = true
-}
 

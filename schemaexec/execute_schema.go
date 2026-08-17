@@ -562,11 +562,6 @@ func collapseAnyOfCtx(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, e
 	return collapsed, nil
 }
 
-// collapseNestedSchemas recursively collapses allOf in nested schemas (properties, items, etc.)
-func collapseNestedSchemas(schema *oas3.Schema) (*oas3.Schema, error) {
-	return collapseNestedSchemasCtx(newCollapseContext(), schema)
-}
-
 // collapseNestedSchemasCtx is the cycle-aware implementation of collapseNestedSchemas
 func collapseNestedSchemasCtx(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, error) {
 	if schema == nil {
@@ -2691,59 +2686,59 @@ func accumulationCompatible(prior, curr *oas3.Schema) bool {
 // This is used for array construction: [.[] | f]
 // Each state has its own accumulator map. Merging happens via lattice join when paths converge.
 // allocateArrayWithOrigin creates a new allocID with origin tracking
-func (state *execState) allocateArrayWithOrigin(pc int, context string) string {
-	*state.allocCounter++
-	allocID := fmt.Sprintf("alloc%d", *state.allocCounter)
+func (s *execState) allocateArrayWithOrigin(pc int, context string) string {
+	*s.allocCounter++
+	allocID := fmt.Sprintf("alloc%d", *s.allocCounter)
 
 	// Track origin for DSU equivalence. The callsite (return address of the
 	// enclosing frame) distinguishes allocations made by different
 	// invocations of the same library function.
 	callSite := -1
-	if len(state.callstack) > 0 {
-		callSite = state.callstack[len(state.callstack)-1]
+	if len(s.callstack) > 0 {
+		callSite = s.callstack[len(s.callstack)-1]
 	}
-	if state.allocOrigin == nil {
-		state.allocOrigin = make(map[string]*AllocOrigin)
+	if s.allocOrigin == nil {
+		s.allocOrigin = make(map[string]*AllocOrigin)
 	}
-	state.allocOrigin[allocID] = &AllocOrigin{
+	s.allocOrigin[allocID] = &AllocOrigin{
 		PC:       pc,
 		Context:  context,
 		CallSite: callSite,
 	}
 
 	// Initialize cardinality as empty (MinItems=0, MaxItems=0)
-	if state.allocCardinality == nil {
-		state.allocCardinality = make(map[string]*ArrayCardinality)
+	if s.allocCardinality == nil {
+		s.allocCardinality = make(map[string]*ArrayCardinality)
 	}
 	zero := 0
-	state.allocCardinality[allocID] = &ArrayCardinality{
+	s.allocCardinality[allocID] = &ArrayCardinality{
 		MinItems: &zero,
 		MaxItems: &zero,
 	}
 
 	// Theory 10: Initialize DSU parent for this new allocID
-	if state.dsu == nil {
-		state.dsu = NewDSU()
+	if s.dsu == nil {
+		s.dsu = NewDSU()
 	}
-	state.dsu.Find(allocID) // seeds parent[allocID] = allocID
+	s.dsu.Find(allocID) // seeds parent[allocID] = allocID
 
 	return allocID
 }
 
 // setArrayNonEmpty marks an array as non-empty (MinItems=1)
-func (state *execState) setArrayNonEmpty(allocID string) {
+func (s *execState) setArrayNonEmpty(allocID string) {
 	if allocID == "" {
 		return
 	}
-	if state.allocCardinality == nil {
-		state.allocCardinality = make(map[string]*ArrayCardinality)
+	if s.allocCardinality == nil {
+		s.allocCardinality = make(map[string]*ArrayCardinality)
 	}
 
 	// Get or create cardinality
-	card := state.allocCardinality[allocID]
+	card := s.allocCardinality[allocID]
 	if card == nil {
 		card = &ArrayCardinality{}
-		state.allocCardinality[allocID] = card
+		s.allocCardinality[allocID] = card
 	}
 
 	// Set MinItems=1 (array must be non-empty)

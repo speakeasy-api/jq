@@ -257,12 +257,20 @@ func externalizeSchemas(doc map[string]any, percent float64, seed int64) (map[st
 		if !ok {
 			continue
 		}
-		c := extWalkSchemaForItems(m, docCopy, schemas, used, rng, percent, fmt.Sprintf("%s", schemaName), "")
+		c := extWalkSchemaForItems(m, docCopy, schemas, used, rng, percent, schemaName, "")
 		total += c
 		schemas[schemaName] = m
 	}
 
 	return docCopy, total, nil
+}
+
+// titleCase upper-cases the first byte of an ASCII keyword ("if" → "If").
+func titleCase(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 func extWalkSchemaForItems(
@@ -325,7 +333,7 @@ func extWalkSchemaForItems(
 	// conditionals
 	for _, key := range []string{"if", "then", "else", "not"} {
 		if sub, ok := schema[key].(map[string]any); ok {
-			count += extWalkSchemaForItems(sub, doc, allSchemas, used, rng, percent, rootName, ctx+strings.Title(key))
+			count += extWalkSchemaForItems(sub, doc, allSchemas, used, rng, percent, rootName, ctx+titleCase(key))
 		}
 	}
 

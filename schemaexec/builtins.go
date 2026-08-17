@@ -1245,7 +1245,7 @@ func builtinIndexOp(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 		var elemType *oas3.Schema
 		if input.Items != nil && input.Items.Left != nil {
 			elemType = input.Items.Left
-		} else if input.PrefixItems != nil && len(input.PrefixItems) > 0 {
+		} else if len(input.PrefixItems) > 0 {
 			// Tuple array - try to get specific element if index is const
 			if idxVal, ok := extractConstValue(indexArg); ok {
 				if idxFloat, ok := idxVal.(float64); ok {
@@ -1457,7 +1457,7 @@ func builtinSetpath(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 }
 
 func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if env != nil && env.opts.EnableWarnings {
+	if env.opts.EnableWarnings {
 		env.logger.Debugf("builtinSetpath: CALLED with %d args", len(args))
 	}
 
@@ -1469,7 +1469,7 @@ func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 	valueArg := args[1]
 
 	// Early dynamic-string key detection for tuple paths: [ non-const string ]
-	if env != nil && env.opts.EnableWarnings && MightBeArray(pathArg) {
+	if env.opts.EnableWarnings && MightBeArray(pathArg) {
 		hasPrefixItems := pathArg.PrefixItems != nil
 		prefixLen := 0
 		if hasPrefixItems {
@@ -1480,16 +1480,16 @@ func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 
 	if MightBeObject(input) && MightBeArray(pathArg) && pathArg.PrefixItems != nil && len(pathArg.PrefixItems) == 1 {
 		if seg := pathArg.PrefixItems[0]; seg != nil && seg.Left != nil {
-			if env != nil && env.opts.EnableWarnings {
+			if env.opts.EnableWarnings {
 				env.logger.Debugf("builtinSetpath: checking seg.Left type=%s, MightBeString=%v", getType(seg.Left), MightBeString(seg.Left))
 			}
 			if MightBeString(seg.Left) {
 				constVal, isConst := extractConstString(seg.Left)
-				if env != nil && env.opts.EnableWarnings {
+				if env.opts.EnableWarnings {
 					env.logger.Debugf("builtinSetpath: extractConstString returned '%s', isConst=%v", constVal, isConst)
 				}
 				if !isConst {
-					if env != nil && env.opts.EnableWarnings {
+					if env.opts.EnableWarnings {
 						env.logger.Debugf("builtinSetpath: tuple[0] is non-const string -> dynamic key; updating additionalProperties")
 					}
 					return []*oas3.Schema{setDynamicProperty(input, valueArg, env.opts)}, nil
@@ -1499,26 +1499,26 @@ func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 	}
 
 	paths := extractPathsFromSchema(pathArg)
-	if env != nil && env.opts.EnableWarnings {
+	if env.opts.EnableWarnings {
 		pathType := getType(pathArg)
 		env.logger.Debugf("builtinSetpath: extracted %d paths from pathArg (type=%s)", len(paths), pathType)
 	}
 
 	if len(paths) == 0 {
 		// DEBUG: Log when setpath no-ops due to non-const path
-		if env != nil && env.opts.EnableWarnings {
+		if env.opts.EnableWarnings {
 			env.logger.Debugf("builtinSetpath: no const paths extracted, checking for wildcard case")
 		}
 
 		// HANDLE EMPTY-PATH SENTINEL: Some upstream builders collapse non-const segments to an "empty array" (maxItems=0).
 		// Treat this as a dynamic string-key update on objects so reduce .[] as $c ({}; .[$c.name] = $c.value) can proceed.
 		if MightBeArray(pathArg) && pathArg.MaxItems != nil && *pathArg.MaxItems == 0 && MightBeObject(input) {
-			if env != nil && env.opts.EnableWarnings {
+			if env.opts.EnableWarnings {
 				env.logger.Debugf("builtinSetpath: empty path tuple treated as dynamic string key; updating additionalProperties")
 				env.logger.Debugf("builtinSetpath: calling setDynamicProperty now...")
 			}
 			result := setDynamicProperty(input, valueArg, env.opts)
-			if env != nil && env.opts.EnableWarnings {
+			if env.opts.EnableWarnings {
 				env.logger.Debugf("builtinSetpath: setDynamicProperty returned, hasAP=%v",
 					result.AdditionalProperties != nil && result.AdditionalProperties.Left != nil)
 			}
@@ -1531,7 +1531,7 @@ func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 			pathItems := pathArg.Items.Left
 			// Check if this is a path array with string-typed items
 			if MightBeString(pathItems) && MightBeObject(input) {
-				if env != nil && env.opts.EnableWarnings {
+				if env.opts.EnableWarnings {
 					env.logger.Debugf("builtinSetpath: detected wildcard string key pattern (non-empty), updating additionalProperties")
 				}
 				return []*oas3.Schema{setDynamicProperty(input, valueArg, env.opts)}, nil
@@ -1553,7 +1553,7 @@ func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 	// Static set done; check if it actually changed anything
 	afterFP := schemaFingerprint(result)
 	if afterFP == beforeFP && MightBeObject(input) {
-		if env != nil && env.opts.EnableWarnings {
+		if env.opts.EnableWarnings {
 			env.logger.Debugf("builtinSetpath: static set had no effect; treating path as dynamic string key and updating additionalProperties")
 		}
 		return []*oas3.Schema{setDynamicProperty(input, valueArg, env.opts)}, nil
@@ -1571,7 +1571,7 @@ func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 
 			// Treat a fresh accumulator {} (no properties, no AP before static set) as dynamic-key target
 			if inputPropCount == 0 && !inputHasAP {
-				if env != nil && env.opts.EnableWarnings {
+				if env.opts.EnableWarnings {
 					env.logger.Debugf("builtinSetpath: widening additionalProperties for single-string path into fresh object; value type=%s", getType(valueArg))
 				}
 				// Preserve accumulator pointer identity for fresh objects
@@ -1765,7 +1765,7 @@ func extractConstValue(schema *oas3.Schema) (any, bool) {
 	// Check for Const field first
 	if schema.Const != nil {
 		node = schema.Const
-	} else if schema.Enum != nil && len(schema.Enum) == 1 {
+	} else if len(schema.Enum) == 1 {
 		node = schema.Enum[0]
 	} else {
 		return nil, false
@@ -1866,67 +1866,6 @@ func parseFloat(s string) (float64, error) {
 // ============================================================================
 // ARITHMETIC BUILTINS
 // ============================================================================
-
-// builtinPlus implements + for two values.
-func builtinPlus(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) < 1 {
-		return []*oas3.Schema{NumberType()}, nil
-	}
-
-	var lhs, rhs *oas3.Schema
-	if len(args) == 2 {
-		// Some jq plans encode + as arity-2; normalize against possible outer input object bleed-through.
-		lhs, rhs = pickBinaryOperands(input, args[0], args[1])
-	} else {
-		// Arity-1: jq uses lhs as input, rhs as arg[0]
-		lhs = input
-		rhs = args[0]
-	}
-
-	// Null identity
-	if isNullSchema(lhs) {
-		return []*oas3.Schema{rhs}, nil
-	}
-	if isNullSchema(rhs) {
-		return []*oas3.Schema{lhs}, nil
-	}
-
-	// Safety check
-	if lhs == nil || rhs == nil {
-		return []*oas3.Schema{NumberType()}, nil
-	}
-
-	lType := getType(lhs)
-	rType := getType(rhs)
-
-	// Numbers
-	if (lType == "number" || lType == "integer") && (rType == "number" || rType == "integer") {
-		return []*oas3.Schema{addNumericSchemas(lhs, rhs)}, nil
-	}
-
-	// Arrays
-	if lType == "array" && rType == "array" {
-		return []*oas3.Schema{concatArraySchemas(lhs, rhs, env.opts)}, nil
-	}
-
-	// Strings
-	if lType == "string" && rType == "string" {
-		return []*oas3.Schema{concatStringSchemas(lhs, rhs)}, nil
-	}
-
-	// Objects
-	if lType == "object" && rType == "object" {
-		return []*oas3.Schema{MergeObjects(lhs, rhs, env.opts)}, nil
-	}
-
-	// Mixed/unknown or empty types: fallback to number (conservative for arithmetic)
-	if lType == "" || rType == "" {
-		return []*oas3.Schema{NumberType()}, nil
-	}
-
-	// Mixed types: return Top
-	return []*oas3.Schema{Top()}, nil
-}
 
 // ============================================================================
 // BUILTINADDOP - JQ "+" WITH PROPER UNION DISTRIBUTION
@@ -2409,7 +2348,7 @@ func subtractArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 	var itemType *oas3.Schema
 	if a.Items != nil && a.Items.Left != nil {
 		itemType = a.Items.Left
-	} else if a.PrefixItems != nil && len(a.PrefixItems) > 0 {
+	} else if len(a.PrefixItems) > 0 {
 		// For tuples, union all item types
 		items := make([]*oas3.Schema, 0, len(a.PrefixItems))
 		for _, item := range a.PrefixItems {

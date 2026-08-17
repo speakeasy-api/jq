@@ -1067,36 +1067,6 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 	return result
 }
 
-// haveSameRequiredSets checks if all schemas have identical required sets
-func haveSameRequiredSets(schemas []*oas3.Schema) bool {
-	if len(schemas) <= 1 {
-		return true
-	}
-
-	// Build set from first schema
-	first := schemas[0].Required
-	firstSet := make(map[string]bool)
-	for _, r := range first {
-		firstSet[r] = true
-	}
-
-	// Compare all others
-	for i := 1; i < len(schemas); i++ {
-		req := schemas[i].Required
-		if len(req) != len(first) {
-			return false
-		}
-
-		for _, r := range req {
-			if !firstSet[r] {
-				return false
-			}
-		}
-	}
-
-	return true
-}
-
 // deduplicateSchemas removes duplicate schemas from a list.
 // Uses enhanced fingerprinting that distinguishes constants and structural shapes.
 func deduplicateSchemas(schemas []*oas3.Schema) []*oas3.Schema {

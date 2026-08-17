@@ -2,7 +2,6 @@ package schemaexec
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
 	"sort"
 	"strings"
@@ -207,12 +206,12 @@ func encodeSchema(s *oas3.Schema, ctx *canonCtx, w *canonWriter) {
 
 	// Build canonical representation
 	startPos := w.Len()
-	w.WriteByte('{')
+	w.writeByte('{')
 
 	first := true
 	writeField := func(key string, fn func()) {
 		if !first {
-			w.WriteByte(',')
+			w.writeByte(',')
 		}
 		first = false
 		w.WriteString(fmt.Sprintf("%q:", key))
@@ -290,10 +289,10 @@ func encodeSchema(s *oas3.Schema, ctx *canonCtx, w *canonWriter) {
 	// Array prefixItems (tuple types)
 	if len(s.PrefixItems) > 0 {
 		writeField("prefixItems", func() {
-			w.WriteByte('[')
+			w.writeByte('[')
 			for i, item := range s.PrefixItems {
 				if i > 0 {
-					w.WriteByte(',')
+					w.writeByte(',')
 				}
 				if itemSchema, ok := derefJSONSchemaForFingerprint(item); ok {
 					encodeSchema(itemSchema, ctx, w)
@@ -301,7 +300,7 @@ func encodeSchema(s *oas3.Schema, ctx *canonCtx, w *canonWriter) {
 					w.WriteString("{\"$unresolved\":true}")
 				}
 			}
-			w.WriteByte(']')
+			w.writeByte(']')
 		})
 	}
 
@@ -321,15 +320,15 @@ func encodeSchema(s *oas3.Schema, ctx *canonCtx, w *canonWriter) {
 			}
 			sort.Slice(props, func(i, j int) bool { return props[i].key < props[j].key })
 
-			w.WriteByte('{')
+			w.writeByte('{')
 			for i, p := range props {
 				if i > 0 {
-					w.WriteByte(',')
+					w.writeByte(',')
 				}
 				w.WriteString(fmt.Sprintf("%q:", p.key))
 				encodeSchema(p.schema, ctx, w)
 			}
-			w.WriteByte('}')
+			w.writeByte('}')
 		})
 	}
 
@@ -339,14 +338,14 @@ func encodeSchema(s *oas3.Schema, ctx *canonCtx, w *canonWriter) {
 			sorted := make([]string, len(s.Required))
 			copy(sorted, s.Required)
 			sort.Strings(sorted)
-			w.WriteByte('[')
+			w.writeByte('[')
 			for i, r := range sorted {
 				if i > 0 {
-					w.WriteByte(',')
+					w.writeByte(',')
 				}
 				w.WriteString(fmt.Sprintf("%q", r))
 			}
-			w.WriteByte(']')
+			w.writeByte(']')
 		})
 	}
 
@@ -387,7 +386,7 @@ func encodeSchema(s *oas3.Schema, ctx *canonCtx, w *canonWriter) {
 		})
 	}
 
-	w.WriteByte('}')
+	w.writeByte('}')
 
 	// Unmark in progress
 	delete(ctx.inProgress, s)
@@ -422,14 +421,14 @@ func encodeCombinator(branches []*oas3.JSONSchema[oas3.Referenceable], ctx *cano
 	sort.Strings(order)
 
 	// Emit as array
-	w.WriteByte('[')
+	w.writeByte('[')
 	for i, key := range order {
 		if i > 0 {
-			w.WriteByte(',')
+			w.writeByte(',')
 		}
 		w.Write(seen[key])
 	}
-	w.WriteByte(']')
+	w.writeByte(']')
 }
 
 // encodeEnums canonicalizes and encodes enum values
@@ -444,14 +443,14 @@ func encodeEnums(enums []*yaml.Node, w *canonWriter) {
 	sort.Strings(canonical)
 
 	// Emit as array
-	w.WriteByte('[')
+	w.writeByte('[')
 	for i, val := range canonical {
 		if i > 0 {
-			w.WriteByte(',')
+			w.writeByte(',')
 		}
 		w.WriteString(val)
 	}
-	w.WriteByte(']')
+	w.writeByte(']')
 }
 
 // canonWriter is a simple buffer for building canonical representations
@@ -467,7 +466,7 @@ func (w *canonWriter) Write(p []byte) {
 	w.buf = append(w.buf, p...)
 }
 
-func (w *canonWriter) WriteByte(b byte) {
+func (w *canonWriter) writeByte(b byte) {
 	w.buf = append(w.buf, b)
 }
 
@@ -495,100 +494,6 @@ func FingerprintSchema(s *oas3.Schema) string {
 	return defaultFingerprinter.FingerprintSchema(s)
 }
 
-// fingerprintStateHelper computes a fingerprint for an execState using schema fingerprints
-// This is used by execState.fingerprint() in multistate.go
-func fingerprintStateHelper(s *execState, fp *Fingerprinter) uint64 {
-	h := sha256.New()
-
-	// Scalar state
-	binary.Write(h, binary.LittleEndian, uint64(s.pc))
-	binary.Write(h, binary.LittleEndian, uint64(s.depth))
-
-	// Callstack
-	binary.Write(h, binary.LittleEndian, uint64(len(s.callstack)))
-	for _, pc := range s.callstack {
-		binary.Write(h, binary.LittleEndian, uint64(pc))
-	}
-
-	// Build exclusion set for mutable schemas (accumulators)
-	excl := make(map[*oas3.Schema]struct{}, len(s.accum)+len(s.schemaToAlloc))
-	for _, arr := range s.accum {
-		if arr != nil {
-			excl[arr] = struct{}{}
-		}
-	}
-	for arr := range s.schemaToAlloc {
-		if arr != nil {
-			excl[arr] = struct{}{}
-		}
-	}
-
-	// Stack schemas
-	binary.Write(h, binary.LittleEndian, uint64(len(s.stack)))
-	for _, sv := range s.stack {
-		var sfp string
-		if sv.Schema == nil {
-			sfp = "bottom"
-		} else {
-			sfp = fp.FingerprintSchemaWithExclusions(sv.Schema, excl)
-		}
-		h.Write([]byte(sfp))
-		h.Write([]byte{0})
-	}
-
-	// Scopes (frames in order, variables sorted within each frame)
-	binary.Write(h, binary.LittleEndian, uint64(len(s.scopes)))
-	for _, frame := range s.scopes {
-		// Sort variable names for determinism
-		names := make([]string, 0, len(frame))
-		for k := range frame {
-			names = append(names, k)
-		}
-		sort.Strings(names)
-
-		binary.Write(h, binary.LittleEndian, uint64(len(names)))
-		for _, name := range names {
-			h.Write([]byte(name))
-			h.Write([]byte{0})
-			v := frame[name]
-			var vfp string
-			if v == nil {
-				vfp = "bottom"
-			} else {
-				vfp = fp.FingerprintSchemaWithExclusions(v, excl)
-			}
-			h.Write([]byte(vfp))
-			h.Write([]byte{0})
-		}
-	}
-
-	// Path mode and current path
-	if s.pathMode {
-		h.Write([]byte("pm:1"))
-		binary.Write(h, binary.LittleEndian, uint64(len(s.currentPath)))
-		for _, seg := range s.currentPath {
-			if seg.IsSymbolic {
-				h.Write([]byte("*"))
-			} else {
-				switch k := seg.Key.(type) {
-				case string:
-					h.Write([]byte("s:"))
-					h.Write([]byte(k))
-				case int:
-					h.Write([]byte(fmt.Sprintf("i:%d", k)))
-				default:
-					h.Write([]byte("u"))
-				}
-			}
-			h.Write([]byte{0})
-		}
-	} else {
-		h.Write([]byte("pm:0"))
-	}
-
-	sum := h.Sum(nil)
-	return binary.LittleEndian.Uint64(sum[:8])
-}
 
 // canonicalizeYAMLNode is moved here from multistate.go for reuse
 // It converts a yaml.Node to a canonical string for fingerprinting
