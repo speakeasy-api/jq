@@ -109,7 +109,7 @@ Important for precision:
 Untyped schemas are typed by structural inference (`impliedTypeOf` in
 `schemaops.go`, consulted by `getType`/`mightBeType`):
 
-| Schema structure (no explicit `type`, no combinators) | Implied type |
+| Schema structure (no explicit `type`, no `allOf`/`anyOf`/`oneOf`/`not`/`if`/`then`/`else`) | Implied type |
 |---|---|
 | `enum` present | `string` |
 | `const` present | the const's scalar type |
@@ -126,9 +126,10 @@ equivalence with the structural inference Speakeasy's SDK/CLI generators
 apply to untyped schemas. Real-world documents routinely omit
 `type: object` on schemas with `properties`; without inference every
 navigation of such schemas widens to Top and the executor is useless on
-exactly the documents it targets. Explicit types and allOf/anyOf/oneOf
-always take precedence — inference only fires when a schema declares no
-types and no combinators.
+exactly the documents it targets. The generator suppresses inference for
+`allOf`/`anyOf`/`oneOf`, but ignores `not`/`if`/`then`/`else`. The executor
+conservatively suppresses inference for those additional keywords too,
+widening rather than asserting a type in their presence.
 
 The mode is selectable via `SchemaExecOptions.Semantics`:
 `SchemaSemanticsSpeakeasy` (default) applies the inference at navigation

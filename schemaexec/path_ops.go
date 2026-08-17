@@ -6,6 +6,20 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const allElementsPathFormat = "jq-path-all-elements"
+
+func allElementsPathSchema() *oas3.Schema {
+	result := IntegerType()
+	marker := allElementsPathFormat
+	result.Format = &marker
+	return result
+}
+
+func isAllElementsSegment(seg PathSegment) bool {
+	_, ok := seg.Key.(PathAllElements)
+	return seg.IsSymbolic && ok
+}
+
 // extractPathsFromSchema converts a path array schema to concrete path segments
 // Input: array schema where items are arrays of (string | integer)
 // Output: list of path segment arrays
@@ -31,8 +45,7 @@ func extractPathsFromSchema(pathSchema *oas3.Schema) [][]PathSegment {
 
 	// Handle array-of-paths (accumulator of multiple paths)
 	// Items.Left should be an array schema representing one path tuple
-	if pathSchema.Items != nil && pathSchema.Items.Left != nil {
-		itemSchema := pathSchema.Items.Left
+	if itemSchema := resolvedLeft(pathSchema.Items); itemSchema != nil {
 		itemType := getType(itemSchema)
 
 		if itemType == "array" {
@@ -41,8 +54,8 @@ func extractPathsFromSchema(pathSchema *oas3.Schema) [][]PathSegment {
 				// Multiple paths - extract each from AnyOf
 				paths := make([][]PathSegment, 0, len(itemSchema.AnyOf))
 				for _, anyOfSchema := range itemSchema.AnyOf {
-					if anyOfSchema.Left != nil && getType(anyOfSchema.Left) == "array" {
-						if path := extractSinglePath(anyOfSchema.Left); path != nil {
+					if left := resolvedLeft(anyOfSchema); left != nil && getType(left) == "array" {
+						if path := extractSinglePath(left); path != nil {
 							paths = append(paths, path)
 						}
 					}
@@ -75,11 +88,12 @@ func extractSinglePath(pathSchema *oas3.Schema) []PathSegment {
 	// TODO: Handle unionized paths where prefixItems[0] has anyOf
 	segments := make([]PathSegment, 0, len(pathSchema.PrefixItems))
 	for _, itemSchema := range pathSchema.PrefixItems {
-		if itemSchema.Left == nil {
+		left := resolvedLeft(itemSchema)
+		if left == nil {
 			continue
 		}
 
-		seg := extractSegmentFromSchema(itemSchema.Left)
+		seg := extractSegmentFromSchema(left)
 		segments = append(segments, seg)
 	}
 
@@ -88,6 +102,10 @@ func extractSinglePath(pathSchema *oas3.Schema) []PathSegment {
 
 // extractSegmentFromSchema converts a schema to a path segment
 func extractSegmentFromSchema(schema *oas3.Schema) PathSegment {
+	if getType(schema) == "integer" && schema.Format != nil && *schema.Format == allElementsPathFormat {
+		return PathSegment{Key: PathAllElements{}, IsSymbolic: true}
+	}
+
 	// Check for const string (property name)
 	if getType(schema) == "string" && len(schema.Enum) > 0 {
 		if schema.Enum[0].Kind == yaml.ScalarNode {
@@ -149,10 +167,15 @@ func deletePathFromSchema(schema *oas3.Schema, path []PathSegment, opts SchemaEx
 // deleteSegment deletes a single segment (property or array element)
 func deleteSegment(schema *oas3.Schema, seg PathSegment, opts SchemaExecOptions) *oas3.Schema {
 	if seg.IsSymbolic {
-		// Wildcard deletion: for arrays, clear all elements
 		if getType(schema) == "array" {
-			// Return empty array schema
-			return ArrayType(Bottom())
+			if isAllElementsSegment(seg) {
+				return ArrayType(Bottom())
+			}
+			// Deleting an unknown index may shift every tuple position and may
+			// reduce the length by one, but does not necessarily empty the array.
+			result := eraseArrayPositions(schema, opts)
+			result.MinItems = nil
+			return result
 		}
 		// For objects, can't delete "all properties" - return unchanged
 		return schema
@@ -228,9 +251,9 @@ func navigatePathInSchema(schema *oas3.Schema, path []PathSegment, opts SchemaEx
 	// Navigate one step
 	var next *oas3.Schema
 	if seg.IsSymbolic {
-		// Wildcard: return union of all possible values
-		if getType(schema) == "array" && schema.Items != nil && schema.Items.Left != nil {
-			next = schema.Items.Left
+		// Both all-elements and unknown-index reads may observe any element.
+		if getType(schema) == "array" {
+			next = arrayElementUnion(schema, opts)
 		} else if getType(schema) == "object" {
 			next = unionAllObjectValues(schema, opts)
 		} else {
@@ -279,7 +302,12 @@ func setSegment(schema *oas3.Schema, seg PathSegment, value *oas3.Schema, opts S
 		if getType(schema) == "object" {
 			return setDynamicProperty(schema, value, opts)
 		}
-		// For arrays, still unclear how to set "all elements" symbolically; keep conservative behavior
+		if getType(schema) == "array" {
+			if isAllElementsSegment(seg) {
+				return replaceAllArrayElements(schema, value, opts)
+			}
+			return widenArrayAfterWrite(schema, value, nil, opts)
+		}
 		return schema
 	}
 
@@ -288,8 +316,47 @@ func setSegment(schema *oas3.Schema, seg PathSegment, value *oas3.Schema, opts S
 		return setProperty(schema, key, value)
 	}
 
-	// Set array element (complex for symbolic execution)
+	if idx, ok := seg.Key.(int); ok && getType(schema) == "array" {
+		return widenArrayAfterWrite(schema, value, &idx, opts)
+	}
+
 	return schema
+}
+
+func replaceAllArrayElements(schema, value *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	if schema == nil || getType(schema) != "array" {
+		return schema
+	}
+	result := eraseArrayPositions(schema, opts)
+	if value == nil {
+		return result
+	}
+	result.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](value)
+	return result
+}
+
+// widenArrayAfterWrite drops tuple positions invalidated by an indexed write.
+// The homogeneous item type includes prior positions, the written value, and
+// null padding that setpath may insert when extending past the end.
+func widenArrayAfterWrite(schema, value *oas3.Schema, index *int, opts SchemaExecOptions) *oas3.Schema {
+	if schema == nil || getType(schema) != "array" {
+		return schema
+	}
+	result := eraseArrayPositions(schema, opts)
+	items := arrayElementUnion(schema, opts)
+	result.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Union([]*oas3.Schema{
+		items,
+		value,
+		ConstNull(),
+	}, opts))
+	result.MaxItems = nil
+	if index != nil && *index >= 0 {
+		writtenLength := int64(*index + 1)
+		if result.MinItems == nil || *result.MinItems < writtenLength {
+			result.MinItems = &writtenLength
+		}
+	}
+	return result
 }
 
 // setProperty sets or updates a property in an object schema
@@ -306,6 +373,7 @@ func setProperty(schema *oas3.Schema, propName string, value *oas3.Schema) *oas3
 
 	// Clone and update
 	result := *schema
+	result.Required = append([]string(nil), schema.Required...)
 	if schema.Properties == nil {
 		result.Properties = sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
 	} else {
@@ -338,13 +406,12 @@ func setProperty(schema *oas3.Schema, propName string, value *oas3.Schema) *oas3
 // navigateAndModify navigates to a segment and applies a modification function
 func navigateAndModify(schema *oas3.Schema, seg PathSegment, remainingPath []PathSegment, opts SchemaExecOptions, modifyFn func(*oas3.Schema) *oas3.Schema) *oas3.Schema {
 	if seg.IsSymbolic {
-		// Wildcard: apply to all elements
-		if getType(schema) == "array" && schema.Items != nil && schema.Items.Left != nil {
-			// Modify array item schema
-			result := *schema
-			newItems := modifyFn(schema.Items.Left)
-			result.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newItems)
-			return &result
+		if getType(schema) == "array" {
+			newItems := modifyFn(arrayElementUnion(schema, opts))
+			if isAllElementsSegment(seg) {
+				return replaceAllArrayElements(schema, newItems, opts)
+			}
+			return widenArrayAfterWrite(schema, newItems, nil, opts)
 		}
 		// For objects, would need to modify all properties (complex)
 		return schema
@@ -376,6 +443,11 @@ func navigateAndModify(schema *oas3.Schema, seg PathSegment, remainingPath []Pat
 		return &result
 	}
 
-	// Array index navigation (complex for symbolic execution)
+	if idx, ok := seg.Key.(int); ok && getType(schema) == "array" {
+		child := getArrayElement(schema, idx, opts)
+		modified := modifyFn(child)
+		return widenArrayAfterWrite(schema, modified, &idx, opts)
+	}
+
 	return schema
 }

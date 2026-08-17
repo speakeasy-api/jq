@@ -41,7 +41,11 @@ const (
 	SchemaSemanticsRaw
 )
 
-// SchemaExecOptions configures symbolic execution behavior.
+// SchemaExecOptions configures symbolic execution behavior. Callers should
+// start from DefaultOptions when changing individual fields. Public entry
+// points fill zero-valued numeric limits from DefaultOptions, but boolean
+// fields whose defaults are true (EnableWarnings, EnableMemo, and
+// LogSchemaDeltas) remain false in a zero-value struct.
 type SchemaExecOptions struct {
 	// Semantics selects the schema interpretation mode (see SchemaSemantics).
 	// The zero value is SchemaSemanticsSpeakeasy.
@@ -78,6 +82,32 @@ type SchemaExecOptions struct {
 	logger Logger
 }
 
+// normalizeOptions fills numeric safety limits that cannot use zero during an
+// execution. Boolean fields are deliberately left unchanged so an explicit
+// false remains meaningful.
+func normalizeOptions(opts SchemaExecOptions) SchemaExecOptions {
+	defaults := DefaultOptions()
+	if opts.AnyOfLimit == 0 {
+		opts.AnyOfLimit = defaults.AnyOfLimit
+	}
+	if opts.EnumLimit == 0 {
+		opts.EnumLimit = defaults.EnumLimit
+	}
+	if opts.MaxDepth == 0 {
+		opts.MaxDepth = defaults.MaxDepth
+	}
+	if opts.LogMaxEnumValues == 0 {
+		opts.LogMaxEnumValues = defaults.LogMaxEnumValues
+	}
+	if opts.LogMaxProps == 0 {
+		opts.LogMaxProps = defaults.LogMaxProps
+	}
+	if opts.LogStackPreviewDepth == 0 {
+		opts.LogStackPreviewDepth = defaults.LogStackPreviewDepth
+	}
+	return opts
+}
+
 // debugf routes diagnostic output from options-carrying helpers through the
 // configured logger. No-op when no logger is attached.
 func (o SchemaExecOptions) debugf(format string, args ...any) {
@@ -95,14 +125,14 @@ type SchemaExecResult struct {
 // DefaultOptions returns the default configuration for schema execution.
 func DefaultOptions() SchemaExecOptions {
 	return SchemaExecOptions{
-		AnyOfLimit:           10,
-		EnumLimit:            50,
-		MaxDepth:             100,
-		StrictMode:           false,
-		EnableWarnings:       true,
-		EnableMemo:           true,
-		WideningLevel:        1,
-		LogLevel:             "", // silent by default; set "warn"/"debug" to log
+		AnyOfLimit:     10,
+		EnumLimit:      50,
+		MaxDepth:       100,
+		StrictMode:     false,
+		EnableWarnings: true,
+		EnableMemo:     true,
+		WideningLevel:  1,
+		LogLevel:       "", // silent by default; set "warn"/"debug" to log
 
 		LogMaxEnumValues:     5,
 		LogMaxProps:          5,

@@ -9,25 +9,26 @@ import (
 )
 
 // Verdict classifies the outcome of symbolically executing a jq query against
-// an input schema. The library is best-effort: it cannot prove everything, but
-// when it CAN prove a query is broken, consumers may hard-error.
+// an input schema. The zero value is VerdictUnverifiable. The library is
+// best-effort: it cannot prove everything, but when it CAN prove a query is
+// broken, consumers may hard-error.
 type Verdict int
 
 const (
+	// VerdictUnverifiable: the output contains Top (unknown) somewhere — the
+	// library could not decide. This is NOT an error; consumers should warn
+	// at most.
+	VerdictUnverifiable Verdict = iota
+
 	// VerdictProven: a concrete output schema was inferred; it contains no
 	// Top (unknown) anywhere and is not provably empty. Safe to use as the
 	// projected output shape.
-	VerdictProven Verdict = iota
+	VerdictProven
 
 	// VerdictProvenBroken: the output is provably null or empty for EVERY
 	// valid input — e.g. a typo'd leaf yielding const null, or a query whose
 	// execution paths are all dead (Bottom). Safe to fail a build on.
 	VerdictProvenBroken
-
-	// VerdictUnverifiable: the output contains Top (unknown) somewhere — the
-	// library could not decide. This is NOT an error; consumers should warn
-	// at most.
-	VerdictUnverifiable
 )
 
 // String returns a human-readable name for the verdict.
@@ -100,9 +101,12 @@ type Analysis struct {
 // SchemaSemanticsRaw, objects without additionalProperties are open and such
 // access is merely Unverifiable.
 func Analyze(ctx context.Context, q *gojq.Query, input *oas3.Schema, opts ...SchemaExecOptions) (*Analysis, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	opt := DefaultOptions()
 	if len(opts) > 0 {
-		opt = opts[0]
+		opt = normalizeOptions(opts[0])
 	}
 	// Classification requires the completed lenient output schema.
 	opt.StrictMode = false

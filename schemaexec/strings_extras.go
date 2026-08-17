@@ -83,7 +83,7 @@ func builtinGsub(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 			// Invalid regex on fully-const => Bottom (per instruction)
 			return []*oas3.Schema{Bottom()}, nil
 		}
-		out := re.ReplaceAllString(inStr, repl)
+		out := replaceAllLiteral(re, inStr, repl)
 		return []*oas3.Schema{ConstString(out)}, nil
 	}
 
@@ -102,7 +102,7 @@ func builtinGsub(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 				return []*oas3.Schema{defaultOut}, nil
 			}
 			// Apply replacement
-			res := re.ReplaceAllString(node.Value, repl)
+			res := replaceAllLiteral(re, node.Value, repl)
 			if _, ok := seen[res]; ok {
 				continue
 			}

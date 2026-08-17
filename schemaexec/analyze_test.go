@@ -22,6 +22,50 @@ func analyzeExpr(t *testing.T, expr string, input *oas3.Schema) *Analysis {
 	return a
 }
 
+func TestAnalyzePublicAPIZeroValuesAreConservativeAndUsable(t *testing.T) {
+	if Verdict(0) != VerdictUnverifiable {
+		t.Fatalf("Verdict(0) = %s, want unverifiable", Verdict(0))
+	}
+
+	q, err := gojq.Parse(`.`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nilContext context.Context
+	a, err := Analyze(nilContext, q, StringType(), SchemaExecOptions{})
+	if err != nil {
+		t.Fatalf("Analyze with nil context and zero options: %v", err)
+	}
+	if a.Verdict != VerdictProven {
+		t.Fatalf("identity verdict = %s, want proven", a.Verdict)
+	}
+	rawOptions := SchemaExecOptions{Semantics: SchemaSemanticsRaw}
+	rawAnalysis, err := Analyze(context.Background(), q, StringType(), rawOptions)
+	if err != nil {
+		t.Fatalf("Analyze with partially populated options: %v", err)
+	}
+	if rawAnalysis.Semantics != SchemaSemanticsRaw {
+		t.Fatalf("semantics = %v, want raw", rawAnalysis.Semantics)
+	}
+
+	if _, err := RunSchema(nilContext, q, StringType(), SchemaExecOptions{}); err != nil {
+		t.Fatalf("RunSchema with nil context and zero options: %v", err)
+	}
+	code, err := gojq.Compile(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExecSchema(nilContext, code, StringType(), SchemaExecOptions{}); err != nil {
+		t.Fatalf("ExecSchema with nil context and zero options: %v", err)
+	}
+}
+
+func TestNormalizeOptionsPreservesDisabledWidening(t *testing.T) {
+	if got := normalizeOptions(SchemaExecOptions{}).WideningLevel; got != 0 {
+		t.Fatalf("WideningLevel = %d, want 0", got)
+	}
+}
+
 // personSchema is a typical closed response object.
 func personSchema() *oas3.Schema {
 	return BuildObject(map[string]*oas3.Schema{

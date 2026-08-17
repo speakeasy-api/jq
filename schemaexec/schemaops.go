@@ -295,6 +295,63 @@ func ArrayType(items *oas3.Schema) *oas3.Schema {
 	return schema
 }
 
+// arrayElementUnion returns a sound homogeneous view of every position an
+// array schema can contain. It is used whenever an operation invalidates
+// prefixItems positions (sorting, reversing, slicing, or indexed writes).
+func arrayElementUnion(arr *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	if arr == nil || getType(arr) != "array" {
+		return Top()
+	}
+	if arr.MaxItems != nil && *arr.MaxItems == 0 {
+		return Bottom()
+	}
+
+	candidates := make([]*oas3.Schema, 0, len(arr.PrefixItems)+1)
+	for _, item := range arr.PrefixItems {
+		if schema, ok := derefJSONSchema(newCollapseContext(), item); ok && schema != nil {
+			candidates = append(candidates, schema)
+		}
+	}
+	if arr.Items != nil {
+		if schema, ok := derefJSONSchema(newCollapseContext(), arr.Items); !ok {
+			candidates = append(candidates, Top())
+		} else if schema != nil {
+			candidates = append(candidates, schema)
+		}
+	} else if arr.MaxItems == nil || *arr.MaxItems > int64(len(arr.PrefixItems)) {
+		// In JSON Schema, absent items leaves positions beyond prefixItems
+		// unconstrained unless maxItems proves those positions cannot exist.
+		candidates = append(candidates, Top())
+	}
+
+	if len(candidates) == 0 {
+		if arr.Items != nil && arr.Items.Right != nil && !*arr.Items.Right {
+			return Bottom()
+		}
+		return Top()
+	}
+	return Union(candidates, opts)
+}
+
+// eraseArrayPositions converts a tuple/positional array into a homogeneous
+// array while retaining non-positional constraints and length bounds.
+func eraseArrayPositions(arr *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	if arr == nil || getType(arr) != "array" {
+		return arr
+	}
+	result := cloneSchema(arr)
+	items := arrayElementUnion(arr, opts)
+	result.PrefixItems = nil
+	if items == nil {
+		result.Items = nil
+		zero := int64(0)
+		result.MaxItems = &zero
+	} else {
+		result.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](items)
+	}
+	return result
+}
+
 // ObjectType creates a basic object schema (unconstrained).
 func ObjectType() *oas3.Schema {
 	return &oas3.Schema{
@@ -819,9 +876,11 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 		if opts.EnableWarnings {
 			opts.debugf("tryMergeArrays: len(itemSchemas)==0, returning unconstrained array (not empty)")
 		}
-		return &oas3.Schema{
+		result := &oas3.Schema{
 			Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
 		}
+		mergeArrayLengthBounds(result, schemas)
+		return result
 	}
 
 	// SOUNDNESS: item schemas are unioned as-is. An earlier heuristic dropped
@@ -838,7 +897,39 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 		mergedItems = Top()
 	}
 
-	return ArrayType(mergedItems)
+	result := ArrayType(mergedItems)
+	mergeArrayLengthBounds(result, schemas)
+	return result
+}
+
+func mergeArrayLengthBounds(result *oas3.Schema, schemas []*oas3.Schema) {
+	var minItems int64
+	hasPositiveMinimum := true
+	var maxItems int64
+	hasFiniteMaximum := true
+	for i, schema := range schemas {
+		if schema.MinItems == nil || *schema.MinItems == 0 {
+			hasPositiveMinimum = false
+		} else if i == 0 || *schema.MinItems < minItems {
+			minItems = *schema.MinItems
+		}
+
+		if schema.MaxItems == nil {
+			hasFiniteMaximum = false
+		} else if i == 0 || *schema.MaxItems > maxItems {
+			maxItems = *schema.MaxItems
+		}
+	}
+	if hasPositiveMinimum {
+		result.MinItems = &minItems
+	} else {
+		result.MinItems = nil
+	}
+	if hasFiniteMaximum {
+		result.MaxItems = &maxItems
+	} else {
+		result.MaxItems = nil
+	}
 }
 
 func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
@@ -1462,9 +1553,8 @@ func BuildObject(props map[string]*oas3.Schema, required []string) *oas3.Schema 
 //
 // DELIBERATE DEVIATION FROM RAW JSON SCHEMA SEMANTICS: under JSON Schema, an
 // untyped schema with `properties` still admits strings, numbers, etc. This
-// library targets Speakeasy-processed OpenAPI documents, and the contract is
-// equivalence with what Speakeasy's SDK/CLI generators assume. The rules below
-// EXACTLY mirror the structural inference those generators apply to untyped
+// library targets Speakeasy-processed OpenAPI documents. The structural rules
+// below mirror those used by Speakeasy's SDK/CLI generators for untyped
 // schemas:
 //
 //  1. has enum                 → string
@@ -1474,9 +1564,9 @@ func BuildObject(props map[string]*oas3.Schema, required []string) *oas3.Schema 
 //  5. has items                → array
 //  6. otherwise                → "" (unknown / any)
 //
-// Callers must only consult this when the schema has no explicit types and no
-// allOf/anyOf/oneOf (combinators are handled by their own collapse paths,
-// matching the generator's precedence).
+// The generator suppresses inference for allOf/anyOf/oneOf. Executor callers
+// additionally suppress it for not/if/then/else: the generator ignores those
+// keywords, but widening is safer here than asserting a type in their presence.
 func impliedTypeOf(s *oas3.Schema) string {
 	if s == nil {
 		return ""
@@ -1558,10 +1648,10 @@ func getTypeImpl(s *oas3.Schema, allowImplied bool) string {
 
 	types := s.GetType()
 	if len(types) == 0 {
-		// No explicit type. Fall back to structural inference (implied types),
-		// mirroring the generator. anyOf was handled above; allOf/oneOf are
-		// collapsed by their own paths and must not be second-guessed here.
-		if allowImplied && len(s.AllOf) == 0 && len(s.OneOf) == 0 {
+		// No explicit type. Fall back to structural inference. anyOf was handled
+		// above; allOf/oneOf and the executor's conservative conditional
+		// suppressors must not be second-guessed here.
+		if allowImplied && !hasTypeInferenceSuppressor(s) {
 			return impliedTypeOf(s)
 		}
 		return ""
@@ -1600,7 +1690,7 @@ func mightBeType(s *oas3.Schema, typ oas3.SchemaType) bool {
 	// prune real outputs (e.g. under raw semantics an untyped schema with
 	// properties still admits strings). Precision for untyped schemas comes
 	// from getType-based navigation dispatch, not from these guards.
-	if len(types) == 0 && s.AnyOf == nil && s.AllOf == nil && s.OneOf == nil {
+	if len(types) == 0 && !hasTypeInferenceSuppressor(s) {
 		return true
 	}
 
@@ -1616,6 +1706,11 @@ func mightBeType(s *oas3.Schema, typ oas3.SchemaType) bool {
 
 	// Conservative: could be anything
 	return true
+}
+
+func hasTypeInferenceSuppressor(s *oas3.Schema) bool {
+	return s != nil && (s.AnyOf != nil || s.AllOf != nil || s.OneOf != nil ||
+		s.Not != nil || s.If != nil || s.Then != nil || s.Else != nil)
 }
 
 // MightBeObject checks if schema could be an object.
@@ -2098,14 +2193,27 @@ func isSubschemaOf(a, b *oas3.Schema) bool {
 		}
 	}
 
-	// Handle enum/const cases first (most common in our use case)
-	aHasEnum := len(a.Enum) > 0
-	bHasEnum := len(b.Enum) > 0
+	// Treat const exactly as a singleton enum. The executor's own constant
+	// constructors already use singleton enums, so externally ingested const
+	// schemas must participate in the same containment rules.
+	valueFacet := func(s *oas3.Schema) []*yaml.Node {
+		if len(s.Enum) > 0 {
+			return s.Enum
+		}
+		if s.Const != nil {
+			return []*yaml.Node{s.Const}
+		}
+		return nil
+	}
+	aValues := valueFacet(a)
+	bValues := valueFacet(b)
+	aHasEnum := len(aValues) > 0
+	bHasEnum := len(bValues) > 0
 
 	if aHasEnum {
 		if bHasEnum {
 			// Both have enums: A ⊆ B if all of A's values are in B
-			return enumSubset(a.Enum, b.Enum)
+			return enumSubset(aValues, bValues)
 		}
 		// A has enum, B doesn't: A ⊆ B only if all of A's values satisfy B.
 		// This fast path is valid ONLY when B carries no value-restricting
@@ -2120,7 +2228,7 @@ func isSubschemaOf(a, b *oas3.Schema) bool {
 			b.Properties == nil && b.Required == nil && b.AdditionalProperties == nil &&
 			b.AllOf == nil && b.AnyOf == nil && b.OneOf == nil && b.Not == nil && b.Const == nil {
 			// B is an unconstrained type; A's enum values must match that type
-			return enumMatchesType(a.Enum, bType)
+			return enumMatchesType(aValues, bType)
 		}
 		return false
 	}
@@ -2563,13 +2671,14 @@ func stripNullUnion(s *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	if len(s.AnyOf) > 0 {
 		nonNulls := make([]*oas3.Schema, 0, len(s.AnyOf))
 		for _, br := range s.AnyOf {
-			if br == nil || br.Left == nil {
+			left := resolvedLeft(br)
+			if left == nil {
 				continue
 			}
-			if getType(br.Left) == "null" {
+			if getType(left) == "null" {
 				continue
 			}
-			nonNulls = append(nonNulls, br.Left)
+			nonNulls = append(nonNulls, left)
 		}
 		if len(nonNulls) == 0 {
 			return nil
@@ -2584,13 +2693,14 @@ func stripNullUnion(s *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	if len(s.OneOf) > 0 {
 		nonNulls := make([]*oas3.Schema, 0, len(s.OneOf))
 		for _, br := range s.OneOf {
-			if br == nil || br.Left == nil {
+			left := resolvedLeft(br)
+			if left == nil {
 				continue
 			}
-			if getType(br.Left) == "null" {
+			if getType(left) == "null" {
 				continue
 			}
-			nonNulls = append(nonNulls, br.Left)
+			nonNulls = append(nonNulls, left)
 		}
 		if len(nonNulls) == 0 {
 			return nil
@@ -2624,6 +2734,62 @@ func refineVarRefs(st *execState, old, nw *oas3.Schema) {
 	for i := range st.stack {
 		if st.stack[i].Schema == old {
 			st.stack[i].Schema = nw
+		}
+	}
+}
+
+func refineForkRefs(st *execState, old, nw *oas3.Schema) {
+	if st == nil || old == nil || nw == nil || old == nw {
+		return
+	}
+	seen := make(map[*forkControl]struct{}, len(st.forks)+len(st.forkUpdates))
+	for i := range st.forks {
+		fork := &st.forks[i]
+		refineSchemaValues(fork.stack, fork.scopes, old, nw)
+		if fork.control != nil {
+			if _, ok := seen[fork.control]; !ok {
+				fork.control.replacements = append(fork.control.replacements, schemaReplacement{old: old, new: nw})
+				seen[fork.control] = struct{}{}
+			}
+		}
+	}
+	for _, control := range st.forkUpdates {
+		if control == nil {
+			continue
+		}
+		if _, ok := seen[control]; ok {
+			continue
+		}
+		control.replacements = append(control.replacements, schemaReplacement{old: old, new: nw})
+		seen[control] = struct{}{}
+	}
+}
+
+func (s *execState) applyForkUpdates() {
+	for _, control := range s.forkUpdates {
+		if control == nil {
+			continue
+		}
+		for _, replacement := range control.replacements {
+			refineSchemaValues(s.stack, s.scopes, replacement.old, replacement.new)
+			for i := range s.forks {
+				refineSchemaValues(s.forks[i].stack, s.forks[i].scopes, replacement.old, replacement.new)
+			}
+		}
+	}
+}
+
+func refineSchemaValues(stack []SValue, scopes []map[string]*oas3.Schema, old, nw *oas3.Schema) {
+	for i := range stack {
+		if stack[i].Schema == old {
+			stack[i].Schema = nw
+		}
+	}
+	for _, scope := range scopes {
+		for key, value := range scope {
+			if value == old {
+				scope[key] = nw
+			}
 		}
 	}
 }

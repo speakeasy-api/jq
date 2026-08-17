@@ -92,6 +92,28 @@ func TestGetType_UsesImpliedTypes(t *testing.T) {
 	}
 }
 
+func TestGetType_CombinatorsAndConditionalsSuppressImpliedTypes(t *testing.T) {
+	for _, keyword := range []string{"not", "if", "then", "else"} {
+		t.Run(keyword, func(t *testing.T) {
+			in := untypedObject(map[string]*oas3.Schema{"x": StringType()}, nil)
+			wrapped := oas3.NewJSONSchemaFromSchema[oas3.Referenceable](StringType())
+			switch keyword {
+			case "not":
+				in.Not = wrapped
+			case "if":
+				in.If = wrapped
+			case "then":
+				in.Then = wrapped
+			case "else":
+				in.Else = wrapped
+			}
+			if got := getType(in); got != "" {
+				t.Fatalf("getType = %q, want unknown", got)
+			}
+		})
+	}
+}
+
 // TestMightBeType_ConservativeForUntyped verifies the MightBeX helpers stay
 // CONSERVATIVE for untyped schemas: they gate builtins, and a false negative
 // would prune real outputs. (Structural inference narrows navigation dispatch

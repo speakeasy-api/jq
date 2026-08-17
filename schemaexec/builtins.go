@@ -120,7 +120,6 @@ var builtinRegistry = map[string]builtinFunc{
 	"_index": builtinIndexOp,
 
 	// Internal
-	"_break":     builtinBreak,
 	"_allocator": builtinAllocator,
 	"_setpath":   builtinSetpath,  // Reuse public version
 	"_delpaths":  builtinDelpaths, // Reuse public version
@@ -407,8 +406,7 @@ func builtinReverse(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 	if !MightBeArray(input) {
 		return []*oas3.Schema{Bottom()}, nil
 	}
-	// Reverse doesn't change schema
-	return []*oas3.Schema{input}, nil
+	return []*oas3.Schema{eraseArrayPositions(input, env.opts)}, nil
 }
 
 // builtinSort sorts an array.
@@ -416,8 +414,7 @@ func builtinSort(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 	if !MightBeArray(input) {
 		return []*oas3.Schema{Bottom()}, nil
 	}
-	// Sort doesn't change schema
-	return []*oas3.Schema{input}, nil
+	return []*oas3.Schema{eraseArrayPositions(input, env.opts)}, nil
 }
 
 // builtinUnique removes duplicates.
@@ -425,8 +422,12 @@ func builtinUnique(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*
 	if !MightBeArray(input) {
 		return []*oas3.Schema{Bottom()}, nil
 	}
-	// Unique doesn't change schema type
-	return []*oas3.Schema{input}, nil
+	if getType(input) != "array" {
+		return []*oas3.Schema{input}, nil
+	}
+	result := eraseArrayPositions(input, env.opts)
+	result.MinItems = nil
+	return []*oas3.Schema{result}, nil
 }
 
 // builtinMinMax returns min or max element.
@@ -738,7 +739,7 @@ func builtinASCIIDowncase(input *oas3.Schema, args []*oas3.Schema, env *schemaEn
 
 	// Const folding
 	if inputStr, ok := extractConstString(input); ok {
-		return []*oas3.Schema{ConstString(strings.ToLower(inputStr))}, nil
+		return []*oas3.Schema{ConstString(asciiDowncase(inputStr))}, nil
 	}
 
 	// Enum preservation
@@ -748,7 +749,7 @@ func builtinASCIIDowncase(input *oas3.Schema, args []*oas3.Schema, env *schemaEn
 			if node.Kind == yaml.ScalarNode {
 				newEnum[i] = &yaml.Node{
 					Kind:  yaml.ScalarNode,
-					Value: strings.ToLower(node.Value),
+					Value: asciiDowncase(node.Value),
 					Tag:   "!!str",
 				}
 			} else {
@@ -772,7 +773,7 @@ func builtinASCIIUpcase(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv)
 
 	// Const folding
 	if inputStr, ok := extractConstString(input); ok {
-		return []*oas3.Schema{ConstString(strings.ToUpper(inputStr))}, nil
+		return []*oas3.Schema{ConstString(asciiUpcase(inputStr))}, nil
 	}
 
 	// Enum preservation
@@ -782,7 +783,7 @@ func builtinASCIIUpcase(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv)
 			if node.Kind == yaml.ScalarNode {
 				newEnum[i] = &yaml.Node{
 					Kind:  yaml.ScalarNode,
-					Value: strings.ToUpper(node.Value),
+					Value: asciiUpcase(node.Value),
 					Tag:   "!!str",
 				}
 			} else {
@@ -795,6 +796,24 @@ func builtinASCIIUpcase(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv)
 	}
 
 	return []*oas3.Schema{StringType()}, nil
+}
+
+func asciiDowncase(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, s)
+}
+
+func asciiUpcase(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' {
+			return r - ('a' - 'A')
+		}
+		return r
+	}, s)
 }
 
 // ============================================================================
@@ -956,14 +975,14 @@ func builtinGroupBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 
 	// Get item type
 	itemType := Top()
-	if input.Items != nil && input.Items.Left != nil {
-		itemType = input.Items.Left
+	if left := resolvedLeft(input.Items); left != nil {
+		itemType = left
 	} else if len(input.PrefixItems) > 0 {
 		// For tuples, union all items
 		items := make([]*oas3.Schema, 0, len(input.PrefixItems))
 		for _, item := range input.PrefixItems {
-			if item.Left != nil {
-				items = append(items, item.Left)
+			if left := resolvedLeft(item); left != nil {
+				items = append(items, left)
 			}
 		}
 		itemType = Union(items, env.opts)
@@ -979,8 +998,7 @@ func builtinSortBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*
 		return []*oas3.Schema{Bottom()}, nil
 	}
 
-	// Sorting doesn't change schema - return input as-is
-	return []*oas3.Schema{input}, nil
+	return []*oas3.Schema{eraseArrayPositions(input, env.opts)}, nil
 }
 
 // builtinUniqueBy removes duplicates by key expression
@@ -988,9 +1006,13 @@ func builtinUniqueBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([
 	if !MightBeArray(input) {
 		return []*oas3.Schema{Bottom()}, nil
 	}
+	if getType(input) != "array" {
+		return []*oas3.Schema{input}, nil
+	}
 
-	// Dedup doesn't change schema - return input as-is
-	return []*oas3.Schema{input}, nil
+	result := eraseArrayPositions(input, env.opts)
+	result.MinItems = nil
+	return []*oas3.Schema{result}, nil
 }
 
 // builtinMinMaxBy returns min/max element by key (reuses min/max logic)
@@ -1029,21 +1051,31 @@ func flattenSchemaRecursive(schema *oas3.Schema, depth int, opts SchemaExecOptio
 		return schema
 	}
 
+	if schema.MaxItems != nil && *schema.MaxItems == 0 {
+		return ArrayType(Bottom())
+	}
+
 	// Collect all item schemas
 	items := make([]*oas3.Schema, 0)
 
 	// Add prefixItems
 	if schema.PrefixItems != nil {
 		for _, item := range schema.PrefixItems {
-			if item.Left != nil {
-				items = append(items, item.Left)
+			if left := resolvedLeft(item); left != nil {
+				items = append(items, left)
 			}
 		}
 	}
 
 	// Add items schema
-	if schema.Items != nil && schema.Items.Left != nil {
-		items = append(items, schema.Items.Left)
+	if schema.Items != nil {
+		if item, ok := derefJSONSchema(newCollapseContext(), schema.Items); !ok {
+			items = append(items, Top())
+		} else if item != nil {
+			items = append(items, item)
+		}
+	} else if schema.MaxItems == nil || *schema.MaxItems > int64(len(schema.PrefixItems)) {
+		items = append(items, Top())
 	}
 
 	if len(items) == 0 {
@@ -1058,13 +1090,13 @@ func flattenSchemaRecursive(schema *oas3.Schema, depth int, opts SchemaExecOptio
 			flattened := flattenSchemaRecursive(item, depth-1, opts)
 			if getType(flattened) == "array" {
 				// Extract items from flattened result
-				if flattened.Items != nil && flattened.Items.Left != nil {
-					flattenedItems = append(flattenedItems, flattened.Items.Left)
+				if left := resolvedLeft(flattened.Items); left != nil {
+					flattenedItems = append(flattenedItems, left)
 				}
 				if flattened.PrefixItems != nil {
 					for _, pi := range flattened.PrefixItems {
-						if pi.Left != nil {
-							flattenedItems = append(flattenedItems, pi.Left)
+						if left := resolvedLeft(pi); left != nil {
+							flattenedItems = append(flattenedItems, left)
 						}
 					}
 				}
@@ -1194,7 +1226,16 @@ func builtinSub(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 		return []*oas3.Schema{StringType()}, nil
 	}
 
-	// Const folding: if input, pattern, and replacement are all const
+	global := false
+	if len(args) >= 3 {
+		flags, ok := extractConstString(args[2])
+		if !ok || (flags != "" && flags != "g") {
+			return []*oas3.Schema{StringType()}, nil
+		}
+		global = flags == "g"
+	}
+
+	// Const folding: if input, pattern, and replacement are all const.
 	if inputStr, ok := extractConstString(input); ok {
 		if patternStr, ok := extractConstString(args[0]); ok {
 			if replStr, ok := extractConstString(args[1]); ok {
@@ -1203,7 +1244,14 @@ func builtinSub(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 					// Invalid regex - return string (conservative)
 					return []*oas3.Schema{StringType()}, nil
 				}
-				result := re.ReplaceAllString(inputStr, replStr)
+				var result string
+				if global {
+					result = replaceAllLiteral(re, inputStr, replStr)
+				} else if loc := re.FindStringIndex(inputStr); loc != nil {
+					result = inputStr[:loc[0]] + replStr + inputStr[loc[1]:]
+				} else {
+					result = inputStr
+				}
 				return []*oas3.Schema{ConstString(result)}, nil
 			}
 		}
@@ -1211,6 +1259,10 @@ func builtinSub(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 
 	// Conservative abstract semantics: return string
 	return []*oas3.Schema{StringType()}, nil
+}
+
+func replaceAllLiteral(re *regexp.Regexp, input, replacement string) string {
+	return re.ReplaceAllStringFunc(input, func(string) string { return replacement })
 }
 
 // builtinIndexOp implements _index(index) for array/string indexing with slicing support
@@ -1326,13 +1378,6 @@ func builtinIndexOp(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 // ============================================================================
 // INTERNAL BUILTINS
 // ============================================================================
-
-// builtinBreak signals iteration termination
-func builtinBreak(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	// Return empty to signal backtrack (terminates this execution path)
-	// The VM's opCall handler will treat this as no successors
-	return []*oas3.Schema{}, nil
-}
 
 // builtinAllocator is an internal allocator (no-op for symbolic execution)
 func builtinAllocator(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
@@ -1510,6 +1555,16 @@ func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 			env.logger.Debugf("builtinSetpath: no const paths extracted, checking for wildcard case")
 		}
 
+		// A homogeneous integer path loses positional length information in the
+		// accumulator representation. Preserve the receiver's array shape but
+		// widen its items rather than pretending setpath was a no-op.
+		if MightBeArray(input) && MightBeArray(pathArg) {
+			if pathItems := resolvedLeft(pathArg.Items); pathItems != nil && MightBeNumber(pathItems) {
+				unknownWrite := env.NewTopWithCause("setpath: numeric path positions are not fully modeled")
+				return []*oas3.Schema{widenArrayAfterWrite(input, unknownWrite, nil, env.opts)}, nil
+			}
+		}
+
 		// HANDLE EMPTY-PATH SENTINEL: Some upstream builders collapse non-const segments to an "empty array" (maxItems=0).
 		// Treat this as a dynamic string-key update on objects so reduce .[] as $c ({}; .[$c.name] = $c.value) can proceed.
 		if MightBeArray(pathArg) && pathArg.MaxItems != nil && *pathArg.MaxItems == 0 && MightBeObject(input) {
@@ -1574,8 +1629,7 @@ func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 				if env.opts.EnableWarnings {
 					env.logger.Debugf("builtinSetpath: widening additionalProperties for single-string path into fresh object; value type=%s", getType(valueArg))
 				}
-				// Preserve accumulator pointer identity for fresh objects
-				// This ensures the original accumulator pointer gets AP, not just the cloned result
+				// Fresh reducer accumulators keep their executor-owned identity.
 				widened := setDynamicProperty(input, valueArg, env.opts)
 				return []*oas3.Schema{widened}, nil
 			}
@@ -1598,9 +1652,7 @@ func setDynamicProperty(obj *oas3.Schema, value *oas3.Schema, opts SchemaExecOpt
 		return result
 	}
 
-	// Prefer in-place update so reduce keeps the same accumulator pointer
-	// This ensures the reduce accumulator variable gets the AP update
-	result := obj
+	result := cloneSchema(obj)
 
 	// Get existing additionalProperties
 	var existingAP *oas3.Schema

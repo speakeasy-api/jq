@@ -23,10 +23,13 @@ import (
 //	}
 //	fmt.Printf("Output schema: %+v\n", result.Schema)
 func RunSchema(ctx context.Context, query *gojq.Query, input *oas3.Schema, opts ...SchemaExecOptions) (*SchemaExecResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Use default options if none provided
 	opt := DefaultOptions()
 	if len(opts) > 0 {
-		opt = opts[0]
+		opt = normalizeOptions(opts[0])
 	}
 
 	// Compile the query to bytecode
@@ -43,6 +46,11 @@ func RunSchema(ctx context.Context, query *gojq.Query, input *oas3.Schema, opts 
 // ExecSchema executes compiled jq bytecode symbolically on an input schema.
 // This is the core execution function - Phase 2 implementation.
 func ExecSchema(ctx context.Context, code *gojq.Code, input *oas3.Schema, opts SchemaExecOptions) (*SchemaExecResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	opts = normalizeOptions(opts)
+
 	// Validate input
 	if err := validateSchema(input); err != nil {
 		return nil, fmt.Errorf("invalid input schema: %w", err)

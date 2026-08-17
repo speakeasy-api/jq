@@ -157,7 +157,28 @@ func resolvedLeft(js *oas3.JSONSchema[oas3.Referenceable]) *oas3.Schema {
 			return s
 		}
 	}
+	if value, ok := resolvedBooleanSchema(js); ok {
+		if value {
+			return Top()
+		}
+		return Bottom()
+	}
 	return js.Left
+}
+
+func resolvedBooleanSchema(js *oas3.JSONSchema[oas3.Referenceable]) (bool, bool) {
+	if js == nil {
+		return false, false
+	}
+	if resolved := js.GetResolvedSchema(); resolved != nil {
+		if value := resolved.GetRight(); value != nil {
+			return *value, true
+		}
+	}
+	if js.Right != nil {
+		return *js.Right, true
+	}
+	return false, false
 }
 
 // dispatchType returns the type used to dispatch navigation (property access,
@@ -179,6 +200,12 @@ func (env *schemaEnv) dispatchType(s *oas3.Schema) string {
 func derefJSONSchema(ctx context.Context, js *oas3.JSONSchema[oas3.Referenceable]) (*oas3.Schema, bool) {
 	if js == nil {
 		return nil, false
+	}
+	if value, ok := resolvedBooleanSchema(js); ok {
+		if value {
+			return Top(), true
+		}
+		return Bottom(), true
 	}
 
 	// 1) Try GetResolvedSchema() first (handles $refs after ResolveAllReferences).
@@ -245,8 +272,8 @@ const (
 type normCtx struct {
 	inProgress map[*oas3.Schema]struct{}     // Cycle detection: schemas currently being processed
 	memo       map[*oas3.Schema]*oas3.Schema // Memoization for DAG sharing
-	depth      int                            // Current recursion depth
-	maxDepth   int                            // Maximum depth guard
+	depth      int                           // Current recursion depth
+	maxDepth   int                           // Maximum depth guard
 }
 
 func newNormCtx() *normCtx {
@@ -336,6 +363,14 @@ func collapseAllOfCtx(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, e
 	// Extract and dereference all allOf subschemas ($refs followed via resolvedLeft)
 	subschemas := make([]*oas3.Schema, 0, len(schema.AllOf))
 	for _, schemaOrRef := range schema.AllOf {
+		if value, ok := resolvedBooleanSchema(schemaOrRef); ok {
+			if !value {
+				result := Bottom()
+				nctx.memo[schema] = result
+				return result, nil
+			}
+			continue // true is the identity for conjunction
+		}
 		if left := resolvedLeft(schemaOrRef); left != nil {
 			// Recursively collapse the subschema
 			collapsed, err := collapseAllOfCtx(ctx, left)
@@ -1174,7 +1209,9 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		if len(worklist.states) >= mergeThreshold {
 			frontier := make([]*execState, 0, len(worklist.states))
 			for !worklist.isEmpty() {
-				frontier = append(frontier, worklist.pop())
+				candidate := worklist.pop()
+				candidate.applyForkUpdates()
+				frontier = append(frontier, candidate)
 			}
 			frontier = env.mergeFrontierByPC(frontier)
 			for _, s := range frontier {
@@ -1188,6 +1225,7 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 			// Worklist empty (shouldn't happen but guard against it)
 			break
 		}
+		state.applyForkUpdates()
 
 		// Check if we've seen this state (memoization) — currently disabled (see code comments)
 		_ = worklist
@@ -1360,7 +1398,6 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 	}, nil
 }
 
-
 // sortedAccumKeys returns the keys of an accumulator map in sorted order.
 // Accumulator merging, tagging, and redirect selection MUST iterate
 // deterministically: several of these loops are first-wins or mutate shared
@@ -1430,6 +1467,9 @@ func mergeTwoAccumulatorSets(
 	// Union values for overlapping keys
 	for k, v := range accumB {
 		if existing, ok := mergedAccum[k]; ok {
+			if existing == v {
+				continue
+			}
 			// Union array items if both are arrays
 			if getType(existing) == "array" && getType(v) == "array" {
 				var existingItems, vItems *oas3.Schema
@@ -1910,7 +1950,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 							env.logger.Debugf("opStore: var='%s', accumKey=%s - storing canonical instead of stale (valEmpty=%v, canonEmpty=%v, canonHasItems=%v, itemType=%s)",
 								key, accumKey, valEmpty, canonEmpty, canonHasItems, itemType)
 						}
-						finalVal = canonical  // Store canonical, not stale reference!
+						finalVal = canonical // Store canonical, not stale reference!
 					}
 				}
 			}
@@ -2143,8 +2183,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		return env.execFork(state, c)
 
 	case opBacktrack:
-		// Backtrack terminates this path (return no successors)
-		return []*execState{}, nil
+		return nil, nil
 
 	case opJump:
 		// Unconditional jump
@@ -2223,6 +2262,10 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		errorState := state.clone()
 		errorState.pc = targetPC
 		errorState.lineage = state.lineage + ".E" // Error branch
+		if len(errorState.stack) > 0 {
+			errorState.pop()
+		}
+		errorState.push(env.NewTopWithCause("value caught by try/catch is unknown"))
 
 		return []*execState{continueState, errorState}, nil
 
@@ -2251,8 +2294,12 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		return []*execState{next}, nil
 
 	case opForkLabel:
-		// Label for fork operations - used in some control flow
-		// For schema execution, treat as no-op
+		key := fmt.Sprintf("%v", c.value)
+		next.storeVar(key, ConstString("jq-label:"+key))
+		next.labels = append(next.labels, labelContinuation{
+			key:       key,
+			forkDepth: len(next.forks),
+		})
 		return []*execState{next}, nil
 
 	// Unsupported opcodes
@@ -2472,7 +2519,7 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 		// slice may be shorter (or empty) than the source — a lower bound on
 		// length does not survive slicing.
 		if isSliceIndex(indexKey) {
-			sliced := cloneSchema(base)
+			sliced := eraseArrayPositions(base, env.opts)
 			sliced.MinItems = nil
 			result = sliced
 		} else {
@@ -2506,10 +2553,11 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, error) {
 	// PATH MODE: Add wildcard segment for symbolic iteration
 	if state.pathMode {
-		// Symbolic iteration: .[] means "any index"
-		// Represent as a wildcard in the path
+		// Unlike an unknown single index, .[] selects every element. Preserve
+		// that distinction so update assignments can replace the item schema
+		// without adding padding or retaining the old item type.
 		state.currentPath = append(state.currentPath, PathSegment{
-			Key:        PathWildcard{},
+			Key:        PathAllElements{},
 			IsSymbolic: true,
 		})
 		// Don't pop in path mode - we're building a path, not evaluating
@@ -2549,25 +2597,15 @@ func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, 
 			return []*execState{}, nil
 		}
 
-		if val.Items != nil {
-			// Try to dereference items schema (handles both inline and $ref)
-			if schema, ok := derefJSONSchema(newCollapseContext(), val.Items); ok {
-				itemSchema = schema
-			} else {
-				// Unresolved reference - widen conservatively with cause
-				itemSchema = env.NewTopWithCause("iter: failed to resolve array.items (GetResolvedSchema().Left==nil)")
-				if env.opts.EnableWarnings {
-					env.addWarning("iter: failed to resolve array.items schema; widening to Top")
-				}
-			}
-		} else {
-			// Items field not set at all - unconstrained array, items can be any type
-			itemSchema = Top()
-		}
+		itemSchema = arrayElementUnion(val, env.opts)
 	case "object":
 		itemSchema = unionAllObjectValues(val, env.opts)
 	default:
-		itemSchema = Bottom()
+		if baseType == "" {
+			itemSchema = env.NewTopWithCause("iteration over unknown type")
+		} else {
+			itemSchema = Bottom()
+		}
 	}
 
 	// Don't push Bottom - it should terminate paths earlier
@@ -2984,21 +3022,84 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 func (env *schemaEnv) execFork(state *execState, c *codeOp) ([]*execState, error) {
 	// Fork to target PC
 	targetPC := c.value.(int)
+	control := &forkControl{}
 
 	// Create two states: one continues, one jumps to target
 	continueState := state.clone()
 	continueState.pc++
 	continueState.lineage = state.lineage + ".C" // Continue branch
+	continueState.forks = append(continueState.forks, forkContinuation{
+		targetPC:     targetPC,
+		stack:        append([]SValue(nil), state.stack...),
+		scopeDepth:   len(state.scopes),
+		scopes:       cloneScopeMaps(state.scopes),
+		callstackLen: len(state.callstack),
+		callstack:    append([]int(nil), state.callstack...),
+		depth:        state.depth,
+		pathMode:     state.pathMode,
+		currentPath:  append([]PathSegment(nil), state.currentPath...),
+		control:      control,
+	})
 
 	forkState := state.clone()
 	forkState.pc = targetPC
 	forkState.depth++
 	forkState.lineage = state.lineage + ".F" // Fork branch
+	forkState.forkUpdates = append(forkState.forkUpdates, control)
 
 	// Return fork target FIRST, continue SECOND
 	// This ensures LIFO worklist processes continue state first,
 	// which is critical for accumulator mutations (e.g., path collection)
 	return []*execState{forkState, continueState}, nil
+}
+
+func (env *schemaEnv) execBreak(state *execState, token *oas3.Schema) ([]*execState, error) {
+	value, ok := extractConstString(token)
+	if !ok || !strings.HasPrefix(value, "jq-label:") {
+		return []*execState{}, nil
+	}
+	key := strings.TrimPrefix(value, "jq-label:")
+	labelIndex := -1
+	for i := len(state.labels) - 1; i >= 0; i-- {
+		if state.labels[i].key == key {
+			labelIndex = i
+			break
+		}
+	}
+	if labelIndex < 0 {
+		return []*execState{}, nil
+	}
+
+	label := state.labels[labelIndex]
+	if label.forkDepth == 0 {
+		return []*execState{}, nil
+	}
+	if label.forkDepth > len(state.forks) {
+		return []*execState{}, nil
+	}
+	forkIndex := label.forkDepth - 1
+	fork := state.forks[forkIndex]
+	restoreForkContinuation(state, fork)
+	state.forks = state.forks[:forkIndex]
+	state.labels = state.labels[:labelIndex]
+	state.lineage += ".B"
+	return []*execState{state}, nil
+}
+
+func restoreForkContinuation(state *execState, fork forkContinuation) {
+	state.pc = fork.targetPC
+	state.stack = append([]SValue(nil), fork.stack...)
+	currentScopes := state.scopes
+	state.scopes = cloneScopeMaps(fork.scopes)
+	for i := 0; i < len(currentScopes) && i < len(state.scopes); i++ {
+		for key, value := range currentScopes[i] {
+			state.scopes[i][key] = value
+		}
+	}
+	state.callstack = append([]int(nil), fork.callstack...)
+	state.depth = fork.depth
+	state.pathMode = fork.pathMode
+	state.currentPath = append([]PathSegment(nil), fork.currentPath...)
 }
 
 // execForkAlt handles alternative fork (// operator).
@@ -3079,6 +3180,9 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 			}
 			args[i] = state.pop()
 		}
+		if funcName == "_break" {
+			return env.execBreak(state, input)
+		}
 
 		// DEBUG: Trace builtin calls
 		if env.opts.EnableWarnings && funcName == "delpaths" {
@@ -3102,6 +3206,14 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 		// Rebind accumulator variables for setpath to ensure pointer identity is updated
 		if (funcName == "setpath" || funcName == "_setpath") && len(results) == 1 && results[0] != nil {
 			refineVarRefs(state, input, results[0])
+			// Dynamic-key reducers update an executor-owned object accumulator.
+			// Carry that copy-on-write AP change to queued reduce continuations;
+			// ordinary path updates remain functional and must not rewrite sibling
+			// states that still observe the original input.
+			if getType(input) == "object" && getType(results[0]) == "object" &&
+				input.AdditionalProperties != results[0].AdditionalProperties {
+				refineForkRefs(state, input, results[0])
+			}
 			if env.opts.EnableWarnings {
 				env.logger.Debugf("execCallMulti: rebinding vars after %s (old ptr=%p, new ptr=%p)",
 					funcName, input, results[0])
@@ -3247,9 +3359,12 @@ func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 
 	if len(schemas) == 0 {
 		if opts.EnableWarnings {
-			opts.debugf("unionAllObjectValues: no schemas found -> Top")
+			opts.debugf("unionAllObjectValues: no schemas found")
 		}
-		return Top() // Unknown object values
+		if obj.PatternProperties != nil && obj.PatternProperties.Len() > 0 {
+			return Top()
+		}
+		return Bottom() // closed object with no possible values
 	}
 
 	result := Union(schemas, opts)
@@ -3353,7 +3468,9 @@ func buildPathSchemaFromSegments(segments []PathSegment) *oas3.Schema {
 
 	prefixItems := make([]*oas3.Schema, len(segments))
 	for i, seg := range segments {
-		if seg.IsSymbolic {
+		if _, ok := seg.Key.(PathAllElements); ok {
+			prefixItems[i] = allElementsPathSchema()
+		} else if seg.IsSymbolic {
 			// Wildcard: represent as integer type (any index)
 			prefixItems[i] = IntegerType()
 		} else if s, ok := seg.Key.(string); ok {
@@ -3737,8 +3854,6 @@ func (env *schemaEnv) materializeArrays(schema *oas3.Schema, accum map[string]*o
 	return schema
 }
 
-
-
 // ============================================================================
 // State Merging for Branch Explosion Control
 // ============================================================================
@@ -4068,12 +4183,15 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			}
 		}
 
+		mergedForks := joinForkContinuations(a.forks, b.forks)
 		merged := &execState{
 			pc:        a.pc,
 			stack:     make([]SValue, len(a.stack)),
 			scopes:    make([]map[string]*oas3.Schema, len(a.scopes)),
 			depth:     maxInt(a.depth, b.depth),
 			callstack: a.callstack,
+			forks:     mergedForks,
+			labels:    joinLabelContinuations(a.labels, b.labels, len(mergedForks)),
 			id:        a.id,
 			parentID:  a.parentID,
 			lineage:   a.lineage,
@@ -4082,9 +4200,9 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			schemaToAlloc: mergedSchemaToAlloc,
 			allocCounter:  a.allocCounter,
 			// Theory 10: Hybrid Origin-Lattice
-			allocOrigin:      a.allocOrigin,      // SHARED (use from either)
-			allocCardinality: mergedCardinality,  // Merged with lattice join
-			dsu:              a.dsu,              // SHARED (use from either)
+			allocOrigin:      a.allocOrigin,     // SHARED (use from either)
+			allocCardinality: mergedCardinality, // Merged with lattice join
+			dsu:              a.dsu,             // SHARED (use from either)
 		}
 
 		// Merge var history and intent
@@ -4397,12 +4515,15 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 	}
 
 	// States have same accum map - normal join
+	mergedForks := joinForkContinuations(a.forks, b.forks)
 	merged := &execState{
 		pc:        a.pc,
 		stack:     make([]SValue, len(a.stack)),
 		scopes:    make([]map[string]*oas3.Schema, len(a.scopes)),
 		depth:     maxInt(a.depth, b.depth),
 		callstack: a.callstack, // Assume same callstack in partition
+		forks:     mergedForks,
+		labels:    joinLabelContinuations(a.labels, b.labels, len(mergedForks)),
 		id:        a.id,
 		parentID:  a.parentID,
 		lineage:   a.lineage,
@@ -4748,7 +4869,6 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 	return merged
 }
 
-
 // joinTwoSchemas performs schema-level join (LUB) using Union.
 func joinTwoSchemas(a, b *oas3.Schema) *oas3.Schema {
 	// CRITICAL FIX: If pointers are identical, return immediately to preserve pointer identity
@@ -4820,7 +4940,78 @@ func shapeKey(s *execState, relaxScopeKeys bool) string {
 	// Callstack
 	buf.WriteString("callstack:")
 	buf.WriteString(intSliceKey(s.callstack))
+	buf.WriteString(";labels:")
+	labelForkDepth := 0
+	for _, label := range s.labels {
+		buf.WriteString(label.key)
+		buf.WriteByte('/')
+		buf.WriteString(strconv.Itoa(label.forkDepth))
+		if label.forkDepth > labelForkDepth {
+			labelForkDepth = label.forkDepth
+		}
+		buf.WriteByte(';')
+	}
+	buf.WriteString("label-forks:")
+	for i := 0; i < labelForkDepth && i < len(s.forks); i++ {
+		fork := s.forks[i]
+		buf.WriteString(strconv.Itoa(fork.targetPC))
+		buf.WriteByte(':')
+		buf.WriteString(strconv.Itoa(len(fork.stack)))
+		buf.WriteByte(':')
+		buf.WriteString(strconv.Itoa(fork.scopeDepth))
+		buf.WriteByte(':')
+		buf.WriteString(strconv.Itoa(fork.callstackLen))
+		buf.WriteByte(':')
+		buf.WriteString(intSliceKey(fork.callstack))
+		buf.WriteByte(':')
+		buf.WriteString(strconv.Itoa(fork.depth))
+		buf.WriteByte(':')
+		buf.WriteString(strconv.FormatBool(fork.pathMode))
+		buf.WriteByte(':')
+		buf.WriteString(pathSegmentsKey(fork.currentPath))
+		buf.WriteByte(',')
+	}
 
+	return buf.String()
+}
+
+func pathSegmentsKey(segments []PathSegment) string {
+	var buf strings.Builder
+	buf.WriteByte('[')
+	for _, segment := range segments {
+		switch key := segment.Key.(type) {
+		case string:
+			buf.WriteString("s:")
+			buf.WriteString(strconv.Quote(key))
+		case int:
+			buf.WriteString("i:")
+			buf.WriteString(strconv.Itoa(key))
+		case PathWildcard:
+			buf.WriteString("wildcard")
+		case PathAllElements:
+			buf.WriteString("all")
+		case map[string]any:
+			keys := make([]string, 0, len(key))
+			for name := range key {
+				keys = append(keys, name)
+			}
+			sort.Strings(keys)
+			buf.WriteString("map:")
+			for _, name := range keys {
+				buf.WriteString(name)
+				buf.WriteByte('=')
+				buf.WriteString(fmt.Sprintf("%#v", key[name]))
+				buf.WriteByte('/')
+			}
+		default:
+			buf.WriteString(fmt.Sprintf("%T:%v", key, key))
+		}
+		if segment.IsSymbolic {
+			buf.WriteByte('*')
+		}
+		buf.WriteByte(',')
+	}
+	buf.WriteByte(']')
 	return buf.String()
 }
 

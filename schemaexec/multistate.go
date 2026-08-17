@@ -1,20 +1,25 @@
 package schemaexec
 
 import (
+	"reflect"
+
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 )
 
 // execState represents a single execution state in the multi-state VM.
 // jq's backtracking semantics require tracking multiple possible execution paths.
 type execState struct {
-	pc        int                          // Program counter
-	stack     []SValue                     // Schema stack (copy for this state)
-	scopes    []map[string]*oas3.Schema    // Scope frames (copy for this state)
-	depth     int                          // Recursion depth (for limiting)
-	accum         map[string]*oas3.Schema // Shared: allocID → canonical array
-	schemaToAlloc map[*oas3.Schema]string // Shared: schema pointer → allocID (for opAppend)
-	allocCounter  *int                     // Shared: Monotonic counter for unique allocation IDs
-	callstack     []int                    // Per-state: Return address stack for closures
+	pc            int                       // Program counter
+	stack         []SValue                  // Schema stack (copy for this state)
+	scopes        []map[string]*oas3.Schema // Scope frames (copy for this state)
+	depth         int                       // Recursion depth (for limiting)
+	accum         map[string]*oas3.Schema   // Shared: allocID → canonical array
+	schemaToAlloc map[*oas3.Schema]string   // Shared: schema pointer → allocID (for opAppend)
+	allocCounter  *int                      // Shared: Monotonic counter for unique allocation IDs
+	callstack     []int                     // Per-state: Return address stack for closures
+	forks         []forkContinuation        // Per-state: pending backtracking continuations
+	labels        []labelContinuation       // Per-state: active label boundaries
+	forkUpdates   []*forkControl            // Updates shared with eager fork alternatives
 
 	// Path collection (for del/getpath/setpath operations)
 	pathMode    bool          // Are we collecting a path (between opPathBegin/opPathEnd)?
@@ -32,9 +37,9 @@ type execState struct {
 	schemaFPIntent   map[*oas3.Schema]string        // Per-state: schema pointer → items fingerprint
 
 	// Theory 10: Hybrid Origin-Lattice
-	allocOrigin      map[string]*AllocOrigin       // SHARED: allocID -> origin (where it was created)
-	allocCardinality map[string]*ArrayCardinality  // SHARED: allocID -> cardinality bounds
-	dsu              *DSU                          // SHARED: Disjoint Set Union for allocID equivalence
+	allocOrigin      map[string]*AllocOrigin      // SHARED: allocID -> origin (where it was created)
+	allocCardinality map[string]*ArrayCardinality // SHARED: allocID -> cardinality bounds
+	dsu              *DSU                         // SHARED: Disjoint Set Union for allocID equivalence
 }
 
 // AllocOrigin tracks where an allocID was created in the AST/execution
@@ -153,12 +158,48 @@ func (d *DSU) Union(allocID1, allocID2 string) {
 
 // PathSegment represents one segment of a path expression
 type PathSegment struct {
-	Key        interface{} // string (property), int (array index), or PathWildcard (symbolic)
-	IsSymbolic bool        // True if this is a wildcard from .[] iteration
+	Key        interface{} // string, int, PathWildcard, or PathAllElements
+	IsSymbolic bool        // True for unknown-index and all-elements segments
 }
 
-// PathWildcard represents a symbolic array index (from .[])
+// PathWildcard represents an unknown single array index or slice path.
 type PathWildcard struct{}
+
+// PathAllElements represents every array index selected by .[] in path mode.
+type PathAllElements struct{}
+
+// forkContinuation records the state restored when control backtracks through
+// an opFork. Schema pointers are shared, but the stack slice itself is copied.
+type forkContinuation struct {
+	targetPC     int
+	stack        []SValue
+	scopeDepth   int
+	scopes       []map[string]*oas3.Schema
+	callstackLen int
+	callstack    []int
+	depth        int
+	pathMode     bool
+	currentPath  []PathSegment
+	control      *forkControl
+}
+
+// forkControl carries copy-on-write substitutions from a fork's continue path
+// to its already-enqueued eager alternative.
+type forkControl struct {
+	replacements []schemaReplacement
+}
+
+type schemaReplacement struct {
+	old *oas3.Schema
+	new *oas3.Schema
+}
+
+// labelContinuation identifies which pending fork a labeled break must unwind
+// to. The deterministic compiler key is also stored in the label variable.
+type labelContinuation struct {
+	key       string
+	forkDepth int
+}
 
 // clone creates a deep copy of this state for forking.
 func (s *execState) clone() *execState {
@@ -181,6 +222,9 @@ func (s *execState) clone() *execState {
 
 	callstackCopy := make([]int, len(s.callstack))
 	copy(callstackCopy, s.callstack)
+	forksCopy := cloneForkContinuations(s.forks)
+	labelsCopy := append([]labelContinuation(nil), s.labels...)
+	forkUpdatesCopy := append([]*forkControl(nil), s.forkUpdates...)
 
 	// Clone currentPath for path collection
 	pathCopy := make([]PathSegment, len(s.currentPath))
@@ -205,19 +249,22 @@ func (s *execState) clone() *execState {
 	}
 
 	return &execState{
-		pc:         s.pc,
-		stack:      stackCopy,
-		scopes:     scopesCopy,
-		depth:      s.depth,
-		accum:         s.accum,         // SHARED
-		schemaToAlloc: s.schemaToAlloc, // SHARED
-		allocCounter:  s.allocCounter,  // SHARED pointer
-		callstack:     callstackCopy,
-		pathMode:      s.pathMode,
-		currentPath:   pathCopy,
-		id:            s.id,       // Clone inherits ID initially, will be reassigned
-		parentID:      s.parentID, // Clone inherits parent
-		lineage:       s.lineage,  // Clone inherits lineage, will be extended
+		pc:               s.pc,
+		stack:            stackCopy,
+		scopes:           scopesCopy,
+		depth:            s.depth,
+		accum:            s.accum,         // SHARED
+		schemaToAlloc:    s.schemaToAlloc, // SHARED
+		allocCounter:     s.allocCounter,  // SHARED pointer
+		callstack:        callstackCopy,
+		forks:            forksCopy,
+		labels:           labelsCopy,
+		forkUpdates:      forkUpdatesCopy,
+		pathMode:         s.pathMode,
+		currentPath:      pathCopy,
+		id:               s.id,       // Clone inherits ID initially, will be reassigned
+		parentID:         s.parentID, // Clone inherits parent
+		lineage:          s.lineage,  // Clone inherits lineage, will be extended
 		varAllocHistory:  histCopy,
 		varDesiredItemFP: fpCopy,
 		allocDesiredFP:   s.allocDesiredFP, // SHARED
@@ -227,6 +274,81 @@ func (s *execState) clone() *execState {
 		allocCardinality: s.allocCardinality, // SHARED
 		dsu:              s.dsu,              // SHARED
 	}
+}
+
+func cloneForkContinuations(forks []forkContinuation) []forkContinuation {
+	cloned := make([]forkContinuation, len(forks))
+	for i, fork := range forks {
+		cloned[i] = fork
+		cloned[i].stack = append([]SValue(nil), fork.stack...)
+		cloned[i].scopes = cloneScopeMaps(fork.scopes)
+		cloned[i].callstack = append([]int(nil), fork.callstack...)
+		cloned[i].currentPath = append([]PathSegment(nil), fork.currentPath...)
+	}
+	return cloned
+}
+
+func joinForkContinuations(a, b []forkContinuation) []forkContinuation {
+	limit := min(len(a), len(b))
+	joined := make([]forkContinuation, 0, limit)
+	for i := 0; i < limit; i++ {
+		if !compatibleForkContinuations(a[i], b[i]) {
+			break
+		}
+		fork := cloneForkContinuations(a[i : i+1])[0]
+		if fork.control != b[i].control {
+			fork.control = nil
+		}
+		for j := range fork.stack {
+			fork.stack[j].Schema = joinTwoSchemas(fork.stack[j].Schema, b[i].stack[j].Schema)
+		}
+		for j := range fork.scopes {
+			for key, bValue := range b[i].scopes[j] {
+				if aValue, ok := fork.scopes[j][key]; ok {
+					fork.scopes[j][key] = joinTwoSchemas(aValue, bValue)
+				} else {
+					fork.scopes[j][key] = bValue
+				}
+			}
+		}
+		joined = append(joined, fork)
+	}
+	return joined
+}
+
+func compatibleForkContinuations(a, b forkContinuation) bool {
+	return a.targetPC == b.targetPC &&
+		len(a.stack) == len(b.stack) &&
+		a.scopeDepth == b.scopeDepth &&
+		a.callstackLen == b.callstackLen &&
+		a.depth == b.depth &&
+		a.pathMode == b.pathMode &&
+		reflect.DeepEqual(a.callstack, b.callstack) &&
+		reflect.DeepEqual(a.currentPath, b.currentPath)
+}
+
+func cloneScopeMaps(scopes []map[string]*oas3.Schema) []map[string]*oas3.Schema {
+	cloned := make([]map[string]*oas3.Schema, len(scopes))
+	for i, scope := range scopes {
+		cloned[i] = make(map[string]*oas3.Schema, len(scope))
+		for key, value := range scope {
+			cloned[i][key] = value
+		}
+	}
+	return cloned
+}
+
+func joinLabelContinuations(a, b []labelContinuation, joinedForkDepth int) []labelContinuation {
+	limit := min(len(a), len(b))
+	joined := make([]labelContinuation, 0, limit)
+	for i := 0; i < limit; i++ {
+		if a[i].key != b[i].key || a[i].forkDepth != b[i].forkDepth ||
+			a[i].forkDepth > joinedForkDepth {
+			break
+		}
+		joined = append(joined, a[i])
+	}
+	return joined
 }
 
 // recordSchemaFP records intended items fingerprint for a schema pointer
@@ -337,17 +459,17 @@ func (s *execState) loadVar(key string) (*oas3.Schema, bool) {
 func newExecState(input *oas3.Schema) *execState {
 	counter := 0
 	state := &execState{
-		pc:           0,
-		stack:        make([]SValue, 0, 16),
-		scopes:       make([]map[string]*oas3.Schema, 0, 4),
-		depth:        0,
-		accum:         make(map[string]*oas3.Schema), // Shared accumulator
-		schemaToAlloc: make(map[*oas3.Schema]string), // Schema → allocID mapping
-		allocCounter:  &counter,                       // Shared counter (pointer)
-		callstack:     make([]int, 0, 8),
-		id:            0,    // Initial state ID
-		parentID:      0,    // Root has no parent
-		lineage:       "0",  // Root lineage
+		pc:               0,
+		stack:            make([]SValue, 0, 16),
+		scopes:           make([]map[string]*oas3.Schema, 0, 4),
+		depth:            0,
+		accum:            make(map[string]*oas3.Schema), // Shared accumulator
+		schemaToAlloc:    make(map[*oas3.Schema]string), // Schema → allocID mapping
+		allocCounter:     &counter,                      // Shared counter (pointer)
+		callstack:        make([]int, 0, 8),
+		id:               0,   // Initial state ID
+		parentID:         0,   // Root has no parent
+		lineage:          "0", // Root lineage
 		varAllocHistory:  make(map[string]map[string]struct{}),
 		varDesiredItemFP: make(map[string]string),
 		allocDesiredFP:   make(map[string]string), // Shared
@@ -398,5 +520,3 @@ func (w *stateWorklist) pop() *execState {
 func (w *stateWorklist) isEmpty() bool {
 	return len(w.states) == 0
 }
-
-
