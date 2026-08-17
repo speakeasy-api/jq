@@ -87,10 +87,13 @@ components:
       properties:
         id:
           type: integer
+          nullable: true
         name:
           type: string
+          nullable: true
         status:
           type: integer
+          nullable: true
       required:
         - id
         - name
@@ -102,6 +105,7 @@ components:
       properties:
         name:
           type: string
+          nullable: true
         total:
           type: number
       required:
