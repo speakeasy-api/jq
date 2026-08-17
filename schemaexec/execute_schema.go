@@ -2467,6 +2467,11 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 		} else {
 			result = Top()
 		}
+	case "null":
+		// jq indexes null without erroring: `null | .foo`, `null | .[0]`,
+		// and `null | .[a:b]` all yield null. Widening here to Top loses
+		// the null-ness that `//` and truthiness checks rely on.
+		result = ConstNull()
 	case "array":
 		// Array slicing: .[start:end] returns the same item type, but the
 		// slice may be shorter (or empty) than the source — a lower bound on
