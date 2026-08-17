@@ -2579,6 +2579,16 @@ func stripNullUnion(s *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		return nil
 	}
 
+	// {type: T, nullable: true} (the union nullable optimization): the
+	// non-null refinement is the same schema without the nullable flag.
+	// Without this, `a // b` and truthiness checks cannot strip the null
+	// alternative from nullable-optimized values.
+	if s.Nullable != nil && *s.Nullable {
+		base := cloneSchema(s)
+		base.Nullable = nil
+		return base
+	}
+
 	// anyOf
 	if len(s.AnyOf) > 0 {
 		nonNulls := make([]*oas3.Schema, 0, len(s.AnyOf))
