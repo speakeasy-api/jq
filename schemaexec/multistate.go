@@ -39,8 +39,20 @@ type execState struct {
 
 // AllocOrigin tracks where an allocID was created in the AST/execution
 type AllocOrigin struct {
-	PC      int    // Program counter where allocation occurred
-	Context string // Semantic context (e.g., "reduce_accumulator", "map_accumulator")
+	PC       int    // Program counter where allocation occurred
+	Context  string // Semantic context (e.g., "reduce_accumulator", "map_accumulator")
+	CallSite int    // Return address of the enclosing call frame (-1 at top level)
+}
+
+// sameOrigin reports whether two allocation origins are equivalent.
+// The CallSite discriminator matters: two invocations of the same library
+// function (e.g. two separate map() calls in one pipeline) allocate at the
+// SAME internal PC — without the callsite, their accumulators would be
+// DSU-unioned and their item types conflated (e.g. an array<number> from
+// map(.price) leaking into the items of a later map({...})). Loop iterations
+// within one call share the callsite and still merge, as intended.
+func sameOrigin(a, b *AllocOrigin) bool {
+	return a != nil && b != nil && a.PC == b.PC && a.Context == b.Context && a.CallSite == b.CallSite
 }
 
 // ArrayCardinality tracks bounds on array size for lattice-based merging

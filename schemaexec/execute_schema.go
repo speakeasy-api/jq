@@ -1998,8 +1998,8 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 								continue
 							}
 							prevOrigin := next.allocOrigin[priorID]
-							if prevOrigin != nil && currOrigin != nil &&
-								prevOrigin.PC == currOrigin.PC && prevOrigin.Context == currOrigin.Context {
+							if sameOrigin(prevOrigin, currOrigin) &&
+								accumulationCompatible(next.accum[priorID], next.accum[currID]) {
 
 								// Union classes
 								env.logger.Debugf("DSU opStore: var=%s union %s with %s (same origin PC=%d, ctx=%s)",
@@ -2654,6 +2654,34 @@ func (env *schemaEnv) execObjectMulti(state *execState, c *codeOp) ([]*execState
 	return []*execState{state}, nil
 }
 
+// accumulationCompatible reports whether rebinding a variable from array
+// `prior` to array `curr` looks like genuine ACCUMULATION of the same logical
+// array (loop iterations: `. + [x]` always folds the prior items into the new
+// array, so one side's items subsume the other's) rather than a SEPARATE
+// construction reusing the same bytecode temp (e.g. two map() calls in one
+// pipeline, whose item types are unrelated). Unioning the latter conflates
+// distinct arrays' item types.
+func accumulationCompatible(prior, curr *oas3.Schema) bool {
+	if prior == nil || curr == nil {
+		return true
+	}
+	pItems := resolvedLeft(prior.Items)
+	cItems := resolvedLeft(curr.Items)
+	currFreshEmpty := curr.MaxItems != nil && *curr.MaxItems == 0 && cItems == nil
+	if currFreshEmpty && pItems != nil {
+		// A brand-new empty array rebinding over a finished, populated array
+		// is a NEW construction starting from scratch, not an accumulation
+		// step (loop steps rebind with the grown concat result, never with a
+		// fresh empty). Merging here would leak the finished array's items
+		// into the new construction.
+		return false
+	}
+	if pItems == nil || cItems == nil {
+		return true // otherwise unconstrained: nothing to conflate
+	}
+	return isSubschemaOf(pItems, cItems) || isSubschemaOf(cItems, pItems)
+}
+
 // execAppendMulti handles array element appending in multi-state mode.
 // This is used for array construction: [.[] | f]
 // Each state has its own accumulator map. Merging happens via lattice join when paths converge.
@@ -2662,13 +2690,20 @@ func (state *execState) allocateArrayWithOrigin(pc int, context string) string {
 	*state.allocCounter++
 	allocID := fmt.Sprintf("alloc%d", *state.allocCounter)
 
-	// Track origin for DSU equivalence
+	// Track origin for DSU equivalence. The callsite (return address of the
+	// enclosing frame) distinguishes allocations made by different
+	// invocations of the same library function.
+	callSite := -1
+	if len(state.callstack) > 0 {
+		callSite = state.callstack[len(state.callstack)-1]
+	}
 	if state.allocOrigin == nil {
 		state.allocOrigin = make(map[string]*AllocOrigin)
 	}
 	state.allocOrigin[allocID] = &AllocOrigin{
-		PC:      pc,
-		Context: context,
+		PC:       pc,
+		Context:  context,
+		CallSite: callSite,
 	}
 
 	// Initialize cardinality as empty (MinItems=0, MaxItems=0)
