@@ -11,10 +11,10 @@ import (
 	"github.com/speakeasy-api/openapi/sequencedmap"
 )
 
-// These tests encode adversarial soundness probes: cases where the executor
-// used to silently NARROW the output (discarding possible values), which is
-// forbidden by the over-approximation contract and would let the Analyze API
-// claim Proven (or ProvenBroken) incorrectly.
+// These tests encode soundness regressions: cases where the executor used to
+// silently NARROW the output (discarding possible values), which is forbidden
+// by the over-approximation contract and would let the Analyze API claim
+// Proven (or ProvenBroken) incorrectly.
 
 // TestSoundness_TopDominatesPropertyMerge: merging {x: <unknown>} with
 // {x: "ok"} across branches must NOT narrow x to "ok".
@@ -211,7 +211,7 @@ func TestSoundness_RecursiveMergeTerminates(t *testing.T) {
 	}
 }
 
-// --- Round C probes: each encodes a narrowing found by adversarial review. ---
+// --- Union dedup, subsumption, and merge narrowing ---
 
 // TestSoundness_TopSurvivesDedupAgainstCombinator: Union([oneOf[...], Top])
 // must be Top — dedup fingerprinting must not collide a combinator schema
@@ -436,7 +436,7 @@ func TestSoundness_NullableRewriteSkipsEnums(t *testing.T) {
 	}
 }
 
-// --- Round D probes ---
+// --- Array/item unions and enum subsumption ---
 
 // TestSoundness_UnionItemlessArrayNotNarrowed: Union(array<any>, array<string>)
 // must keep any-typed items.
@@ -549,7 +549,7 @@ func TestSemantics_RawAPMergeKeepsOpen(t *testing.T) {
 	}
 }
 
-// --- Final round probes ---
+// --- Bounds, fingerprints, and merge identities ---
 
 // TestSoundness_ExclusiveBoundSubsumption: Union(number,
 // number{exclusiveMinimum:10}) must not collapse onto the bounded schema.
@@ -659,7 +659,7 @@ func TestSoundness_AnyOfBranchKeepsNullableAndOpenAP(t *testing.T) {
 	}
 }
 
-// --- Round E probes (Analyze-contract violations) ---
+// --- Analyze-contract cases (Proven/ProvenBroken must stay sound) ---
 
 // TestSoundness_AnyOfExclusiveBoundsNotFlattened: anyOf branches with
 // different exclusive bounds must not flatten onto the first branch's bound.
@@ -767,7 +767,7 @@ func TestSoundness_PatternPropertiesNotProvenBroken(t *testing.T) {
 	}
 }
 
-// --- Final contract probes ---
+// --- has/keys/to_entries and object-facet cases ---
 
 // TestSoundness_HasKeysPatternProperties: has()/keys must account for
 // patternProperties-admitted keys.
@@ -828,7 +828,7 @@ func TestSoundness_AppendKeepsNestedArrayItem(t *testing.T) {
 	}
 }
 
-// --- Verdict-round probes ---
+// --- Verdict cases: builtins over arrays, nullable flow, path ops ---
 
 // TestSoundness_KeysToEntriesOnArrays: jq defines keys/to_entries on arrays
 // (index keys); they must not be provably broken.

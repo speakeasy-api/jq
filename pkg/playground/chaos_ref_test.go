@@ -230,6 +230,7 @@ components:
 // Deterministic names:
 //   - If item is a simple string schema: ExternalString
 //   - Otherwise: External<SchemaName><PropOrContext>Item
+//
 // Only local internal $refs are produced. No ref-chains or combinators in this first iteration.
 func externalizeSchemas(doc map[string]any, percent float64, seed int64) (map[string]any, int, error) {
 	if percent < 0 || percent > 1 {

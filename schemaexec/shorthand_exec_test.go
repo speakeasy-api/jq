@@ -10,7 +10,7 @@ import (
 
 func TestExecuteShorthand(t *testing.T) {
 	query, _ := gojq.Parse(`{sku, total: (.price * .quantity)}`)
-	
+
 	inputSchema := BuildObject(map[string]*oas3.Schema{
 		"sku":      StringType(),
 		"price":    NumberType(),

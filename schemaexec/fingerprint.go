@@ -109,12 +109,12 @@ func (fp *Fingerprinter) Reset() {
 
 // canonCtx holds state for a single canonicalization traversal
 type canonCtx struct {
-	inProgress map[*oas3.Schema]int         // Cycle detection: schema → cycle ID
-	nextID     int                          // Next cycle ID to assign
-	localMemo  map[*oas3.Schema][]byte      // Per-call memoization for DAGs
-	excl       map[*oas3.Schema]struct{}    // Exclusions from persistent cache
-	depth      int                          // Current recursion depth
-	maxDepth   int                          // Maximum recursion depth guard
+	inProgress map[*oas3.Schema]int      // Cycle detection: schema → cycle ID
+	nextID     int                       // Next cycle ID to assign
+	localMemo  map[*oas3.Schema][]byte   // Per-call memoization for DAGs
+	excl       map[*oas3.Schema]struct{} // Exclusions from persistent cache
+	depth      int                       // Current recursion depth
+	maxDepth   int                       // Maximum recursion depth guard
 }
 
 func newCanonCtx(maxDepth int, excl map[*oas3.Schema]struct{}) *canonCtx {
@@ -493,7 +493,6 @@ var defaultFingerprinter = NewFingerprinter()
 func FingerprintSchema(s *oas3.Schema) string {
 	return defaultFingerprinter.FingerprintSchema(s)
 }
-
 
 // canonicalizeYAMLNode is moved here from multistate.go for reuse
 // It converts a yaml.Node to a canonical string for fingerprinting
