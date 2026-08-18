@@ -191,6 +191,50 @@ func TestAsciiCase(t *testing.T) {
 	})
 }
 
+func TestASCIIcaseConversionLeavesNonASCIICharactersUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		expr string
+		want string
+	}{
+		{name: "downcase", expr: `"ÄA" | ascii_downcase`, want: "Äa"},
+		{name: "upcase", expr: `"äa" | ascii_upcase`, want: "äA"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := analyzeExpr(t, tc.expr, Top())
+			if a.Verdict != VerdictProven {
+				t.Fatalf("verdict = %s, want proven", a.Verdict)
+			}
+			if !schemaAdmitsString(a.Output, tc.want) {
+				t.Fatalf("output must admit %q: %s", tc.want, schemaTypeSummary(a.Output, 2))
+			}
+		})
+	}
+}
+
+func TestRegexReplacementConstFoldingMatchesJQSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		expr string
+		want string
+	}{
+		{name: "sub first match", expr: `"abab" | sub("a"; "x")`, want: "xbab"},
+		{name: "gsub all matches", expr: `"abab" | gsub("a"; "x")`, want: "xbxb"},
+		{name: "replacement is literal", expr: `"a" | sub("a"; "$1")`, want: "$1"},
+		{name: "sub global flag", expr: `"abab" | sub("a"; "x"; "g")`, want: "xbxb"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := analyzeExpr(t, tc.expr, Top())
+			if a.Verdict != VerdictProven {
+				t.Fatalf("verdict = %s, want proven (causes: %v)", a.Verdict, a.Causes)
+			}
+			if !schemaAdmitsString(a.Output, tc.want) {
+				t.Fatalf("output must admit %q: %s", tc.want, schemaTypeSummary(a.Output, 2))
+			}
+		})
+	}
+}
+
 // TestLtrimRtrim tests prefix/suffix removal
 func TestLtrimRtrim(t *testing.T) {
 	ctx := context.Background()

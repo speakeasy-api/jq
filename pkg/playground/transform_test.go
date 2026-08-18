@@ -87,10 +87,13 @@ components:
       properties:
         id:
           type: integer
+          nullable: true
         name:
           type: string
+          nullable: true
         status:
           type: integer
+          nullable: true
       required:
         - id
         - name
@@ -102,6 +105,7 @@ components:
       properties:
         name:
           type: string
+          nullable: true
         total:
           type: number
       required:
@@ -111,6 +115,41 @@ components:
 
 	if strings.TrimSpace(result) != strings.TrimSpace(expectedYAML) {
 		t.Errorf("Transformed OAS does not match expected.\n\nExpected:\n%s\n\nGot:\n%s", expectedYAML, result)
+	}
+}
+
+func TestSymbolicExecuteJQRecursiveSchema(t *testing.T) {
+	oasYAML := `openapi: 3.1.0
+info:
+  title: Recursive schema
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    Node:
+      type: object
+      x-speakeasy-transform-from-api:
+        jq: '.'
+      properties:
+        name:
+          type: string
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+      required: [name, children]
+`
+
+	result, err := SymbolicExecuteJQ(oasYAML)
+	if err != nil {
+		t.Fatalf("SymbolicExecuteJQ: %v", err)
+	}
+	if !strings.Contains(result, "children:") || !strings.Contains(result, "items:") {
+		t.Fatalf("recursive output lost array shape:\n%s", result)
+	}
+	var decoded map[string]any
+	if err := yaml.Unmarshal([]byte(result), &decoded); err != nil {
+		t.Fatalf("output is not finite valid YAML: %v", err)
 	}
 }
 

@@ -5,6 +5,15 @@ type code struct {
 	op opcode
 }
 
+// SchemaForeachMarker is no-op bytecode metadata used by the schema executor
+// to model foreach's generator backtracking independently of downstream code.
+// The concrete VM intentionally treats the containing opnop as a normal no-op.
+type SchemaForeachMarker struct {
+	Accumulator    [2]int
+	InitialStorePC int
+	ContinuePC     int
+}
+
 // GetOp returns the opcode for schema execution.
 func (c *code) GetOp() int {
 	return int(c.op)

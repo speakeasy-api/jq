@@ -23,15 +23,21 @@ import (
 //	}
 //	fmt.Printf("Output schema: %+v\n", result.Schema)
 func RunSchema(ctx context.Context, query *gojq.Query, input *oas3.Schema, opts ...SchemaExecOptions) (*SchemaExecResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Use default options if none provided
 	opt := DefaultOptions()
 	if len(opts) > 0 {
-		opt = opts[0]
+		opt = normalizeOptions(opts[0])
 	}
 
 	// Compile the query to bytecode
 	// Use WithSkipLibraryExpansion to bypass inlining of gsub/sub for better precision
-	code, err := gojq.Compile(query, gojq.WithSkipLibraryExpansion("gsub", "sub", "test"))
+	code, err := gojq.Compile(query,
+		gojq.WithSkipLibraryExpansion("gsub", "sub", "test"),
+		gojq.WithEnvironValue(symbolicEnvironment{}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile query: %w", err)
 	}
@@ -43,6 +49,11 @@ func RunSchema(ctx context.Context, query *gojq.Query, input *oas3.Schema, opts 
 // ExecSchema executes compiled jq bytecode symbolically on an input schema.
 // This is the core execution function - Phase 2 implementation.
 func ExecSchema(ctx context.Context, code *gojq.Code, input *oas3.Schema, opts SchemaExecOptions) (*SchemaExecResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	opts = normalizeOptions(opts)
+
 	// Validate input
 	if err := validateSchema(input); err != nil {
 		return nil, fmt.Errorf("invalid input schema: %w", err)
@@ -51,8 +62,18 @@ func ExecSchema(ctx context.Context, code *gojq.Code, input *oas3.Schema, opts S
 	// Create schema VM environment
 	env := newSchemaEnv(ctx, opts)
 
+	// Normalize the complete reachable graph once for this execution. The
+	// environment's memo is reused by navigation and builtin helpers.
+	normalized, err := normalizeSchema(env.normalizationContext(), input)
+	if err != nil {
+		return nil, fmt.Errorf("normalize input schema: %w", err)
+	}
+	if normalized == nil {
+		return &SchemaExecResult{Schema: Bottom()}, nil
+	}
+
 	// Execute bytecode on the input schema
-	return env.execute(code, input)
+	return env.execute(code, normalized)
 }
 
 // Helper methods that will be used by the VM in Phase 2

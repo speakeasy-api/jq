@@ -21,7 +21,9 @@ The goal is to answer: "Given an input JSON Schema, what schema describes all po
 ### Precision Where Cheap
 - **Constant folding** for enum-singleton values
 - Merge enum strings/integers and deduplicate unions structurally
-- Filter out completely unconstrained "Top" when merging properties to preserve precision
+- Top DOMINATES unions: if any branch (or merged property branch) is fully
+  unconstrained, the union is Top — filtering Top out to "preserve precision"
+  would discard possible outputs and break soundness
 
 ## Key Files
 
@@ -102,6 +104,56 @@ Important for precision:
 - **Never discard possible outputs** - it's better to be imprecise than incorrect
 - If you can't prove something won't happen, assume it can
 
+### 1a. Implied Types (deliberate deviation from raw JSON Schema)
+
+Untyped schemas are typed by structural inference (`impliedTypeOf` in
+`schemaops.go`, consulted by `getType`/`mightBeType`):
+
+| Schema structure (no explicit `type`, no `allOf`/`anyOf`/`oneOf`/`not`/`if`/`then`/`else`) | Implied type |
+|---|---|
+| `enum` present | `string` |
+| `const` present (non-null) | the const's scalar type |
+| `const: null` | unknown (mirrors the generator) |
+| `properties` (non-empty) | `object` |
+| `additionalProperties` present | `object` |
+| `items` present | `array` |
+| otherwise | unknown (Top-like) |
+
+Under raw JSON Schema semantics an untyped schema with `properties` still
+admits strings, numbers, etc., so this inference technically narrows the
+concretization. It is a **deliberate, documented deviation**: this library
+targets Speakeasy-processed OpenAPI documents, and the contract is
+equivalence with the structural inference Speakeasy's SDK/CLI generators
+apply to untyped schemas. Real-world documents routinely omit
+`type: object` on schemas with `properties`; without inference every
+navigation of such schemas widens to Top and the executor is useless on
+exactly the documents it targets. The generator suppresses inference for
+`allOf`/`anyOf`/`oneOf`, but ignores `not`/`if`/`then`/`else`. The executor
+conservatively suppresses inference for those additional keywords too,
+widening rather than asserting a type in their presence.
+
+The mode is selectable via `SchemaExecOptions.Semantics`:
+`SchemaSemanticsSpeakeasy` (default) applies the inference at navigation
+dispatch and treats objects without `additionalProperties` as CLOSED
+(undeclared property access yields null — this is what makes typo'd leaves
+provably broken); `SchemaSemanticsRaw` requires explicit types at dispatch
+and treats absent `additionalProperties` as OPEN per JSON Schema, so a
+missing property is never provably broken without an explicit
+`additionalProperties: false`.
+
+### 1b. $ref Navigation
+
+Reference resolution state lives on the `JSONSchema` **wrapper** (via
+`GetResolvedSchema()`), not on the inline `Left` schema — for a `$ref`,
+`Left` is a bare shell with only `Ref` set. Any code that reads schema
+children MUST look through the resolved schema first (`resolvedLeft` in
+`execute_schema.go`), and any code that rebuilds child wrappers with
+`NewJSONSchemaFromSchema` MUST pass the resolved schema, or the wrapper's
+resolution caches are silently discarded and downstream navigation sees an
+untyped shell (widening to Top — or worse, misreading a referenced property
+as "definitely missing", which is unsound). `derefJSONSchema` treats an
+unresolved ref shell as a failed dereference so callers widen to Top.
+
 ### 2. Determinism/Stability
 - Union-first, then materialize accumulators (to avoid "who writes last" effects)
 - Deduplicate and merge wherever safe (enums, identical structure)
@@ -181,12 +233,14 @@ For `del()`, `setpath()`, `getpath()`:
 3. Multiple const results get merged by Union into enum sets
 4. Example: `if .x then "a" else "b" end` → `{type: string, enum: ["a", "b"]}`
 
-### Preserving Precision in Merges
+### Merging Object Properties Across Paths
 
-When merging object properties from multiple execution paths:
-- Filter out **unconstrained Top-like schemas** (empty schemas `{}`)
-- Keep the more **concrete schemas** (lines 371-383)
-- Example: merging `{id: {type: string}}` with `{id: {}}` keeps `{type: string}`
+When merging object properties from multiple execution paths, the property
+schemas are UNIONED — including unconstrained (Top) branches. If any path
+leaves a property unconstrained, the merged property is Top: merging
+`{id: {type: string}}` with `{id: {}}` yields `{id: {}}` (Top dominates).
+Filtering Top out would silently narrow the output and break the
+over-approximation contract (and the Analyze API's Proven verdict).
 
 ## Testing Strategy
 
@@ -271,8 +325,10 @@ Example builtin locations:
 - Set `AnyOfLimit` and `EnumLimit` for tractable merges
 - Enable `EnableWarnings` during development to collect warnings
 - Set `LogLevel` to "debug" for detailed execution tracing (logs to stderr)
+  - "" (default): no output — the library is silent on stdout/stderr;
+    warnings are still returned on `SchemaExecResult.Warnings`
   - "error": Only critical failures
-  - "warn": Warnings about precision loss and unsupported operations (default)
+  - "warn": Warnings about precision loss and unsupported operations
   - "info": High-level execution lifecycle
   - "debug": Per-opcode trace with state, stack, and schema changes
 
