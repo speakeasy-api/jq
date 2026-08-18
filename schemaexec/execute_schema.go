@@ -2,6 +2,7 @@ package schemaexec
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
@@ -925,9 +926,7 @@ func mergeSchemasModeGuarded(s1, s2 *oas3.Schema, mode MergeMode, inProgress map
 				// If types differ, we can't represent type union in a single schema
 				// The caller should keep anyOf structure for mixed types
 				if t1 != "" && t2 != "" && t1 != t2 {
-					// Mixed types - cannot flatten to single schema
-					// Return an indicator that this should stay as anyOf
-					result.Type = nil // Clear type to indicate multi-type
+					return nil, errCannotFlatten
 				} else if t1 == "" {
 					result.Type = s2.Type
 				}
@@ -1161,13 +1160,8 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 	// Multi-state execution loop
 	maxIterations := env.opts.MaxDepth * 1000 // Safeguard against infinite loops
 	iterations := 0
+	mergeThreshold := 8
 	for !worklist.isEmpty() {
-		// SAFEGUARD: Check iteration limit
-		iterations++
-		if iterations > maxIterations {
-			return nil, fmt.Errorf("exceeded maximum iterations (%d) - possible infinite loop", maxIterations)
-		}
-
 		// Check context cancellation
 		select {
 		case <-env.ctx.Done():
@@ -1176,8 +1170,7 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		}
 
 		// Merge the execution frontier periodically to prevent exponential branch explosion.
-		// Merge frequently (threshold: 8) to control state count even with string builtins
-		const mergeThreshold = 8
+		// Amortize frontier partitioning while still bounding branch growth.
 		if len(worklist.states) >= mergeThreshold {
 			frontier := make([]*execState, 0, len(worklist.states))
 			for !worklist.isEmpty() {
@@ -1207,9 +1200,25 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 			if env.strict {
 				return nil, fmt.Errorf("strict mode: exceeded maximum execution depth (MaxDepth=%d)", env.opts.MaxDepth)
 			}
-			env.addWarning("max depth exceeded, widening to Top")
-			outputs = append(outputs, Top())
+			if env.widenActiveAccumulators(state) {
+				env.addWarning("max depth exceeded, widening active array accumulators")
+				// Once recursive generators have reached their abstraction bound,
+				// batch their remaining frontier states more coarsely. The active
+				// accumulator has already been widened, so frequent joins add cost
+				// without recovering precision.
+				mergeThreshold = 256
+			} else {
+				env.addWarning("max depth exceeded, widening to Top")
+				outputs = append(outputs, Top())
+			}
 			continue
+		}
+
+		// Count states that execute bytecode. Depth-pruned states are terminal
+		// abstractions, not evidence of an infinite VM loop.
+		iterations++
+		if iterations > maxIterations {
+			return nil, fmt.Errorf("exceeded maximum iterations (%d) - possible infinite loop", maxIterations)
 		}
 
 		// Execute one step
@@ -1368,6 +1377,64 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		Schema:   result,
 		Warnings: env.warnings,
 	}, nil
+}
+
+// widenActiveAccumulators preserves an enclosing array result only when the
+// exhausted state is provably confined to compileArray generators. Merely
+// finding an array in the shared accumulator map is insufficient: it may have
+// been built by an unrelated earlier expression while this state still emits
+// directly to the query output.
+func (env *schemaEnv) widenActiveAccumulators(state *execState) bool {
+	if state == nil || state.depthWidenBlocked || state.labels.len() != 0 ||
+		state.tryDepth != 0 || state.forks.len() == 0 {
+		return false
+	}
+	if state.forks.tail == nil || !state.forks.tail.allPlain {
+		return false
+	}
+
+	allocIDs := make(map[string]struct{})
+	foundGenerator := false
+	for node := state.forks.tail; node != nil; node = node.prev {
+		fork := node.value
+		if fork.arrayAppendKey == "" {
+			continue
+		}
+
+		foundGenerator = true
+		array, ok := state.loadVar(fork.arrayAppendKey)
+		if !ok {
+			return false
+		}
+		allocID, ok := state.schemaToAlloc[array]
+		if !ok {
+			return false
+		}
+		canonical, ok := state.accum[allocID]
+		if !ok || canonical == nil || getType(canonical) != "array" {
+			return false
+		}
+		allocIDs[allocID] = struct{}{}
+	}
+	if !foundGenerator || len(allocIDs) == 0 {
+		return false
+	}
+
+	for _, allocID := range sortedAccumKeys(allocIDs) {
+		array := state.accum[allocID]
+		if items := resolvedLeft(array.Items); items != nil && isTopSchema(items) &&
+			len(array.PrefixItems) == 0 && array.MinItems == nil && array.MaxItems == nil {
+			continue
+		}
+		widened := cloneSchema(array)
+		widened.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](env.NewTopWithCause("array generator exceeded maximum execution depth"))
+		widened.PrefixItems = nil
+		widened.MinItems = nil
+		widened.MaxItems = nil
+		state.accum[allocID] = widened
+		state.schemaToAlloc[widened] = allocID
+	}
+	return true
 }
 
 // sortedAccumKeys returns the keys of an accumulator map in sorted order.
@@ -1894,7 +1961,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 	case opScope:
 		// Only push frame for function call scopes, not filter-local scopes
 		// This prevents scope depth variance from fragmenting partition shapes
-		if len(next.callstack) > 0 {
+		if next.callstack.len() > 0 {
 			next.pushFrame()
 		}
 		return []*execState{next}, nil
@@ -2128,10 +2195,12 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 	case opRet:
 		// Return from closure
 		next.popFrame()
-		if len(next.callstack) > 0 {
+		if retPC, callstack, ok := next.callstack.pop(); ok {
 			// Pop return address and jump back
-			retPC := next.callstack[len(next.callstack)-1]
-			next.callstack = next.callstack[:len(next.callstack)-1]
+			next.callstack = callstack
+			next.forks = next.forks.pruneCallDepth(callstack.len())
+			next.labels = next.labels.pruneCallDepth(callstack.len())
+			next.invalidateShapeKey()
 			next.pc = retPC
 			// NOTE: Accumulator changes are preserved in next.accum
 			// When multiple returns merge, Union will handle the lattice join
@@ -2192,8 +2261,14 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			return []*execState{next}, nil
 		}
 		if pc, ok := getClosurePC(clos); ok {
+			if next.callstack.containsTarget(pc) && isTopSchema(next.top()) {
+				next.pop()
+				next.push(env.NewTopWithCause("recursive closure call over unknown input"))
+				return []*execState{next}, nil
+			}
 			// Push return address (next.pc is already incremented by executeOpMultiState)
-			next.callstack = append(next.callstack, next.pc)
+			next.callstack = next.callstack.append(next.pc, pc)
+			next.invalidateShapeKey()
 
 			// Push new scope frame for closure (balanced by opRet)
 			next.pushFrame()
@@ -2229,6 +2304,8 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		// Create two states: one continues (success), one jumps (error handler)
 		continueState := state.clone()
 		continueState.pc++
+		continueState.tryDepth++
+		continueState.invalidateShapeKey()
 		continueState.lineage = state.lineage + ".S" // Success branch
 
 		errorState := state.clone()
@@ -2243,7 +2320,10 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 
 	case opForkTryEnd:
 		// try-catch end - marks end of try block
-		// For schema execution, just continue normally
+		if next.tryDepth > 0 {
+			next.tryDepth--
+			next.invalidateShapeKey()
+		}
 		return []*execState{next}, nil
 
 	case opExpBegin, opExpEnd:
@@ -2268,10 +2348,12 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 	case opForkLabel:
 		key := fmt.Sprintf("%v", c.value)
 		next.storeVar(key, ConstString("jq-label:"+key))
-		next.labels = append(next.labels, labelContinuation{
-			key:       key,
-			forkDepth: len(next.forks),
+		next.labels = next.labels.append(labelContinuation{
+			key:            key,
+			forkDepth:      next.forks.len(),
+			callstackDepth: next.callstack.len(),
 		})
+		next.invalidateShapeKey()
 		return []*execState{next}, nil
 
 	// Unsupported opcodes
@@ -2448,13 +2530,13 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 		indexKey := c.value
 		// Array slicing in path mode: treat as wildcard (symbolic index)
 		if isSliceIndex(indexKey) {
-			state.currentPath = append(state.currentPath, PathSegment{
+			state.currentPath = append(state.currentPath[:len(state.currentPath):len(state.currentPath)], PathSegment{
 				Key:        PathWildcard{},
 				IsSymbolic: true,
 			})
 			return []*execState{state}, nil
 		}
-		state.currentPath = append(state.currentPath, PathSegment{
+		state.currentPath = append(state.currentPath[:len(state.currentPath):len(state.currentPath)], PathSegment{
 			Key:        indexKey,
 			IsSymbolic: false,
 		})
@@ -2467,13 +2549,34 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 		return []*execState{state}, nil
 	}
 
-	indexKey := c.value
+	result := env.indexSchema(base, c.value, make(map[*oas3.Schema]bool))
+	state.push(result)
+	return []*execState{state}, nil
+}
+
+// indexSchema distributes jq indexing over disjunctive receiver schemas.
+// The individual branches retain the existing per-type behavior: null indexes
+// to null, arrays yield elements/slices, and unsupported receivers widen.
+func (env *schemaEnv) indexSchema(base *oas3.Schema, indexKey any, seen map[*oas3.Schema]bool) *oas3.Schema {
+	if base == nil {
+		return Bottom()
+	}
+	if seen[base] {
+		return env.NewTopWithCause("indexing recursive disjunctive schema")
+	}
+	if branches, ok := disjunctiveBranches(base); ok {
+		seen[base] = true
+		results := make([]*oas3.Schema, 0, len(branches))
+		for _, branch := range branches {
+			results = append(results, env.indexSchema(branch, indexKey, seen))
+		}
+		delete(seen, base)
+		return Union(results, env.opts)
+	}
+
+	baseNullable := base.Nullable != nil && *base.Nullable
 	var result *oas3.Schema
-
-	baseNullable := base != nil && base.Nullable != nil && *base.Nullable
-
-	baseType := env.dispatchType(base)
-	switch baseType {
+	switch baseType := env.dispatchType(base); baseType {
 	case "object":
 		if key, ok := indexKey.(string); ok {
 			// Union-aware property lookup with jq semantics: missing → null
@@ -2516,9 +2619,7 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 	if baseNullable && result != nil && !isTopSchema(result) {
 		result = Union([]*oas3.Schema{result, ConstNull()}, env.opts)
 	}
-
-	state.push(result)
-	return []*execState{state}, nil
+	return result
 }
 
 // execIterMulti handles iteration in multi-state mode.
@@ -2528,7 +2629,7 @@ func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, 
 		// Unlike an unknown single index, .[] selects every element. Preserve
 		// that distinction so update assignments can replace the item schema
 		// without adding padding or retaining the old item type.
-		state.currentPath = append(state.currentPath, PathSegment{
+		state.currentPath = append(state.currentPath[:len(state.currentPath):len(state.currentPath)], PathSegment{
 			Key:        PathAllElements{},
 			IsSymbolic: true,
 		})
@@ -2554,31 +2655,7 @@ func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, 
 		return []*execState{state}, nil
 	}
 
-	baseType := env.dispatchType(val)
-	var itemSchema *oas3.Schema
-
-	switch baseType {
-	case "array":
-		// Check for empty array sentinel first, regardless of Items being set
-		// Empty arrays are represented with MaxItems=0 and Items may be nil
-		if val.MaxItems != nil && *val.MaxItems == 0 {
-			// Empty array sentinel: produce no iteration values
-			if env.opts.EnableWarnings {
-				env.addWarning("ITER: empty array sentinel detected, producing no iterations")
-			}
-			return []*execState{}, nil
-		}
-
-		itemSchema = arrayElementUnion(val, env.opts)
-	case "object":
-		itemSchema = unionAllObjectValues(val, env.opts)
-	default:
-		if baseType == "" {
-			itemSchema = env.NewTopWithCause("iteration over unknown type")
-		} else {
-			itemSchema = Bottom()
-		}
-	}
+	itemSchema := env.iterationSchema(val, make(map[*oas3.Schema]bool))
 
 	// Don't push Bottom - it should terminate paths earlier
 	if itemSchema == Bottom() {
@@ -2587,6 +2664,102 @@ func (env *schemaEnv) execIterMulti(state *execState, c *codeOp) ([]*execState, 
 
 	state.push(itemSchema)
 	return []*execState{state}, nil
+}
+
+// iterationSchema distributes jq iteration across anyOf/oneOf branches.
+// Proven scalar and null alternatives produce no values; only a genuinely
+// untyped alternative widens the result to a caused Top.
+func (env *schemaEnv) iterationSchema(val *oas3.Schema, seen map[*oas3.Schema]bool) *oas3.Schema {
+	if val == nil {
+		return Bottom()
+	}
+	if seen[val] {
+		return env.NewTopWithCause("iteration over recursive disjunctive schema")
+	}
+	if branches, ok := disjunctiveBranches(val); ok {
+		seen[val] = true
+		items := make([]*oas3.Schema, 0, len(branches))
+		for _, branch := range branches {
+			items = append(items, env.iterationSchema(branch, seen))
+		}
+		delete(seen, val)
+		return Union(items, env.opts)
+	}
+
+	switch baseType := env.dispatchType(val); baseType {
+	case "array":
+		// Check for empty array sentinel first, regardless of Items being set
+		// Empty arrays are represented with MaxItems=0 and Items may be nil
+		if val.MaxItems != nil && *val.MaxItems == 0 {
+			// Empty array sentinel: produce no iteration values
+			if env.opts.EnableWarnings {
+				env.addWarning("ITER: empty array sentinel detected, producing no iterations")
+			}
+			return Bottom()
+		}
+
+		return arrayElementUnion(val, env.opts)
+	case "object":
+		return unionAllObjectValues(val, env.opts)
+	default:
+		if baseType == "" {
+			return env.NewTopWithCause("iteration over unknown type")
+		}
+		return Bottom()
+	}
+}
+
+// disjunctiveBranches resolves the alternatives of oneOf/anyOf, including
+// boolean schemas. A true branch is Top and a false branch is Bottom. Object
+// and array constraints alongside the combinator are also retained as a
+// conservative alternative; they constrain every branch conjunctively, and
+// omitting them would lose values declared only on the receiver itself.
+func disjunctiveBranches(schema *oas3.Schema) ([]*oas3.Schema, bool) {
+	if schema == nil {
+		return nil, false
+	}
+	branches := schema.OneOf
+	if len(branches) == 0 {
+		branches = schema.AnyOf
+	}
+	if len(branches) == 0 {
+		return nil, false
+	}
+	resolved := make([]*oas3.Schema, 0, len(branches))
+	for _, branch := range branches {
+		if value, ok := resolvedBooleanSchema(branch); ok {
+			if value {
+				resolved = append(resolved, Top())
+			}
+			continue
+		}
+		if left := resolvedLeft(branch); left != nil {
+			resolved = append(resolved, left)
+		}
+	}
+	if base := disjunctiveNavigationBase(schema); base != nil {
+		resolved = append(resolved, base)
+	}
+	if schema.Nullable != nil && *schema.Nullable {
+		resolved = append(resolved, ConstNull())
+	}
+	return resolved, true
+}
+
+func disjunctiveNavigationBase(schema *oas3.Schema) *oas3.Schema {
+	base := cloneSchema(schema)
+	base.OneOf = nil
+	base.AnyOf = nil
+	base.Nullable = nil
+
+	hasObjectShape := base.Properties != nil || base.AdditionalProperties != nil ||
+		(base.PatternProperties != nil && base.PatternProperties.Len() > 0)
+	hasArrayShape := base.Items != nil || len(base.PrefixItems) > 0
+	typeName := getType(base)
+	if !hasObjectShape && !hasArrayShape && typeName != "object" && typeName != "array" {
+		return nil
+	}
+	return base
 }
 
 // execObjectMulti handles object construction in multi-state mode.
@@ -2704,8 +2877,8 @@ func (s *execState) allocateArrayWithOrigin(pc int, context string) string {
 	// enclosing frame) distinguishes allocations made by different
 	// invocations of the same library function.
 	callSite := -1
-	if len(s.callstack) > 0 {
-		callSite = s.callstack[len(s.callstack)-1]
+	if s.callstack.tail != nil {
+		callSite = s.callstack.tail.returnPC
 	}
 	if s.allocOrigin == nil {
 		s.allocOrigin = make(map[string]*AllocOrigin)
@@ -3000,18 +3173,23 @@ func (env *schemaEnv) execFork(state *execState, c *codeOp) ([]*execState, error
 	continueState := state.clone()
 	continueState.pc++
 	continueState.lineage = state.lineage + ".C" // Continue branch
-	continueState.forks = append(continueState.forks, forkContinuation{
-		targetPC:     targetPC,
-		stack:        append([]SValue(nil), state.stack...),
-		scopeDepth:   len(state.scopes),
-		scopes:       cloneScopeMaps(state.scopes),
-		callstackLen: len(state.callstack),
-		callstack:    append([]int(nil), state.callstack...),
-		depth:        state.depth,
-		pathMode:     state.pathMode,
-		currentPath:  append([]PathSegment(nil), state.currentPath...),
-		control:      control,
+	arrayAppendKey, _ := env.arrayGeneratorAppendKey(targetPC)
+	continueState.forks = continueState.forks.append(forkContinuation{
+		kind:           c.op,
+		targetPC:       targetPC,
+		arrayAppendKey: arrayAppendKey,
+		stack:          state.stack,
+		scopeDepth:     len(state.scopes),
+		scopes:         append([]map[string]*oas3.Schema(nil), state.scopes...),
+		callstackLen:   state.callstack.len(),
+		callstack:      state.callstack,
+		depth:          state.depth,
+		pathMode:       state.pathMode,
+		currentPath:    state.currentPath,
+		tryDepth:       state.tryDepth,
+		control:        control,
 	})
+	continueState.invalidateShapeKey()
 
 	forkState := state.clone()
 	forkState.pc = targetPC
@@ -3025,35 +3203,43 @@ func (env *schemaEnv) execFork(state *execState, c *codeOp) ([]*execState, error
 	return []*execState{forkState, continueState}, nil
 }
 
+func (env *schemaEnv) arrayGeneratorAppendKey(targetPC int) (string, bool) {
+	appendPC := targetPC - 2
+	backtrackPC := targetPC - 1
+	if appendPC < 0 || backtrackPC < 0 || backtrackPC >= len(env.codes) ||
+		env.codes[appendPC].op != opAppend || env.codes[backtrackPC].op != opBacktrack {
+		return "", false
+	}
+	return fmt.Sprintf("%v", env.codes[appendPC].value), true
+}
+
 func (env *schemaEnv) execBreak(state *execState, token *oas3.Schema) ([]*execState, error) {
 	value, ok := extractConstString(token)
 	if !ok || !strings.HasPrefix(value, "jq-label:") {
 		return []*execState{}, nil
 	}
 	key := strings.TrimPrefix(value, "jq-label:")
-	labelIndex := -1
-	for i := len(state.labels) - 1; i >= 0; i-- {
-		if state.labels[i].key == key {
-			labelIndex = i
-			break
-		}
-	}
-	if labelIndex < 0 {
+	labelNode := state.labels.find(key)
+	if labelNode == nil {
 		return []*execState{}, nil
 	}
 
-	label := state.labels[labelIndex]
+	label := labelNode.value
 	if label.forkDepth == 0 {
 		return []*execState{}, nil
 	}
-	if label.forkDepth > len(state.forks) {
+	if label.forkDepth > state.forks.len() {
 		return []*execState{}, nil
 	}
 	forkIndex := label.forkDepth - 1
-	fork := state.forks[forkIndex]
+	fork, ok := state.forks.atDepth(label.forkDepth)
+	if !ok {
+		return []*execState{}, nil
+	}
 	restoreForkContinuation(state, fork)
-	state.forks = state.forks[:forkIndex]
-	state.labels = state.labels[:labelIndex]
+	state.forks = state.forks.truncate(forkIndex)
+	state.labels = labelContinuations{tail: labelNode.prev}
+	state.invalidateShapeKey()
 	state.lineage += ".B"
 	return []*execState{state}, nil
 }
@@ -3068,10 +3254,13 @@ func restoreForkContinuation(state *execState, fork forkContinuation) {
 			state.scopes[i][key] = value
 		}
 	}
-	state.callstack = append([]int(nil), fork.callstack...)
+	state.scopeShapes = nil
+	state.callstack = fork.callstack
 	state.depth = fork.depth
 	state.pathMode = fork.pathMode
-	state.currentPath = append([]PathSegment(nil), fork.currentPath...)
+	state.currentPath = fork.currentPath
+	state.tryDepth = fork.tryDepth
+	state.invalidateShapeKey()
 }
 
 // execForkAlt handles alternative fork (// operator).
@@ -3238,10 +3427,16 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 	case int:
 		// User-defined function: record call site for 1-CFA and jump
 		targetPC := v
+		if state.callstack.containsTarget(targetPC) && isTopSchema(state.top()) {
+			state.pop()
+			state.push(env.NewTopWithCause("recursive function call over unknown input"))
+			return []*execState{state}, nil
+		}
 		// Record call site PC (for accumulator disambiguation)
 		// removed callSitePC = state.pc
 		// Push return PC (state.pc is already incremented by dispatcher)
-		state.callstack = append(state.callstack, state.pc)
+		state.callstack = state.callstack.append(state.pc, targetPC)
+		state.invalidateShapeKey()
 		// Jump to function
 		state.pc = targetPC
 		state.depth++
@@ -3899,10 +4094,10 @@ func (env *schemaEnv) mergeFrontierByPC(in []*execState) []*execState {
 				continue
 			}
 
-			// Fast-path for large partitions: skip O(n²) subsumption and just fold with LUB
+			// Large partitions are cheaper to fold directly than to compare
+			// pairwise for subsumption.
 			const mergeCap = 16
 			if len(partition) > mergeCap {
-				// Linear-time merge: fold all states using join (LUB)
 				merged := partition[0]
 				for i := 1; i < len(partition); i++ {
 					merged = joinState(merged, partition[i], env.opts)
@@ -3911,15 +4106,11 @@ func (env *schemaEnv) mergeFrontierByPC(in []*execState) []*execState {
 				continue
 			}
 
-			// For smaller partitions: subsumption checking to remove redundant states
 			kept := make([]*execState, 0, len(partition))
 			for _, candidate := range partition {
 				subsumed := false
 				for _, other := range partition {
-					if candidate == other {
-						continue
-					}
-					if subsumesState(other, candidate) {
+					if candidate != other && subsumesState(other, candidate) {
 						subsumed = true
 						break
 					}
@@ -3928,16 +4119,17 @@ func (env *schemaEnv) mergeFrontierByPC(in []*execState) []*execState {
 					kept = append(kept, candidate)
 				}
 			}
-
-			// Join remaining states pairwise until convergence
-			for len(kept) > 1 {
-				a := kept[0]
-				b := kept[1]
-				merged := joinState(a, b, env.opts)
-				kept = append([]*execState{merged}, kept[2:]...)
+			if len(kept) == 0 {
+				kept = append(kept, partition[0])
 			}
-
-			out = append(out, kept...)
+			merged := partition[0]
+			if len(kept) > 0 {
+				merged = kept[0]
+			}
+			for i := 1; i < len(kept); i++ {
+				merged = joinState(merged, kept[i], env.opts)
+			}
+			out = append(out, merged)
 		}
 	}
 
@@ -3954,6 +4146,9 @@ func subsumesState(dom, sub *execState) bool {
 		return false
 	}
 	if len(dom.scopes) != len(sub.scopes) {
+		return false
+	}
+	if !depthWidenContextSubsumes(dom, sub) {
 		return false
 	}
 
@@ -3987,6 +4182,16 @@ func subsumesState(dom, sub *execState) bool {
 	}
 
 	return true
+}
+
+func depthWidenContextSubsumes(dom, sub *execState) bool {
+	if dom.depthWidenBlocked {
+		return true
+	}
+	if sub.depthWidenBlocked {
+		return false
+	}
+	return equalArrayGeneratorContexts(dom.forks, sub.forks)
 }
 
 // schemaSubsumes checks if schema 'dom' subsumes 'sub' (dom ⊒ sub).
@@ -4175,10 +4380,13 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			depth:     maxInt(a.depth, b.depth),
 			callstack: a.callstack,
 			forks:     mergedForks,
-			labels:    joinLabelContinuations(a.labels, b.labels, len(mergedForks)),
-			id:        a.id,
-			parentID:  a.parentID,
-			lineage:   a.lineage,
+			labels:    joinLabelContinuations(a.labels, b.labels, mergedForks.len()),
+			tryDepth:  a.tryDepth,
+			depthWidenBlocked: a.depthWidenBlocked || b.depthWidenBlocked ||
+				!equalArrayGeneratorContexts(a.forks, b.forks),
+			id:       a.id,
+			parentID: a.parentID,
+			lineage:  a.lineage,
 			// Use merged accumulators
 			accum:         mergedAccum,
 			schemaToAlloc: mergedSchemaToAlloc,
@@ -4507,10 +4715,13 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 		depth:     maxInt(a.depth, b.depth),
 		callstack: a.callstack, // Assume same callstack in partition
 		forks:     mergedForks,
-		labels:    joinLabelContinuations(a.labels, b.labels, len(mergedForks)),
-		id:        a.id,
-		parentID:  a.parentID,
-		lineage:   a.lineage,
+		labels:    joinLabelContinuations(a.labels, b.labels, mergedForks.len()),
+		tryDepth:  a.tryDepth,
+		depthWidenBlocked: a.depthWidenBlocked || b.depthWidenBlocked ||
+			!equalArrayGeneratorContexts(a.forks, b.forks),
+		id:       a.id,
+		parentID: a.parentID,
+		lineage:  a.lineage,
 		// Preserve shared fields from first state
 		accum:         a.accum,
 		schemaToAlloc: a.schemaToAlloc,
@@ -4868,22 +5079,92 @@ func joinTwoSchemas(a, b *oas3.Schema) *oas3.Schema {
 // If relaxScopeKeys is true, ignore scope variable names in the shape key
 // to allow more aggressive merging at hot join points.
 func partitionByShape(states []*execState, relaxScopeKeys bool) [][]*execState {
-	groups := make(map[string][]*execState)
+	buckets := make(map[string][][]*execState)
 	for _, s := range states {
 		key := shapeKey(s, relaxScopeKeys)
-		groups[key] = append(groups[key], s)
+		groups := buckets[key]
+		matched := false
+		for i := range groups {
+			if compatibleStateShapes(groups[i][0], s, relaxScopeKeys) {
+				groups[i] = append(groups[i], s)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			groups = append(groups, []*execState{s})
+		}
+		buckets[key] = groups
 	}
 
-	result := make([][]*execState, 0, len(groups))
-	for _, group := range groups {
-		result = append(result, group)
+	result := make([][]*execState, 0, len(buckets))
+	keys := make([]string, 0, len(buckets))
+	for key := range buckets {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		groups := buckets[key]
+		result = append(result, groups...)
 	}
 	return result
+}
+
+// compatibleStateShapes verifies the hashed persistent-stack components used
+// by shapeKey. Pointer equality makes the common shared case O(1); the exact
+// fallback prevents hash collisions from merging incompatible control states.
+func compatibleStateShapes(a, b *execState, relaxScopeKeys bool) bool {
+	if len(a.stack) != len(b.stack) || len(a.scopes) != len(b.scopes) ||
+		a.tryDepth != b.tryDepth || !equalCallStacks(a.callstack, b.callstack) ||
+		!equalLabelContinuations(a.labels, b.labels) {
+		return false
+	}
+	if a.scopeShapes != b.scopeShapes {
+		for i := range a.scopes {
+			if len(a.scopes[i]) != len(b.scopes[i]) {
+				return false
+			}
+			if !relaxScopeKeys {
+				for key := range a.scopes[i] {
+					if _, ok := b.scopes[i][key]; !ok {
+						return false
+					}
+				}
+			}
+		}
+	}
+	labelForkDepth := 0
+	if a.labels.tail != nil {
+		labelForkDepth = a.labels.tail.maxForkDepth
+	}
+	aDepth := min(labelForkDepth, a.forks.len())
+	bDepth := min(labelForkDepth, b.forks.len())
+	if aDepth != bDepth {
+		return false
+	}
+	depth := aDepth
+	left, right := a.forks.nodeAtDepth(depth), b.forks.nodeAtDepth(depth)
+	if left == right {
+		return true
+	}
+	for left != nil && right != nil {
+		if !compatibleForkContinuations(left.value, right.value) {
+			return false
+		}
+		left, right = left.prev, right.prev
+	}
+	return left == nil && right == nil
 }
 
 // shapeKey generates a deterministic key encoding the state's structural shape.
 // If relaxScopeKeys is true, only include scope frame counts, not variable names.
 func shapeKey(s *execState, relaxScopeKeys bool) string {
+	if relaxScopeKeys && s.relaxedShapeKeyValid {
+		return s.relaxedShapeKey
+	}
+	if !relaxScopeKeys && s.shapeKeyValid {
+		return s.shapeKey
+	}
 	var buf strings.Builder
 
 	// Stack length
@@ -4891,72 +5172,52 @@ func shapeKey(s *execState, relaxScopeKeys bool) string {
 	buf.WriteString(strconv.Itoa(len(s.stack)))
 	buf.WriteString(";")
 
-	// Scope frame count and keys (conditionally)
-	buf.WriteString("scopes:")
-	buf.WriteString(strconv.Itoa(len(s.scopes)))
-	buf.WriteString(";")
-
-	if !relaxScopeKeys {
-		// Include variable names for precise partitioning
-		for i, scope := range s.scopes {
-			keys := make([]string, 0, len(scope))
-			for k := range scope {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			buf.WriteString("scope")
-			buf.WriteString(strconv.Itoa(i))
-			buf.WriteString(":[")
-			buf.WriteString(strings.Join(keys, ","))
-			buf.WriteString("];")
-		}
-	} else {
-		// Just include counts for relaxed merging
-		for i, scope := range s.scopes {
-			buf.WriteString("scope")
-			buf.WriteString(strconv.Itoa(i))
-			buf.WriteString(":count=")
-			buf.WriteString(strconv.Itoa(len(scope)))
-			buf.WriteString(";")
-		}
-	}
+	scopeHash := scopeShapeHash(s, relaxScopeKeys)
+	buf.Write(scopeHash[:])
 
 	// Callstack
 	buf.WriteString("callstack:")
-	buf.WriteString(intSliceKey(s.callstack))
+	callstackHash := s.callstack.shapeHash()
+	buf.Write(callstackHash[:])
 	buf.WriteString(";labels:")
 	labelForkDepth := 0
-	for _, label := range s.labels {
-		buf.WriteString(label.key)
-		buf.WriteByte('/')
-		buf.WriteString(strconv.Itoa(label.forkDepth))
-		if label.forkDepth > labelForkDepth {
-			labelForkDepth = label.forkDepth
-		}
-		buf.WriteByte(';')
+	if s.labels.tail != nil {
+		buf.Write(s.labels.tail.shape[:])
+		labelForkDepth = s.labels.tail.maxForkDepth
 	}
 	buf.WriteString("label-forks:")
-	for i := 0; i < labelForkDepth && i < len(s.forks); i++ {
-		fork := s.forks[i]
-		buf.WriteString(strconv.Itoa(fork.targetPC))
-		buf.WriteByte(':')
-		buf.WriteString(strconv.Itoa(len(fork.stack)))
-		buf.WriteByte(':')
-		buf.WriteString(strconv.Itoa(fork.scopeDepth))
-		buf.WriteByte(':')
-		buf.WriteString(strconv.Itoa(fork.callstackLen))
-		buf.WriteByte(':')
-		buf.WriteString(intSliceKey(fork.callstack))
-		buf.WriteByte(':')
-		buf.WriteString(strconv.Itoa(fork.depth))
-		buf.WriteByte(':')
-		buf.WriteString(strconv.FormatBool(fork.pathMode))
-		buf.WriteByte(':')
-		buf.WriteString(pathSegmentsKey(fork.currentPath))
-		buf.WriteByte(',')
+	if node := s.forks.nodeAtDepth(min(labelForkDepth, s.forks.len())); node != nil {
+		buf.Write(node.shape[:])
 	}
+	buf.WriteString(";try:")
+	buf.WriteString(strconv.Itoa(s.tryDepth))
 
-	return buf.String()
+	key := buf.String()
+	if relaxScopeKeys {
+		s.relaxedShapeKey = key
+		s.relaxedShapeKeyValid = true
+	} else {
+		s.shapeKey = key
+		s.shapeKeyValid = true
+	}
+	return key
+}
+
+func scopeShapeHash(s *execState, relaxed bool) [sha256.Size]byte {
+	if s.scopeShapes == nil || s.scopeShapes.depth != len(s.scopes) {
+		var shapes *scopeShapeNode
+		for _, frame := range s.scopes {
+			shapes = appendScopeShape(shapes, frame)
+		}
+		s.scopeShapes = shapes
+	}
+	if s.scopeShapes == nil {
+		return [sha256.Size]byte{}
+	}
+	if relaxed {
+		return s.scopeShapes.relaxed
+	}
+	return s.scopeShapes.exact
 }
 
 func pathSegmentsKey(segments []PathSegment) string {
@@ -4997,15 +5258,6 @@ func pathSegmentsKey(segments []PathSegment) string {
 	}
 	buf.WriteByte(']')
 	return buf.String()
-}
-
-// intSliceKey generates a string key for an int slice.
-func intSliceKey(ints []int) string {
-	strs := make([]string, len(ints))
-	for i, v := range ints {
-		strs[i] = strconv.Itoa(v)
-	}
-	return "[" + strings.Join(strs, ",") + "]"
 }
 
 // maxInt returns the maximum of two integers.
