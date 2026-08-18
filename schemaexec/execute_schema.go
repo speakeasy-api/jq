@@ -33,8 +33,21 @@ type schemaEnv struct {
 
 	// Tracks why a Top schema was created during execution.
 	// Keyed by the exact Top() schema pointer identity.
-	topCauses map[*oas3.Schema]string
-	norm      *normCtx
+	topCauses    map[*oas3.Schema]string
+	norm         *normCtx
+	loopHeads    map[string]*loopHeadState
+	foreachSeeds map[int][]foreachMarkerLocation
+}
+
+type loopHeadState struct {
+	state   *execState
+	rounds  int
+	widened bool
+}
+
+type foreachMarkerLocation struct {
+	pc     int
+	marker gojq.SchemaForeachMarker
 }
 
 // NewTopWithCause creates a Top schema and records the reason why it was created.
@@ -1133,6 +1146,7 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 			opName: getCodeOpName(rc),
 		}
 	}
+	env.indexForeachMarkers()
 
 	// Create initial state
 	initialState := newExecState(input)
@@ -1378,6 +1392,20 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		Schema:   result,
 		Warnings: env.warnings,
 	}, nil
+}
+
+func (env *schemaEnv) indexForeachMarkers() {
+	env.foreachSeeds = make(map[int][]foreachMarkerLocation)
+	for pc, code := range env.codes {
+		marker, ok := code.value.(gojq.SchemaForeachMarker)
+		if !ok {
+			continue
+		}
+		env.foreachSeeds[marker.InitialStorePC] = append(env.foreachSeeds[marker.InitialStorePC], foreachMarkerLocation{
+			pc:     pc,
+			marker: marker,
+		})
+	}
 }
 
 // widenActiveAccumulators preserves an enclosing array result only when the
@@ -1935,6 +1963,9 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 
 	switch c.op {
 	case opNop:
+		if marker, ok := c.value.(gojq.SchemaForeachMarker); ok {
+			return env.execForeachMarker(next, state.pc, marker), nil
+		}
 		return []*execState{next}, nil
 
 	case opPush:
@@ -1996,6 +2027,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			}
 
 			next.storeVar(key, finalVal)
+			env.captureForeachSeed(next, key, finalVal, next.pc-1)
 
 			// DEBUG: Log variable storage for arrays
 			if getType(finalVal) == "array" && env.opts.EnableWarnings {
@@ -2233,11 +2265,15 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		return env.execFork(state, c)
 
 	case opBacktrack:
-		return nil, nil
+		return env.execBacktrack(state.clone())
 
 	case opJump:
 		// Unconditional jump
-		next.pc = c.value.(int)
+		targetPC := c.value.(int)
+		next.pc = targetPC
+		if targetPC <= state.pc {
+			return env.execBackwardJump(next), nil
+		}
 		return []*execState{next}, nil
 
 	case opJumpIfNot:
@@ -2266,24 +2302,25 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		// Call closure: pop it, jump to its PC, push return address
 		clos := next.pop()
 		if clos == nil {
+			if len(next.stack) > 0 {
+				next.pop()
+			}
 			next.push(Top())
 			return []*execState{next}, nil
 		}
 		if pc, ok := getClosurePC(clos); ok {
-			if next.callstack.containsTarget(pc) && isTopSchema(next.top()) {
+			input := next.top()
+			if env.shouldWidenRecursiveCall(next.callstack, pc, input) {
 				next.pop()
-				next.push(env.NewTopWithCause("recursive closure call over unknown input"))
+				next.push(env.NewTopWithCause("recursion depth limit for closure call"))
 				return []*execState{next}, nil
 			}
 			// Push return address (next.pc is already incremented by executeOpMultiState)
 			if next.pathMode && env.returnsToDynamicIndex(next.pc) {
 				next.pathEvalBases = append(next.pathEvalBases[:len(next.pathEvalBases):len(next.pathEvalBases)], len(next.currentPath))
 			}
-			next.callstack = next.callstack.append(next.pc, pc)
+			next.callstack = next.callstack.append(next.pc, pc, input)
 			next.invalidateShapeKey()
-
-			// Push new scope frame for closure (balanced by opRet)
-			next.pushFrame()
 
 			// Jump to closure PC
 			next.pc = pc
@@ -2293,7 +2330,10 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		if env.strict {
 			return nil, fmt.Errorf("strict mode: attempted to call unknown closure at pc=%d", state.pc)
 		}
-		next.push(Top())
+		if len(next.stack) > 0 {
+			next.pop()
+		}
+		next.push(env.NewTopWithCause("attempted to call unknown closure"))
 		return []*execState{next}, nil
 
 	case opCallRec:
@@ -3190,6 +3230,7 @@ func (env *schemaEnv) execFork(state *execState, c *codeOp) ([]*execState, error
 	arrayAppendKey, _ := env.arrayGeneratorAppendKey(targetPC)
 	continueState.forks = continueState.forks.append(forkContinuation{
 		kind:           c.op,
+		continuePC:     state.pc + 1,
 		targetPC:       targetPC,
 		arrayAppendKey: arrayAppendKey,
 		stack:          state.stack,
@@ -3216,6 +3257,509 @@ func (env *schemaEnv) execFork(state *execState, c *codeOp) ([]*execState, error
 	// This ensures LIFO worklist processes continue state first,
 	// which is critical for accumulator mutations (e.g., path collection)
 	return []*execState{forkState, continueState}, nil
+}
+
+const loopFixpointRounds = 4
+
+type backtrackLoop struct {
+	forkDepth   int
+	fork        forkContinuation
+	accumulator string
+	bodyPC      int
+}
+
+// execBacktrack recognizes compiler-owned reduce loop tails. The
+// concrete VM resumes the pending fork with variables updated by the body;
+// the eager symbolic fork cannot do that for scalar or freshly allocated
+// values, because its exit state was snapshotted before the first update.
+// Iterate the abstract body to a bounded fixpoint and restore the exit with
+// the joined accumulator instead of silently retaining only acc_0.
+func (env *schemaEnv) execBacktrack(state *execState) ([]*execState, error) {
+	loop, ok := env.backtrackAccumulatorLoop(state)
+	if !ok {
+		return nil, nil
+	}
+	if forkControlUpdatesVariable(loop.fork.control, loop.accumulator) {
+		// setpath-style accumulators already propagate immutable replacement
+		// values into the eagerly queued exit through forkControl. Keep that
+		// more precise identity-aware path instead of joining it with the
+		// deliberately conservative current-state placeholder.
+		return nil, nil
+	}
+
+	previous, previousOK := loadVarFromScopes(loop.fork.scopes, loop.accumulator)
+	current, currentOK := state.loadVar(loop.accumulator)
+	if !previousOK || !currentOK {
+		unknown := env.NewTopWithCause("reduce accumulator could not be modeled")
+		return []*execState{env.restoreBacktrackLoopExit(state, loop, unknown)}, nil
+	}
+
+	joined := Union([]*oas3.Schema{previous, current}, env.opts)
+	stable := schemaSubsumes(previous, current) || schemaFingerprint(joined) == schemaFingerprint(previous)
+	round := loop.fork.loopRound + 1
+	env.logger.Debugf("backtrack loop: accumulator=%s round=%d previous=%s current=%s joined=%s stable=%v",
+		loop.accumulator, round, schemaTypeSummary(previous, 2), schemaTypeSummary(current, 2),
+		schemaTypeSummary(joined, 2), stable)
+	if !stable && round > loopFixpointRounds+1 {
+		unknown := env.NewTopWithCause("reduce fixpoint did not stabilize after widening")
+		return []*execState{env.restoreBacktrackLoopExit(state, loop, unknown)}, nil
+	}
+	if !stable && round > loopFixpointRounds {
+		joined = env.widenLoopValue(joined, make(map[*oas3.Schema]*oas3.Schema))
+	}
+
+	if stable {
+		return []*execState{env.restoreBacktrackLoopExit(state, loop, joined)}, nil
+	}
+
+	reentered := state.clone()
+	restoreForkContinuation(reentered, loop.fork)
+	reentered.pc = loop.bodyPC
+	reentered.lineage += ".L"
+	reentered.storeExistingVar(loop.accumulator, joined)
+
+	updatedFork := cloneForkContinuation(loop.fork)
+	updatedFork.loopRound = round
+	updatedFork.scopes = storeVarInScopes(updatedFork.scopes, loop.accumulator, joined)
+	values := state.forks.values()
+	values[loop.forkDepth-1] = updatedFork
+	reentered.forks = forkContinuationsFromValues(values[:loop.forkDepth])
+	reentered.invalidateShapeKey()
+	return []*execState{reentered}, nil
+}
+
+func forkControlUpdatesVariable(control *forkControl, key string) bool {
+	if control == nil {
+		return false
+	}
+	for _, replacement := range control.replacements {
+		if replacement.key == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (env *schemaEnv) backtrackAccumulatorLoop(state *execState) (backtrackLoop, bool) {
+	if state == nil || state.pc <= 0 || state.pc >= len(env.codes) || env.codes[state.pc].op != opBacktrack {
+		return backtrackLoop{}, false
+	}
+	for node := state.forks.tail; node != nil; node = node.prev {
+		fork := node.value
+		if fork.targetPC != state.pc+1 || fork.targetPC < 2 || fork.targetPC > len(env.codes) {
+			continue
+		}
+
+		// compileReduce: ... store v; backtrack; L_end: pop; load v
+		if store := env.codes[fork.targetPC-2]; store.op == opStore {
+			return backtrackLoop{
+				forkDepth:   node.depth,
+				fork:        fork,
+				accumulator: fmt.Sprintf("%v", store.value),
+				bodyPC:      fork.continuePC,
+			}, true
+		}
+
+	}
+	return backtrackLoop{}, false
+}
+
+// captureForeachSeed snapshots the control state immediately after acc_0 is
+// stored. The compiler's no-op marker later restores this snapshot for every
+// abstract next round, independent of how the extract or downstream filter
+// backtracks.
+func (env *schemaEnv) captureForeachSeed(state *execState, accumulator string, value *oas3.Schema, storePC int) {
+	if state == nil {
+		return
+	}
+	locations := env.foreachSeeds[storePC]
+	if len(locations) == 0 {
+		return
+	}
+	loops := cloneForeachLoops(state.foreachLoops)
+	for _, location := range locations {
+		if fmt.Sprintf("%v", location.marker.Accumulator) != accumulator {
+			continue
+		}
+		key := foreachLoopKey{markerPC: location.pc, callDepth: state.callstack.len()}
+		loops[key] = foreachLoopState{
+			accumulator: accumulator,
+			previous:    value,
+			forks:       state.forks,
+			labels:      state.labels,
+			forkUpdates: append([]*forkControl(nil), state.forkUpdates...),
+			continuation: forkContinuation{
+				kind:          opNop,
+				continuePC:    location.marker.ContinuePC,
+				targetPC:      location.marker.ContinuePC,
+				stack:         append([]SValue(nil), state.stack...),
+				scopeDepth:    len(state.scopes),
+				scopes:        cloneScopeMaps(state.scopes),
+				callstackLen:  state.callstack.len(),
+				callstack:     state.callstack,
+				depth:         state.depth,
+				pathMode:      state.pathMode,
+				currentPath:   append([]PathSegment(nil), state.currentPath...),
+				pathEvalBases: append([]int(nil), state.pathEvalBases...),
+				tryDepth:      state.tryDepth,
+			},
+		}
+	}
+	state.foreachLoops = loops
+	state.invalidateShapeKey()
+}
+
+// execForeachMarker emits the current round into the extract/downstream code
+// and independently schedules the next abstract round from the initialization
+// snapshot. This mirrors jq's generator backtracking without relying on a
+// particular downstream opbacktrack layout.
+func (env *schemaEnv) execForeachMarker(state *execState, markerPC int, marker gojq.SchemaForeachMarker) []*execState {
+	key := foreachLoopKey{markerPC: markerPC, callDepth: state.callstack.len()}
+	loop, ok := state.foreachLoops[key]
+	if !ok {
+		// The marker is compiler-owned, so a missing seed means the control
+		// state could not be reconstructed. Widen the emitted value instead of
+		// silently representing only the first concrete round.
+		unknown := env.NewTopWithCause("foreach continuation could not be modeled")
+		state.storeExistingVar(fmt.Sprintf("%v", marker.Accumulator), unknown)
+		if len(state.stack) > 0 {
+			state.stack[len(state.stack)-1] = SValue{Schema: unknown}
+			state.invalidateShapeKey()
+		}
+		return []*execState{state}
+	}
+
+	current, currentOK := state.loadVar(loop.accumulator)
+	if !currentOK || loop.previous == nil {
+		unknown := env.NewTopWithCause("foreach accumulator could not be modeled")
+		state.storeExistingVar(loop.accumulator, unknown)
+		if len(state.stack) > 0 {
+			state.stack[len(state.stack)-1] = SValue{Schema: unknown}
+			state.invalidateShapeKey()
+		}
+		state.foreachLoops = withoutForeachLoop(state.foreachLoops, key)
+		return []*execState{state}
+	}
+
+	joined := Union([]*oas3.Schema{loop.previous, current}, env.opts)
+	stable := schemaSubsumes(loop.previous, current) ||
+		schemaFingerprint(joined) == schemaFingerprint(loop.previous)
+	round := loop.round + 1
+	forcedWiden := false
+	env.logger.Debugf("foreach loop: accumulator=%s round=%d previous=%s current=%s joined=%s stable=%v",
+		loop.accumulator, round, schemaTypeSummary(loop.previous, 2), schemaTypeSummary(current, 2),
+		schemaTypeSummary(joined, 2), stable)
+	if !stable && round > loopFixpointRounds+1 {
+		joined = env.NewTopWithCause("foreach fixpoint did not stabilize after widening")
+		stable = true
+		forcedWiden = true
+	} else if !stable && round > loopFixpointRounds {
+		joined = env.widenLoopValue(joined, make(map[*oas3.Schema]*oas3.Schema))
+	}
+
+	emitted := state.clone()
+	if forcedWiden {
+		emitted.storeExistingVar(loop.accumulator, joined)
+		if len(emitted.stack) > 0 {
+			emitted.stack[len(emitted.stack)-1] = SValue{Schema: joined}
+		}
+	}
+	emitted.foreachLoops = withoutForeachLoop(emitted.foreachLoops, key)
+	emitted.lineage += ".O"
+	emitted.invalidateShapeKey()
+	if stable {
+		return []*execState{emitted}
+	}
+
+	reentered := state.clone()
+	restoreForkContinuation(reentered, loop.continuation)
+	reentered.forks = loop.forks
+	reentered.labels = loop.labels
+	reentered.forkUpdates = append([]*forkControl(nil), loop.forkUpdates...)
+	reentered.storeExistingVar(loop.accumulator, joined)
+	reentered.lineage += ".L"
+	updated := loop
+	updated.previous = joined
+	updated.round = round
+	updated.continuation = cloneForkContinuation(loop.continuation)
+	updated.continuation.scopes = storeVarInScopes(updated.continuation.scopes, loop.accumulator, joined)
+	reentered.foreachLoops = cloneForeachLoops(reentered.foreachLoops)
+	reentered.foreachLoops[key] = updated
+	reentered.invalidateShapeKey()
+	return []*execState{emitted, reentered}
+}
+
+func cloneForeachLoops(loops map[foreachLoopKey]foreachLoopState) map[foreachLoopKey]foreachLoopState {
+	cloned := make(map[foreachLoopKey]foreachLoopState, len(loops)+1)
+	for key, loop := range loops {
+		cloned[key] = loop
+	}
+	return cloned
+}
+
+func withoutForeachLoop(loops map[foreachLoopKey]foreachLoopState, remove foreachLoopKey) map[foreachLoopKey]foreachLoopState {
+	cloned := make(map[foreachLoopKey]foreachLoopState, maxInt(0, len(loops)-1))
+	for key, loop := range loops {
+		if key != remove {
+			cloned[key] = loop
+		}
+	}
+	return cloned
+}
+
+func (env *schemaEnv) restoreBacktrackLoopExit(state *execState, loop backtrackLoop, accumulator *oas3.Schema) *execState {
+	exit := state.clone()
+	restoreForkContinuation(exit, loop.fork)
+	exit.storeExistingVar(loop.accumulator, accumulator)
+	exit.forks = state.forks.truncate(loop.forkDepth - 1)
+	exit.lineage += ".E"
+	exit.invalidateShapeKey()
+	return exit
+}
+
+func (env *schemaEnv) shouldWidenRecursiveCall(stack callStack, targetPC int, input *oas3.Schema) bool {
+	if stack.targetInputSubsumes(targetPC, input) {
+		return true
+	}
+	limit := env.opts.MaxDepth / 12
+	if limit < 2 {
+		limit = 2
+	}
+	if limit > 8 {
+		limit = 8
+	}
+	return stack.countTarget(targetPC) >= limit
+}
+
+// execBackwardJump is a small abstract loop-header cache for compiler-emitted
+// while/until/repeat bodies. A repeated state already subsumed by a processed
+// header cannot add outputs; growing states are joined for a few rounds and
+// then widened once so a typed-but-unknown value cannot run to the global VM
+// iteration guard.
+func (env *schemaEnv) execBackwardJump(state *execState) []*execState {
+	if state == nil {
+		return nil
+	}
+	if env.loopHeads == nil {
+		env.loopHeads = make(map[string]*loopHeadState)
+	}
+	callHash := state.callstack.shapeHash()
+	key := fmt.Sprintf("%d:%x:%s", state.pc, callHash, shapeKey(state, false))
+	previous := env.loopHeads[key]
+	if previous == nil {
+		env.loopHeads[key] = &loopHeadState{state: state.clone(), rounds: 1}
+		return []*execState{state}
+	}
+	if loopStateSubsumes(previous.state, state) {
+		if !previous.widened && state.pc >= 0 && state.pc < len(env.codes) && env.codes[state.pc].op == opFork {
+			widened := env.widenRecursiveLoopState(state)
+			env.widenLoopGeneratorArrays(widened)
+			env.loopHeads[key] = &loopHeadState{state: widened.clone(), rounds: previous.rounds + 1, widened: true}
+			return []*execState{widened}
+		}
+		env.logger.Debugf("backward loop fixpoint at pc=%d after %d rounds", state.pc, previous.rounds)
+		return nil
+	}
+	if !compatibleStateShapes(previous.state, state, false) {
+		// The same bytecode header can be invoked with multiple structural
+		// layouts. Do not combine them; call-depth bounding remains the safe
+		// fallback for this uncommon case.
+		return []*execState{state}
+	}
+
+	joined := joinState(previous.state, state, env.opts)
+	rounds := previous.rounds + 1
+	if rounds > loopFixpointRounds {
+		joined = env.widenRecursiveLoopState(joined)
+	}
+	env.loopHeads[key] = &loopHeadState{state: joined.clone(), rounds: rounds, widened: rounds > loopFixpointRounds}
+	return []*execState{joined}
+}
+
+func (env *schemaEnv) widenLoopGeneratorArrays(state *execState) bool {
+	changed := false
+	env.logger.Debugf("widen recursive loop generators: forks=%d", state.forks.len())
+	for node := state.forks.tail; node != nil; node = node.prev {
+		key := node.value.arrayAppendKey
+		env.logger.Debugf("widen recursive loop generator continuation: target=%d key=%q", node.value.targetPC, key)
+		if key == "" {
+			continue
+		}
+		array, ok := state.loadVar(key)
+		if !ok {
+			continue
+		}
+		allocID, ok := state.schemaToAlloc[array]
+		if !ok {
+			continue
+		}
+		canonical := state.accum[allocID]
+		if canonical == nil || getType(canonical) != "array" {
+			continue
+		}
+		widened := cloneSchema(canonical)
+		widened.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](
+			env.NewTopWithCause("recursive array generator reached an abstract fixpoint"))
+		widened.PrefixItems = nil
+		widened.MinItems = nil
+		widened.MaxItems = nil
+		state.accum[allocID] = widened
+		state.schemaToAlloc[widened] = allocID
+		state.storeExistingVar(key, widened)
+		changed = true
+	}
+	return changed
+}
+
+func loopStateSubsumes(dom, sub *execState) bool {
+	if dom == nil || sub == nil || dom.pc != sub.pc || len(dom.stack) != len(sub.stack) ||
+		len(dom.scopes) != len(sub.scopes) || !compatibleStateShapes(dom, sub, false) {
+		return false
+	}
+	for i := range dom.stack {
+		if !schemaSubsumes(dom.stack[i].Schema, sub.stack[i].Schema) {
+			return false
+		}
+	}
+	for i := range dom.scopes {
+		for key, subValue := range sub.scopes[i] {
+			domValue, ok := dom.scopes[i][key]
+			if !ok || !schemaSubsumes(domValue, subValue) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (env *schemaEnv) widenRecursiveLoopState(state *execState) *execState {
+	widened := state.clone()
+	activeArrays := make(map[string]struct{})
+	for node := state.forks.tail; node != nil; node = node.prev {
+		if node.value.arrayAppendKey != "" {
+			activeArrays[node.value.arrayAppendKey] = struct{}{}
+		}
+	}
+	for i := range widened.stack {
+		if _, ok := getClosurePC(widened.stack[i].Schema); ok {
+			continue
+		}
+		widened.stack[i] = SValue{Schema: env.NewTopWithCause("recursive loop fixpoint exceeded widening budget")}
+	}
+	for i, scope := range widened.scopes {
+		frame := make(map[string]*oas3.Schema, len(scope))
+		for key, value := range scope {
+			if _, ok := activeArrays[key]; ok {
+				frame[key] = value
+				continue
+			}
+			if _, ok := getClosurePC(value); ok {
+				frame[key] = value
+				continue
+			}
+			frame[key] = env.NewTopWithCause("recursive loop variable exceeded widening budget")
+		}
+		widened.scopes[i] = frame
+	}
+	widened.scopeShapes = nil
+	widened.depthWidenBlocked = true
+	widened.invalidateShapeKey()
+	return widened
+}
+
+func loadVarFromScopes(scopes []map[string]*oas3.Schema, key string) (*oas3.Schema, bool) {
+	for i := len(scopes) - 1; i >= 0; i-- {
+		if value, ok := scopes[i][key]; ok {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func storeVarInScopes(scopes []map[string]*oas3.Schema, key string, value *oas3.Schema) []map[string]*oas3.Schema {
+	result := append([]map[string]*oas3.Schema(nil), scopes...)
+	for i := len(result) - 1; i >= 0; i-- {
+		if _, ok := result[i][key]; !ok {
+			continue
+		}
+		result[i] = cloneScopeMap(result[i])
+		result[i][key] = value
+		return result
+	}
+	if len(result) > 0 {
+		result[len(result)-1] = cloneScopeMap(result[len(result)-1])
+		result[len(result)-1][key] = value
+	}
+	return result
+}
+
+func (s *execState) storeExistingVar(key string, value *oas3.Schema) {
+	s.scopes = storeVarInScopes(s.scopes, key, value)
+	s.scopeShapes = nil
+	s.invalidateShapeKey()
+}
+
+// widenLoopValue removes value/count facets after bounded growth while
+// retaining cheap container shape. It is applied only after repeated strict
+// growth; one additional body pass then proves the widened fixpoint stable.
+func (env *schemaEnv) widenLoopValue(schema *oas3.Schema, seen map[*oas3.Schema]*oas3.Schema) *oas3.Schema {
+	if schema == nil {
+		return Bottom()
+	}
+	if isTopSchema(schema) {
+		return env.NewTopWithCause("reduce/foreach fixpoint exceeded widening budget")
+	}
+	if widened, ok := seen[schema]; ok {
+		return widened
+	}
+	if branches, ok := disjunctiveBranches(schema); ok {
+		widened := make([]*oas3.Schema, 0, len(branches))
+		for _, branch := range branches {
+			widened = append(widened, env.widenLoopValue(branch, seen))
+		}
+		return Union(widened, env.opts)
+	}
+
+	switch getType(schema) {
+	case "string":
+		return StringType()
+	case "integer":
+		return IntegerType()
+	case "number":
+		return NumberType()
+	case "boolean":
+		return BoolType()
+	case "null":
+		return NullType()
+	case "array":
+		result := ArrayType(Top())
+		seen[schema] = result
+		if items := arrayElementUnion(schema, env.opts); items != nil {
+			result.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](env.widenLoopValue(items, seen))
+		}
+		return result
+	case "object":
+		result := cloneSchema(schema)
+		seen[schema] = result
+		result.Enum = nil
+		result.Const = nil
+		result.MinProperties = nil
+		result.MaxProperties = nil
+		if schema.Properties != nil {
+			result.Properties = cloneSchemaMap(schema.Properties)
+			for key, property := range schema.Properties.All() {
+				if child := resolvedLeft(property); child != nil {
+					result.Properties.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](env.widenLoopValue(child, seen)))
+				}
+			}
+		}
+		if child := resolvedLeft(schema.AdditionalProperties); child != nil {
+			result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](env.widenLoopValue(child, seen))
+		}
+		return result
+	default:
+		return env.NewTopWithCause("reduce/foreach accumulator type is unknown")
+	}
 }
 
 func (env *schemaEnv) arrayGeneratorAppendKey(targetPC int) (string, bool) {
@@ -3444,15 +3988,16 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 	case int:
 		// User-defined function: record call site for 1-CFA and jump
 		targetPC := v
-		if state.callstack.containsTarget(targetPC) && isTopSchema(state.top()) {
+		input := state.top()
+		if env.shouldWidenRecursiveCall(state.callstack, targetPC, input) {
 			state.pop()
-			state.push(env.NewTopWithCause("recursive function call over unknown input"))
+			state.push(env.NewTopWithCause("recursion depth limit for function call"))
 			return []*execState{state}, nil
 		}
 		// Record call site PC (for accumulator disambiguation)
 		// removed callSitePC = state.pc
 		// Push return PC (state.pc is already incremented by dispatcher)
-		state.callstack = state.callstack.append(state.pc, targetPC)
+		state.callstack = state.callstack.append(state.pc, targetPC, input)
 		state.invalidateShapeKey()
 		// Jump to function
 		state.pc = targetPC
@@ -4467,6 +5012,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			callstack:     a.callstack,
 			forks:         mergedForks,
 			labels:        joinLabelContinuations(a.labels, b.labels, mergedForks.len()),
+			foreachLoops:  joinForeachLoops(a.foreachLoops, b.foreachLoops, opts),
 			tryDepth:      a.tryDepth,
 			pathMode:      a.pathMode,
 			currentPath:   a.currentPath,
@@ -4805,6 +5351,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 		callstack:     a.callstack, // Assume same callstack in partition
 		forks:         mergedForks,
 		labels:        joinLabelContinuations(a.labels, b.labels, mergedForks.len()),
+		foreachLoops:  joinForeachLoops(a.foreachLoops, b.foreachLoops, opts),
 		tryDepth:      a.tryDepth,
 		pathMode:      a.pathMode,
 		currentPath:   a.currentPath,
@@ -5157,6 +5704,50 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 	return merged
 }
 
+func joinForeachLoops(a, b map[foreachLoopKey]foreachLoopState, opts SchemaExecOptions) map[foreachLoopKey]foreachLoopState {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	joined := make(map[foreachLoopKey]foreachLoopState, len(a))
+	for key, left := range a {
+		right, ok := b[key]
+		if !ok {
+			continue
+		}
+		loop := left
+		loop.previous = Union([]*oas3.Schema{left.previous, right.previous}, opts)
+		loop.round = maxInt(left.round, right.round)
+		loop.continuation = cloneForkContinuation(left.continuation)
+		loop.forks = joinForkContinuations(left.forks, right.forks)
+		loop.labels = joinLabelContinuations(left.labels, right.labels, loop.forks.len())
+		loop.forkUpdates = append([]*forkControl(nil), left.forkUpdates...)
+		for index := range loop.continuation.stack {
+			loop.continuation.stack[index] = joinedStackValue(
+				left.continuation.stack[index], right.continuation.stack[index])
+			loop.continuation.stack[index].Schema = Union([]*oas3.Schema{
+				left.continuation.stack[index].Schema,
+				right.continuation.stack[index].Schema,
+			}, opts)
+		}
+		for index := range loop.continuation.scopes {
+			frame := cloneScopeMap(left.continuation.scopes[index])
+			for name, value := range right.continuation.scopes[index] {
+				if existing, exists := frame[name]; exists {
+					frame[name] = Union([]*oas3.Schema{existing, value}, opts)
+				} else {
+					frame[name] = value
+				}
+			}
+			loop.continuation.scopes[index] = frame
+		}
+		joined[key] = loop
+	}
+	return joined
+}
+
 // joinTwoSchemas performs schema-level join (LUB) using Union.
 func joinTwoSchemas(a, b *oas3.Schema) *oas3.Schema {
 	// CRITICAL FIX: If pointers are identical, return immediately to preserve pointer identity
@@ -5209,7 +5800,7 @@ func partitionByShape(states []*execState, relaxScopeKeys bool) [][]*execState {
 func compatibleStateShapes(a, b *execState, relaxScopeKeys bool) bool {
 	if len(a.stack) != len(b.stack) || len(a.scopes) != len(b.scopes) ||
 		a.tryDepth != b.tryDepth || !equalCallStacks(a.callstack, b.callstack) ||
-		!equalLabelContinuations(a.labels, b.labels) {
+		!equalLabelContinuations(a.labels, b.labels) || !compatibleForeachLoops(a.foreachLoops, b.foreachLoops) {
 		return false
 	}
 	if a.scopeShapes != b.scopeShapes {
@@ -5287,6 +5878,13 @@ func shapeKey(s *execState, relaxScopeKeys bool) string {
 	}
 	buf.WriteString(";try:")
 	buf.WriteString(strconv.Itoa(s.tryDepth))
+	buf.WriteString(";foreach:")
+	for _, key := range sortedForeachLoopKeys(s.foreachLoops) {
+		buf.WriteString(strconv.Itoa(key.markerPC))
+		buf.WriteByte('/')
+		buf.WriteString(strconv.Itoa(key.callDepth))
+		buf.WriteByte(',')
+	}
 
 	key := buf.String()
 	if relaxScopeKeys {
@@ -5297,6 +5895,66 @@ func shapeKey(s *execState, relaxScopeKeys bool) string {
 		s.shapeKeyValid = true
 	}
 	return key
+}
+
+func sortedForeachLoopKeys(loops map[foreachLoopKey]foreachLoopState) []foreachLoopKey {
+	keys := make([]foreachLoopKey, 0, len(loops))
+	for key := range loops {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].markerPC != keys[j].markerPC {
+			return keys[i].markerPC < keys[j].markerPC
+		}
+		return keys[i].callDepth < keys[j].callDepth
+	})
+	return keys
+}
+
+func compatibleForeachLoops(a, b map[foreachLoopKey]foreachLoopState) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, left := range a {
+		right, ok := b[key]
+		if !ok || left.accumulator != right.accumulator ||
+			!compatibleForkContinuations(left.continuation, right.continuation) ||
+			!compatibleForkStacks(left.forks, right.forks) ||
+			!equalLabelContinuations(left.labels, right.labels) ||
+			!equalForkUpdates(left.forkUpdates, right.forkUpdates) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalForkUpdates(a, b []*forkControl) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for index := range a {
+		if a[index] != b[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func compatibleForkStacks(a, b forkContinuations) bool {
+	if a.tail == b.tail {
+		return true
+	}
+	if a.len() != b.len() {
+		return false
+	}
+	left, right := a.tail, b.tail
+	for left != nil && right != nil {
+		if !compatibleForkContinuations(left.value, right.value) {
+			return false
+		}
+		left, right = left.prev, right.prev
+	}
+	return left == nil && right == nil
 }
 
 func scopeShapeHash(s *execState, relaxed bool) [sha256.Size]byte {

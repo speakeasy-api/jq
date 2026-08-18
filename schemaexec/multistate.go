@@ -22,16 +22,17 @@ type execState struct {
 	relaxedShapeKey      string                    // Cached relaxed state-shape key
 	shapeKeyValid        bool
 	relaxedShapeKeyValid bool
-	depth                int                     // Recursion depth (for limiting)
-	accum                map[string]*oas3.Schema // Shared: allocID → canonical array
-	schemaToAlloc        map[*oas3.Schema]string // Shared: schema pointer → allocID (for opAppend)
-	allocCounter         *int                    // Shared: Monotonic counter for unique allocation IDs
-	callstack            callStack               // Per-state: persistent return-address stack
-	forks                forkContinuations       // Per-state: persistent pending backtracking continuations
-	labels               labelContinuations      // Per-state: persistent active label boundaries
-	tryDepth             int                     // Per-state: active try regions on the success path
-	depthWidenBlocked    bool                    // Joined incompatible control contexts must fall back to output Top
-	forkUpdates          []*forkControl          // Updates shared with eager fork alternatives
+	depth                int                                 // Recursion depth (for limiting)
+	accum                map[string]*oas3.Schema             // Shared: allocID → canonical array
+	schemaToAlloc        map[*oas3.Schema]string             // Shared: schema pointer → allocID (for opAppend)
+	allocCounter         *int                                // Shared: Monotonic counter for unique allocation IDs
+	callstack            callStack                           // Per-state: persistent return-address stack
+	forks                forkContinuations                   // Per-state: persistent pending backtracking continuations
+	labels               labelContinuations                  // Per-state: persistent active label boundaries
+	foreachLoops         map[foreachLoopKey]foreachLoopState // Per-state: immutable foreach iteration snapshots
+	tryDepth             int                                 // Per-state: active try regions on the success path
+	depthWidenBlocked    bool                                // Joined incompatible control contexts must fall back to output Top
+	forkUpdates          []*forkControl                      // Updates shared with eager fork alternatives
 
 	// Path collection (for del/getpath/setpath operations)
 	pathMode      bool          // Are we collecting a path (between opPathBegin/opPathEnd)?
@@ -186,8 +187,10 @@ type PathAllElements struct{}
 // refines or joins a continuation must construct a replacement value.
 type forkContinuation struct {
 	kind           int
+	continuePC     int
 	targetPC       int
 	arrayAppendKey string
+	loopRound      int
 	stack          []SValue
 	scopeDepth     int
 	scopes         []map[string]*oas3.Schema
@@ -202,9 +205,28 @@ type forkContinuation struct {
 	shapeHash      [sha256.Size]byte
 }
 
+// foreachLoopState holds the immutable seed/continuation for one active
+// foreach invocation. Updates replace the map entry instead of mutating a
+// snapshot shared by cloned states.
+type foreachLoopState struct {
+	accumulator  string
+	previous     *oas3.Schema
+	round        int
+	continuation forkContinuation
+	forks        forkContinuations
+	labels       labelContinuations
+	forkUpdates  []*forkControl
+}
+
+type foreachLoopKey struct {
+	markerPC  int
+	callDepth int
+}
+
 type callStackNode struct {
 	returnPC int
 	targetPC int
+	input    *oas3.Schema
 	prev     *callStackNode
 	depth    int
 	shape    [sha256.Size]byte
@@ -267,7 +289,7 @@ func (s callStack) len() int {
 	return s.tail.depth
 }
 
-func (s callStack) append(returnPC, targetPC int) callStack {
+func (s callStack) append(returnPC, targetPC int, input *oas3.Schema) callStack {
 	var hashInput [sha256.Size + 16]byte
 	if s.tail != nil {
 		copy(hashInput[:sha256.Size], s.tail.shape[:])
@@ -277,10 +299,30 @@ func (s callStack) append(returnPC, targetPC int) callStack {
 	return callStack{tail: &callStackNode{
 		returnPC: returnPC,
 		targetPC: targetPC,
+		input:    input,
 		prev:     s.tail,
 		depth:    s.len() + 1,
 		shape:    sha256.Sum256(hashInput[:]),
 	}}
+}
+
+func (s callStack) countTarget(targetPC int) int {
+	count := 0
+	for node := s.tail; node != nil; node = node.prev {
+		if node.targetPC == targetPC {
+			count++
+		}
+	}
+	return count
+}
+
+func (s callStack) targetInputSubsumes(targetPC int, input *oas3.Schema) bool {
+	for node := s.tail; node != nil; node = node.prev {
+		if node.targetPC == targetPC && schemaSubsumes(node.input, input) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s callStack) pop() (int, callStack, bool) {
@@ -288,15 +330,6 @@ func (s callStack) pop() (int, callStack, bool) {
 		return 0, s, false
 	}
 	return s.tail.returnPC, callStack{tail: s.tail.prev}, true
-}
-
-func (s callStack) containsTarget(targetPC int) bool {
-	for node := s.tail; node != nil; node = node.prev {
-		if node.targetPC == targetPC {
-			return true
-		}
-	}
-	return false
 }
 
 func (s callStack) shapeHash() [sha256.Size]byte {
@@ -399,6 +432,8 @@ func (f forkContinuations) append(value forkContinuation) forkContinuations {
 func forkContinuationShapeHash(fork forkContinuation) [sha256.Size]byte {
 	var buf strings.Builder
 	buf.WriteString(strconv.Itoa(fork.kind))
+	buf.WriteByte(':')
+	buf.WriteString(strconv.Itoa(fork.continuePC))
 	buf.WriteByte(':')
 	buf.WriteString(strconv.Itoa(fork.targetPC))
 	buf.WriteByte(':')
@@ -674,6 +709,7 @@ func (s *execState) clone() *execState {
 	// Continuations form an immutable persistent stack.
 	forksCopy := s.forks
 	labelsCopy := s.labels
+	foreachLoopsCopy := s.foreachLoops
 	forkUpdatesCopy := append([]*forkControl(nil), s.forkUpdates...)
 
 	pathCopy := s.currentPath
@@ -713,6 +749,7 @@ func (s *execState) clone() *execState {
 		callstack:            callstackCopy,
 		forks:                forksCopy,
 		labels:               labelsCopy,
+		foreachLoops:         foreachLoopsCopy,
 		tryDepth:             s.tryDepth,
 		depthWidenBlocked:    s.depthWidenBlocked,
 		forkUpdates:          forkUpdatesCopy,
@@ -753,6 +790,7 @@ func joinForkContinuations(a, b forkContinuations) forkContinuations {
 			fork.control = nil
 		}
 		fork.depth = maxInt(fork.depth, bValues[i].depth)
+		fork.loopRound = maxInt(fork.loopRound, bValues[i].loopRound)
 		for j := range fork.stack {
 			fork.stack[j].Schema = joinTwoSchemas(fork.stack[j].Schema, bValues[i].stack[j].Schema)
 			if !sameValueProvenance(fork.stack[j], bValues[i].stack[j]) {
@@ -777,6 +815,7 @@ func joinForkContinuations(a, b forkContinuations) forkContinuations {
 
 func compatibleForkContinuations(a, b forkContinuation) bool {
 	if a.kind != b.kind ||
+		a.continuePC != b.continuePC ||
 		a.targetPC != b.targetPC ||
 		a.arrayAppendKey != b.arrayAppendKey ||
 		len(a.stack) != len(b.stack) ||

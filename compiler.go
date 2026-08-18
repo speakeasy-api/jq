@@ -777,7 +777,9 @@ func (c *compiler) compileForeach(e *Foreach) error {
 		return err
 	}
 	f()
+	initialStorePC := len(c.codes)
 	c.append(&code{op: opstore, v: v})
+	continuePC := len(c.codes)
 	if err := c.compileQuery(e.Query); err != nil {
 		return err
 	}
@@ -792,6 +794,11 @@ func (c *compiler) compileForeach(e *Foreach) error {
 	f()
 	c.append(&code{op: opdup})
 	c.append(&code{op: opstore, v: v})
+	c.append(&code{op: opnop, v: SchemaForeachMarker{
+		Accumulator:    v,
+		InitialStorePC: initialStorePC,
+		ContinuePC:     continuePC,
+	}})
 	if e.Extract != nil {
 		defer c.newScopeDepth()()
 		return c.compileQuery(e.Extract)

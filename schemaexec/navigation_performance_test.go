@@ -49,11 +49,11 @@ func benchmarkAnalyze(b *testing.B, expression string, input *oas3.Schema) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		if _, err := Analyze(context.Background(), query, input); err != nil {
-			b.Logf("analysis outcome: %v", err)
-			return
+			b.Fatal(err)
 		}
 	}
 }

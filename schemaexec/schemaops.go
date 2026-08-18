@@ -783,7 +783,7 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 			continue // Bottom
 		}
 		if isTopSchema(s) {
-			return Top()
+			return s
 		}
 		validSchemas = append(validSchemas, s)
 	}
@@ -865,6 +865,59 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 		return first
 	}
 
+	// Tuples need a positional join. Treating prefixItems arrays as ordinary
+	// homogeneous arrays either discards every positional constraint or, when
+	// subsumption has made a bad choice, keeps only one tuple. For each index,
+	// union the schemas contributed by branches which can actually contain that
+	// index. Length bounds retain the union of the branches' ranges, while the
+	// tail is false only when no branch can extend beyond the merged prefix.
+	maxPrefix := 0
+	for _, schema := range schemas {
+		if len(schema.PrefixItems) > maxPrefix {
+			maxPrefix = len(schema.PrefixItems)
+		}
+	}
+	if maxPrefix > 0 {
+		result := &oas3.Schema{Type: oas3.NewTypeFromString(oas3.SchemaTypeArray)}
+		result.PrefixItems = make([]*oas3.JSONSchema[oas3.Referenceable], 0, maxPrefix)
+		for index := 0; index < maxPrefix; index++ {
+			candidates := make([]*oas3.Schema, 0, len(schemas))
+			for _, schema := range schemas {
+				candidate, possible, known := arraySchemaAtIndex(schema, index)
+				if !known {
+					candidate, possible = Top(), true
+				}
+				if possible {
+					candidates = append(candidates, candidate)
+				}
+			}
+			if len(candidates) == 0 {
+				break
+			}
+			result.PrefixItems = append(result.PrefixItems,
+				oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Union(candidates, opts)))
+		}
+
+		tailCandidates := make([]*oas3.Schema, 0, len(schemas))
+		for _, schema := range schemas {
+			candidate, possible, known := arraySchemaAtIndex(schema, len(result.PrefixItems))
+			if !known {
+				candidate, possible = Top(), true
+			}
+			if possible {
+				tailCandidates = append(tailCandidates, candidate)
+			}
+		}
+		if len(tailCandidates) == 0 {
+			result.Items = oas3.NewJSONSchemaFromBool(false)
+		} else {
+			result.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Union(tailCandidates, opts))
+		}
+		mergeArrayLengthBounds(result, schemas)
+		mergeArrayNullability(result, schemas)
+		return result
+	}
+
 	// Collect all item schemas ($refs followed). A non-empty array branch
 	// WITHOUT an items schema admits items of any type: it contributes Top.
 	// Only empty-array sentinels (maxItems=0) contribute nothing.
@@ -892,6 +945,7 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 			Type: oas3.NewTypeFromString(oas3.SchemaTypeArray),
 		}
 		mergeArrayLengthBounds(result, schemas)
+		mergeArrayNullability(result, schemas)
 		return result
 	}
 
@@ -911,7 +965,18 @@ func tryMergeArrays(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 
 	result := ArrayType(mergedItems)
 	mergeArrayLengthBounds(result, schemas)
+	mergeArrayNullability(result, schemas)
 	return result
+}
+
+func mergeArrayNullability(result *oas3.Schema, schemas []*oas3.Schema) {
+	for _, schema := range schemas {
+		if schema.Nullable != nil && *schema.Nullable {
+			nullable := true
+			result.Nullable = &nullable
+			return
+		}
+	}
 }
 
 func mergeArrayLengthBounds(result *oas3.Schema, schemas []*oas3.Schema) {
@@ -2472,6 +2537,32 @@ func arrayConstraintsSubsumed(a, b *oas3.Schema, seen map[subschemaPair]bool) bo
 		}
 	}
 
+	// prefixItems constrain positions independently. Prove containment at
+	// every position where either tuple has a distinct positional schema, plus
+	// one representative tail position. If a wrapper cannot be resolved, do
+	// not claim subsumption: keeping both union branches is conservative.
+	if len(a.PrefixItems) > 0 || len(b.PrefixItems) > 0 {
+		limit := maxInt(len(a.PrefixItems), len(b.PrefixItems))
+		for index := 0; index <= limit; index++ {
+			aValue, aPossible, aKnown := arraySchemaAtIndex(a, index)
+			bValue, bPossible, bKnown := arraySchemaAtIndex(b, index)
+			if !aKnown || !bKnown {
+				return false
+			}
+			if !aPossible {
+				continue
+			}
+			if !bPossible || !isSubschemaOfSeen(aValue, bValue, seen) {
+				return false
+			}
+		}
+
+		if b.UniqueItems != nil && *b.UniqueItems && (a.UniqueItems == nil || !*a.UniqueItems) {
+			return false
+		}
+		return true
+	}
+
 	// Check items: A.items must be subschema of B.items ($refs followed)
 	aItems := resolvedLeft(a.Items)
 	bItems := resolvedLeft(b.Items)
@@ -2513,6 +2604,39 @@ func arrayConstraintsSubsumed(a, b *oas3.Schema, seen map[subschemaPair]bool) bo
 	}
 
 	return true
+}
+
+// arraySchemaAtIndex returns the element schema applied at index. possible is
+// false when length bounds or a boolean-false positional/tail schema prove the
+// array cannot contain that position. known is false for unresolved wrappers,
+// for which callers must avoid making a narrowing containment claim.
+func arraySchemaAtIndex(array *oas3.Schema, index int) (schema *oas3.Schema, possible, known bool) {
+	if array == nil || index < 0 || getType(array) != "array" {
+		return nil, false, true
+	}
+	if array.MaxItems != nil && *array.MaxItems <= int64(index) {
+		return nil, false, true
+	}
+
+	var wrapper *oas3.JSONSchema[oas3.Referenceable]
+	if index < len(array.PrefixItems) {
+		wrapper = array.PrefixItems[index]
+	} else {
+		wrapper = array.Items
+	}
+	if wrapper == nil {
+		return Top(), true, true
+	}
+	if wrapper.Right != nil {
+		if !*wrapper.Right {
+			return nil, false, true
+		}
+		return Top(), true, true
+	}
+	if resolved := resolvedLeft(wrapper); resolved != nil {
+		return resolved, true, true
+	}
+	return nil, true, false
 }
 
 // objectConstraintsSubsumed checks if A's object constraints are stricter than or equal to B's

@@ -2283,62 +2283,77 @@ func mergeObjectsForPlus(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 
 // builtinMinus implements - for two values.
 func builtinMinus(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) < 1 {
-		return []*oas3.Schema{NumberType()}, nil
+	lhs, rhs, ok := binaryOperands(input, args)
+	if !ok {
+		return []*oas3.Schema{env.NewTopWithCause("minus operands could not be modeled")}, nil
 	}
-
-	var lhs, rhs *oas3.Schema
-	if len(args) == 2 {
-		// Some jq plans encode - as arity-2
-		lhs, rhs = pickBinaryOperands(input, args[0], args[1])
-	} else {
-		// Arity-1: jq uses lhs as input, rhs as arg[0]
-		lhs = input
-		rhs = args[0]
-	}
-
-	// Safety check
-	if lhs == nil || rhs == nil {
-		return []*oas3.Schema{NumberType()}, nil
-	}
-
-	lType := getType(lhs)
-	rType := getType(rhs)
-
-	// Array subtraction: remove all occurrences of elements in rhs from lhs
-	if lType == "array" && rType == "array" {
-		return []*oas3.Schema{subtractArraySchemas(lhs, rhs, env.opts)}, nil
-	}
-
-	// Numbers (default arithmetic operation)
-	return arithmeticOp(lhs, rhs, func(a, b float64) float64 { return a - b })
+	return []*oas3.Schema{distributeBinarySchemas(lhs, rhs, env, func(a, b *oas3.Schema) *oas3.Schema {
+		switch {
+		case isNumericType(getType(a)) && isNumericType(getType(b)):
+			return numericBinarySchema(a, b, func(x, y float64) float64 { return x - y })
+		case getType(a) == "array" && getType(b) == "array":
+			return subtractArraySchemas(a, b, env.opts)
+		case getType(a) == "" || getType(b) == "":
+			return env.NewTopWithCause("minus operand type is unknown")
+		default:
+			return Bottom()
+		}
+	})}, nil
 }
 
 // builtinMultiply implements * for two values.
 func builtinMultiply(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
-		return []*oas3.Schema{NumberType()}, nil
+	lhs, rhs, ok := binaryOperands(input, args)
+	if !ok {
+		return []*oas3.Schema{env.NewTopWithCause("multiply operands could not be modeled")}, nil
 	}
-	return arithmeticOp(input, args[0], func(a, b float64) float64 { return a * b })
+	seen := make(map[schemaPair]*oas3.Schema)
+	return []*oas3.Schema{distributeBinarySchemas(lhs, rhs, env, func(a, b *oas3.Schema) *oas3.Schema {
+		return multiplySchemaPair(a, b, env, seen)
+	})}, nil
 }
 
 // builtinDivide implements / for two values.
 func builtinDivide(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
-		return []*oas3.Schema{NumberType()}, nil
+	lhs, rhs, ok := binaryOperands(input, args)
+	if !ok {
+		return []*oas3.Schema{env.NewTopWithCause("divide operands could not be modeled")}, nil
 	}
-	return arithmeticOp(input, args[0], func(a, b float64) float64 { return a / b })
+	return []*oas3.Schema{distributeBinarySchemas(lhs, rhs, env, func(a, b *oas3.Schema) *oas3.Schema {
+		switch {
+		case isNumericType(getType(a)) && isNumericType(getType(b)):
+			if divisor, ok := constNumber(b); ok && divisor == 0 {
+				return Bottom()
+			}
+			return numericBinarySchema(a, b, func(x, y float64) float64 { return x / y })
+		case getType(a) == "string" && getType(b) == "string":
+			return splitStringSchema(a, b)
+		case getType(a) == "" || getType(b) == "":
+			return env.NewTopWithCause("divide operand type is unknown")
+		default:
+			return Bottom()
+		}
+	})}, nil
 }
 
 // builtinModulo implements % for two values.
 func builtinModulo(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
-		return []*oas3.Schema{NumberType()}, nil
+	lhs, rhs, ok := binaryOperands(input, args)
+	if !ok {
+		return []*oas3.Schema{env.NewTopWithCause("modulo operands could not be modeled")}, nil
 	}
-	return arithmeticOp(input, args[0], func(a, b float64) float64 {
-		// Integer modulo for integers
-		return float64(int(a) % int(b))
-	})
+	return []*oas3.Schema{distributeBinarySchemas(lhs, rhs, env, func(a, b *oas3.Schema) *oas3.Schema {
+		if getType(a) == "" || getType(b) == "" {
+			return env.NewTopWithCause("modulo operand type is unknown")
+		}
+		if !isNumericType(getType(a)) || !isNumericType(getType(b)) {
+			return Bottom()
+		}
+		if divisor, ok := constNumber(b); ok && divisor == 0 {
+			return Bottom()
+		}
+		return numericBinarySchema(a, b, math.Mod)
+	})}, nil
 }
 
 // builtinNegate implements unary - (negation).
@@ -2352,73 +2367,165 @@ func builtinNegate(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*
 	return []*oas3.Schema{NumberType()}, nil
 }
 
-// pickBinaryOperands chooses (lhs, rhs) robustly across jq calling conventions.
-// Object-first: preserve explicit args order for object+object cases.
-func pickBinaryOperands(input, a0, a1 *oas3.Schema) (*oas3.Schema, *oas3.Schema) {
-	// Count how many are objects
-	numObjects := 0
-	if getType(input) == "object" {
-		numObjects++
+func binaryOperands(input *oas3.Schema, args []*oas3.Schema) (*oas3.Schema, *oas3.Schema, bool) {
+	switch len(args) {
+	case 1:
+		return input, args[0], input != nil && args[0] != nil
+	case 2:
+		return args[0], args[1], args[0] != nil && args[1] != nil
+	default:
+		return nil, nil, false
 	}
-	if getType(a0) == "object" {
-		numObjects++
-	}
-	if getType(a1) == "object" {
-		numObjects++
-	}
-
-	// If we have 3 objects, the outer input is likely a1
-	// Prefer a0 (first operand) + input (second operand)
-	if numObjects == 3 {
-		return a0, input
-	}
-
-	// If a0 and input are both objects (common for object literals where a1 is null)
-	if getType(a0) == "object" && getType(input) == "object" {
-		return a0, input
-	}
-
-	// If both args are objects (and input is not), use args as-is
-	if getType(a0) == "object" && getType(a1) == "object" {
-		return a0, a1
-	}
-
-	cands := []*oas3.Schema{a0, a1, input}
-
-	// Prefer two non-object operands (avoid outer input object bleed-through)
-	nonObjIdx := make([]int, 0, 3)
-	for i, s := range cands {
-		if s == nil {
-			continue
-		}
-		if getType(s) != "object" {
-			nonObjIdx = append(nonObjIdx, i)
-		}
-	}
-	if len(nonObjIdx) >= 2 {
-		i := nonObjIdx[len(nonObjIdx)-2]
-		j := nonObjIdx[len(nonObjIdx)-1]
-		return cands[i], cands[j]
-	}
-
-	// Fallback: use args as-is
-	return a0, a1
 }
 
-// arithmeticOp performs arithmetic on two schemas.
-func arithmeticOp(lhs, rhs *oas3.Schema, op func(float64, float64) float64) ([]*oas3.Schema, error) {
-	lhsVal, lhsIsConst := extractConstValue(lhs)
-	rhsVal, rhsIsConst := extractConstValue(rhs)
-
-	if lhsIsConst && rhsIsConst {
-		lf, lok := lhsVal.(float64)
-		rf, rok := rhsVal.(float64)
-		if lok && rok {
-			return []*oas3.Schema{ConstNumber(op(lf, rf))}, nil
+func distributeBinarySchemas(lhs, rhs *oas3.Schema, env *schemaEnv, pair func(*oas3.Schema, *oas3.Schema) *oas3.Schema) *oas3.Schema {
+	left, right := explodeAlternatives(lhs), explodeAlternatives(rhs)
+	results := make([]*oas3.Schema, 0, len(left)*len(right))
+	for _, a := range left {
+		for _, b := range right {
+			if result := pair(a, b); result != nil {
+				results = append(results, result)
+			}
 		}
 	}
+	if len(results) == 0 {
+		return Bottom()
+	}
+	return Union(results, env.opts)
+}
 
-	return []*oas3.Schema{NumberType()}, nil
+func isNumericType(typ string) bool {
+	return typ == "integer" || typ == "number"
+}
+
+func constNumber(schema *oas3.Schema) (float64, bool) {
+	value, ok := extractConstValue(schema)
+	if !ok {
+		return 0, false
+	}
+	number, ok := value.(float64)
+	return number, ok
+}
+
+func numericBinarySchema(lhs, rhs *oas3.Schema, operation func(float64, float64) float64) *oas3.Schema {
+	left, leftOK := constNumber(lhs)
+	right, rightOK := constNumber(rhs)
+	if leftOK && rightOK {
+		return ConstNumber(operation(left, right))
+	}
+	return NumberType()
+}
+
+type schemaPair struct {
+	left  *oas3.Schema
+	right *oas3.Schema
+}
+
+func multiplySchemaPair(lhs, rhs *oas3.Schema, env *schemaEnv, seen map[schemaPair]*oas3.Schema) *oas3.Schema {
+	leftType, rightType := getType(lhs), getType(rhs)
+	switch {
+	case isNumericType(leftType) && isNumericType(rightType):
+		return numericBinarySchema(lhs, rhs, func(a, b float64) float64 { return a * b })
+	case leftType == "string" && isNumericType(rightType):
+		return repeatStringSchema(lhs, rhs, env.opts)
+	case leftType == "object" && rightType == "object":
+		return mergeObjectsForMultiply(lhs, rhs, env, seen)
+	case leftType == "" || rightType == "":
+		return env.NewTopWithCause("multiply operand type is unknown")
+	default:
+		return Bottom()
+	}
+}
+
+func repeatStringSchema(value, count *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	number, countOK := constNumber(count)
+	if !countOK {
+		return Union([]*oas3.Schema{StringType(), ConstNull()}, opts)
+	}
+	if number != math.Trunc(number) {
+		return Bottom()
+	}
+	if number < 0 {
+		return ConstNull()
+	}
+	text, textOK := extractConstString(value)
+	if !textOK {
+		return StringType()
+	}
+	// Constant folding must not turn authored jq into an allocation attack.
+	if number > 10_000 || float64(len(text))*number > 1_000_000 {
+		return StringType()
+	}
+	return ConstString(strings.Repeat(text, int(number)))
+}
+
+func splitStringSchema(value, separator *oas3.Schema) *oas3.Schema {
+	text, textOK := extractConstString(value)
+	sep, sepOK := extractConstString(separator)
+	if !textOK || !sepOK {
+		return ArrayType(StringType())
+	}
+	parts := strings.Split(text, sep)
+	elements := make([]*oas3.Schema, len(parts))
+	for i, part := range parts {
+		elements[i] = ConstString(part)
+	}
+	result := BuildArray(nil, elements)
+	length := int64(len(elements))
+	result.MinItems = &length
+	result.MaxItems = &length
+	result.Items = oas3.NewJSONSchemaFromBool(false)
+	return result
+}
+
+func mergeObjectsForMultiply(lhs, rhs *oas3.Schema, env *schemaEnv, seen map[schemaPair]*oas3.Schema) *oas3.Schema {
+	pair := schemaPair{left: lhs, right: rhs}
+	if result, ok := seen[pair]; ok {
+		return result
+	}
+	result := MergeObjects(lhs, rhs, env.opts)
+	seen[pair] = result
+	if result.Properties == nil || lhs.Properties == nil || rhs.Properties == nil {
+		return result
+	}
+	result = cloneSchema(result)
+	result.Properties = cloneSchemaMap(result.Properties)
+	seen[pair] = result
+	for key, leftProperty := range lhs.Properties.All() {
+		rightProperty, ok := rhs.Properties.Get(key)
+		if !ok {
+			continue
+		}
+		leftValue, rightValue := resolvedLeft(leftProperty), resolvedLeft(rightProperty)
+		if leftValue == nil || rightValue == nil {
+			result.Properties.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](
+				env.NewTopWithCause("recursive object merge property could not be resolved")))
+			continue
+		}
+		merged := recursiveMultiplyProperty(leftValue, rightValue, env, seen)
+		result.Properties.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](merged))
+	}
+	return result
+}
+
+func recursiveMultiplyProperty(lhs, rhs *oas3.Schema, env *schemaEnv, seen map[schemaPair]*oas3.Schema) *oas3.Schema {
+	left, right := explodeAlternatives(lhs), explodeAlternatives(rhs)
+	results := make([]*oas3.Schema, 0, len(left)*len(right))
+	for _, a := range left {
+		for _, b := range right {
+			switch {
+			case getType(a) == "object" && getType(b) == "object":
+				results = append(results, mergeObjectsForMultiply(a, b, env, seen))
+			case getType(a) == "" || getType(b) == "":
+				results = append(results, env.NewTopWithCause("recursive object merge property type is unknown"))
+			default:
+				// jq recursively merges only object/object conflicts; otherwise
+				// the right-hand property replaces the left-hand value.
+				results = append(results, b)
+			}
+		}
+	}
+	return Union(results, env.opts)
 }
 
 // isNullSchema returns true if schema is explicitly null type.
