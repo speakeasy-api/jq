@@ -127,7 +127,7 @@ func TestMixedLengthTupleUnionPreservesLengths(t *testing.T) {
 	}
 }
 
-func batch3bLoopInput() *oas3.Schema {
+func loopFixtureInput() *oas3.Schema {
 	item := BuildObject(map[string]*oas3.Schema{"v": IntegerType()}, []string{"v"})
 	return BuildObject(map[string]*oas3.Schema{
 		"tags":  ArrayType(StringType()),
@@ -137,7 +137,7 @@ func batch3bLoopInput() *oas3.Schema {
 }
 
 func TestReduceScalarAccumulatorReachesFixpoint(t *testing.T) {
-	input := batch3bLoopInput()
+	input := loopFixtureInput()
 	tests := []struct {
 		name       string
 		expression string
@@ -182,7 +182,7 @@ func TestReduceScalarAccumulatorReachesFixpoint(t *testing.T) {
 }
 
 func TestReduceObjectAccumulatorAdmitsUpdatedProperties(t *testing.T) {
-	input := batch3bLoopInput()
+	input := loopFixtureInput()
 	instance := map[string]any{
 		"tags":  []any{},
 		"items": []any{map[string]any{"v": 7}},
@@ -218,7 +218,7 @@ func TestForeachAccumulatorEmitsLaterRounds(t *testing.T) {
 	if got := concreteJQResult(t, expression, instance); !reflect.DeepEqual(got, []any{1, 2}) {
 		t.Fatalf("concrete output = %#v, want [1 2]", got)
 	}
-	analysis := analyzeExpr(t, expression, batch3bLoopInput())
+	analysis := analyzeExpr(t, expression, loopFixtureInput())
 	items := arrayElementUnion(analysis.Output, DefaultOptions())
 	if analysis.Verdict == VerdictProvenBroken || !schemaAdmitsInteger(items, 2) {
 		t.Fatalf("foreach items exclude 2: verdict=%s output=%s causes=%v",
@@ -256,7 +256,7 @@ func TestForeachExtractAndLabelsPreserveLaterRounds(t *testing.T) {
 			if got := concreteJQResults(t, test.expression, instance); !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("concrete outputs = %#v, want %#v", got, test.want)
 			}
-			analysis := analyzeExpr(t, test.expression, batch3bLoopInput())
+			analysis := analyzeExpr(t, test.expression, loopFixtureInput())
 			output := analysis.Output
 			if test.array {
 				output = arrayElementUnion(output, DefaultOptions())
@@ -286,7 +286,7 @@ func TestForeachDownstreamAndLimitPreserveLaterRounds(t *testing.T) {
 			if got := concreteJQResults(t, test.expression, instance); !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("concrete outputs = %#v, want %#v", got, test.want)
 			}
-			analysis := analyzeExpr(t, test.expression, batch3bLoopInput())
+			analysis := analyzeExpr(t, test.expression, loopFixtureInput())
 			output := analysis.Output
 			if test.array {
 				output = arrayElementUnion(output, DefaultOptions())
@@ -316,7 +316,7 @@ func TestReduceFixpointIsIndependentOfDownstreamContext(t *testing.T) {
 			if got := concreteJQResults(t, test.expression, instance); !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("concrete outputs = %#v, want %#v", got, test.want)
 			}
-			analysis := analyzeExpr(t, test.expression, batch3bLoopInput())
+			analysis := analyzeExpr(t, test.expression, loopFixtureInput())
 			if !schemaAdmitsInteger(analysis.Output, test.admit) {
 				t.Fatalf("output excludes %d: verdict=%s output=%s causes=%v",
 					test.admit, analysis.Verdict, schemaTypeSummary(analysis.Output, 5), analysis.Causes)
@@ -331,7 +331,7 @@ func TestReduceAccumulatorIncludesZeroIterationCase(t *testing.T) {
 	if got := concreteJQResult(t, expression, instance); got != 0 {
 		t.Fatalf("concrete output = %#v, want 0", got)
 	}
-	analysis := analyzeExpr(t, expression, batch3bLoopInput())
+	analysis := analyzeExpr(t, expression, loopFixtureInput())
 	if !schemaAdmitsInteger(analysis.Output, 0) {
 		t.Fatalf("output excludes zero-iteration accumulator: %s", schemaTypeSummary(analysis.Output, 4))
 	}
@@ -343,7 +343,7 @@ func TestReduceRetainsIdentityTrackedArrayAccumulator(t *testing.T) {
 	if got := concreteJQResult(t, expression, instance); !reflect.DeepEqual(got, []any{"a"}) {
 		t.Fatalf("concrete output = %#v, want [a]", got)
 	}
-	analysis := analyzeExpr(t, expression, batch3bLoopInput())
+	analysis := analyzeExpr(t, expression, loopFixtureInput())
 	items := arrayElementUnion(analysis.Output, DefaultOptions())
 	if analysis.Verdict == VerdictProvenBroken || !schemaAdmitsString(items, "a") {
 		t.Fatalf("identity-tracked accumulator excludes a: verdict=%s output=%s causes=%v",
@@ -470,7 +470,7 @@ func TestMinusModuloAndComparisonTypeAudit(t *testing.T) {
 }
 
 func TestTypedRecursiveLoopsTerminateAtAbstractFixpoint(t *testing.T) {
-	input := batch3bLoopInput()
+	input := loopFixtureInput()
 	tests := []struct {
 		expression string
 		wantType   string
