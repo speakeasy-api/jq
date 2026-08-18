@@ -15,6 +15,124 @@ func allElementsPathSchema() *oas3.Schema {
 	return result
 }
 
+func stripInternalSchemaMarkers(schema *oas3.Schema) *oas3.Schema {
+	if !hasInternalSchemaMarker(schema, make(map[*oas3.Schema]bool)) {
+		return schema
+	}
+	return stripInternalSchemaMarkersSeen(schema, make(map[*oas3.Schema]*oas3.Schema))
+}
+
+func hasInternalSchemaMarker(schema *oas3.Schema, seen map[*oas3.Schema]bool) bool {
+	if schema == nil || seen[schema] {
+		return false
+	}
+	seen[schema] = true
+	if schema.Format != nil && *schema.Format == allElementsPathFormat {
+		return true
+	}
+	hasWrapper := func(wrapper *oas3.JSONSchema[oas3.Referenceable]) bool {
+		return hasInternalSchemaMarker(resolvedLeft(wrapper), seen)
+	}
+	for _, wrappers := range [][]*oas3.JSONSchema[oas3.Referenceable]{schema.PrefixItems, schema.AllOf, schema.AnyOf, schema.OneOf} {
+		for _, wrapper := range wrappers {
+			if hasWrapper(wrapper) {
+				return true
+			}
+		}
+	}
+	for _, wrapper := range []*oas3.JSONSchema[oas3.Referenceable]{
+		schema.Items, schema.Contains, schema.AdditionalProperties, schema.PropertyNames,
+		schema.UnevaluatedItems, schema.UnevaluatedProperties, schema.ContentSchema,
+		schema.Not, schema.If, schema.Then, schema.Else,
+	} {
+		if hasWrapper(wrapper) {
+			return true
+		}
+	}
+	for _, values := range []*sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]]{
+		schema.Properties, schema.PatternProperties, schema.DependentSchemas, schema.Defs,
+	} {
+		if values == nil {
+			continue
+		}
+		for _, wrapper := range values.All() {
+			if hasWrapper(wrapper) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func stripInternalSchemaMarkersSeen(schema *oas3.Schema, memo map[*oas3.Schema]*oas3.Schema) *oas3.Schema {
+	if schema == nil {
+		return nil
+	}
+	if result, ok := memo[schema]; ok {
+		return result
+	}
+	result := cloneSchema(schema)
+	memo[schema] = result
+	if result.Format != nil && *result.Format == allElementsPathFormat {
+		result.Format = nil
+	}
+
+	stripWrapper := func(wrapper *oas3.JSONSchema[oas3.Referenceable]) *oas3.JSONSchema[oas3.Referenceable] {
+		if wrapper == nil {
+			return wrapper
+		}
+		if value, ok := resolvedBooleanSchema(wrapper); ok {
+			return oas3.NewJSONSchemaFromBool(value)
+		}
+		left := resolvedLeft(wrapper)
+		if left == nil {
+			return wrapper
+		}
+		return oas3.NewJSONSchemaFromSchema[oas3.Referenceable](stripInternalSchemaMarkersSeen(left, memo))
+	}
+	stripSlice := func(wrappers []*oas3.JSONSchema[oas3.Referenceable]) []*oas3.JSONSchema[oas3.Referenceable] {
+		if wrappers == nil {
+			return nil
+		}
+		cleaned := make([]*oas3.JSONSchema[oas3.Referenceable], len(wrappers))
+		for i, wrapper := range wrappers {
+			cleaned[i] = stripWrapper(wrapper)
+		}
+		return cleaned
+	}
+	stripMap := func(values *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]]) *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]] {
+		if values == nil {
+			return nil
+		}
+		cleaned := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+		for key, wrapper := range values.All() {
+			cleaned.Set(key, stripWrapper(wrapper))
+		}
+		return cleaned
+	}
+
+	result.Properties = stripMap(schema.Properties)
+	result.PatternProperties = stripMap(schema.PatternProperties)
+	result.DependentSchemas = stripMap(schema.DependentSchemas)
+	result.Defs = stripMap(schema.Defs)
+	result.Items = stripWrapper(schema.Items)
+	result.PrefixItems = stripSlice(schema.PrefixItems)
+	result.Contains = stripWrapper(schema.Contains)
+	result.AdditionalProperties = stripWrapper(schema.AdditionalProperties)
+	result.PropertyNames = stripWrapper(schema.PropertyNames)
+	result.UnevaluatedItems = stripWrapper(schema.UnevaluatedItems)
+	result.UnevaluatedProperties = stripWrapper(schema.UnevaluatedProperties)
+	result.ContentSchema = stripWrapper(schema.ContentSchema)
+	result.AllOf = stripSlice(schema.AllOf)
+	result.AnyOf = stripSlice(schema.AnyOf)
+	result.OneOf = stripSlice(schema.OneOf)
+	result.Not = stripWrapper(schema.Not)
+	result.If = stripWrapper(schema.If)
+	result.Then = stripWrapper(schema.Then)
+	result.Else = stripWrapper(schema.Else)
+	return result
+}
+
 func isAllElementsSegment(seg PathSegment) bool {
 	_, ok := seg.Key.(PathAllElements)
 	return seg.IsSymbolic && ok
@@ -159,7 +277,7 @@ func deletePathFromSchema(schema *oas3.Schema, path []PathSegment, opts SchemaEx
 	}
 
 	// Recursive: navigate to parent and delete child
-	return navigateAndModify(schema, seg, path[1:], opts, func(child *oas3.Schema) *oas3.Schema {
+	return navigateAndModify(schema, seg, path[1:], opts, false, func(child *oas3.Schema) *oas3.Schema {
 		return deletePathFromSchema(child, path[1:], opts)
 	})
 }
@@ -177,7 +295,11 @@ func deleteSegment(schema *oas3.Schema, seg PathSegment, opts SchemaExecOptions)
 			result.MinItems = nil
 			return result
 		}
-		// For objects, can't delete "all properties" - return unchanged
+		if getType(schema) == "object" {
+			result := cloneSchema(schema)
+			result.Required = nil
+			return result
+		}
 		return schema
 	}
 
@@ -188,7 +310,7 @@ func deleteSegment(schema *oas3.Schema, seg PathSegment, opts SchemaExecOptions)
 
 	// Array index deletion
 	if idx, ok := seg.Key.(int); ok {
-		return deleteArrayIndex(schema, idx)
+		return deleteArrayIndex(schema, idx, opts)
 	}
 
 	return schema
@@ -229,15 +351,58 @@ func deleteProperty(schema *oas3.Schema, propName string) *oas3.Schema {
 }
 
 // deleteArrayIndex removes an element from an array schema
-func deleteArrayIndex(schema *oas3.Schema, index int) *oas3.Schema {
+func deleteArrayIndex(schema *oas3.Schema, index int, opts SchemaExecOptions) *oas3.Schema {
 	if schema == nil || getType(schema) != "array" {
 		return schema
 	}
 
-	// For symbolic execution, deleting a specific index is complex
-	// For now, keep schema unchanged (conservative)
-	// TODO: Handle tuple schemas with prefixItems
-	return schema
+	normalized := index
+	if normalized < 0 && schema.MinItems != nil && schema.MaxItems != nil && *schema.MinItems == *schema.MaxItems {
+		normalized = int(*schema.MaxItems) + normalized
+	}
+	if normalized < 0 {
+		result := eraseArrayPositions(schema, opts)
+		decrementArrayBounds(result, index)
+		return result
+	}
+
+	if schema.MinItems != nil && schema.MaxItems != nil && *schema.MinItems == *schema.MaxItems &&
+		normalized < len(schema.PrefixItems) {
+		result := cloneSchema(schema)
+		result.PrefixItems = append([]*oas3.JSONSchema[oas3.Referenceable](nil), schema.PrefixItems[:normalized]...)
+		result.PrefixItems = append(result.PrefixItems, schema.PrefixItems[normalized+1:]...)
+		decrementArrayBounds(result, normalized)
+		return result
+	}
+
+	result := eraseArrayPositions(schema, opts)
+	decrementArrayBounds(result, normalized)
+	return result
+}
+
+func decrementArrayBounds(schema *oas3.Schema, index int) {
+	if schema == nil {
+		return
+	}
+	if index < 0 {
+		if schema.MinItems != nil && *schema.MinItems > 0 {
+			value := *schema.MinItems - 1
+			schema.MinItems = &value
+		}
+		if schema.MaxItems != nil && *schema.MaxItems > 0 {
+			value := *schema.MaxItems - 1
+			schema.MaxItems = &value
+		}
+		return
+	}
+	if schema.MinItems != nil && int64(index) < *schema.MinItems {
+		value := *schema.MinItems - 1
+		schema.MinItems = &value
+	}
+	if schema.MaxItems != nil && int64(index) < *schema.MaxItems {
+		value := *schema.MaxItems - 1
+		schema.MaxItems = &value
+	}
 }
 
 // navigatePathInSchema navigates to a path and returns the schema at that location
@@ -290,7 +455,7 @@ func setPathInSchema(schema *oas3.Schema, path []PathSegment, value *oas3.Schema
 	}
 
 	// Recursive: navigate and set at child
-	return navigateAndModify(schema, seg, path[1:], opts, func(child *oas3.Schema) *oas3.Schema {
+	return navigateAndModify(schema, seg, path[1:], opts, true, func(child *oas3.Schema) *oas3.Schema {
 		return setPathInSchema(child, path[1:], value, opts)
 	})
 }
@@ -404,7 +569,7 @@ func setProperty(schema *oas3.Schema, propName string, value *oas3.Schema) *oas3
 }
 
 // navigateAndModify navigates to a segment and applies a modification function
-func navigateAndModify(schema *oas3.Schema, seg PathSegment, remainingPath []PathSegment, opts SchemaExecOptions, modifyFn func(*oas3.Schema) *oas3.Schema) *oas3.Schema {
+func navigateAndModify(schema *oas3.Schema, seg PathSegment, remainingPath []PathSegment, opts SchemaExecOptions, createMissing bool, modifyFn func(*oas3.Schema) *oas3.Schema) *oas3.Schema {
 	if seg.IsSymbolic {
 		if getType(schema) == "array" {
 			newItems := modifyFn(arrayElementUnion(schema, opts))
@@ -424,20 +589,33 @@ func navigateAndModify(schema *oas3.Schema, seg PathSegment, remainingPath []Pat
 		}
 
 		result := *schema
-		if schema.Properties == nil {
-			return schema
-		}
 
 		// Clone properties
 		newProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
-		for k, v := range schema.Properties.All() {
-			if k == key && v.Left != nil {
-				// Modify this property
-				modified := modifyFn(v.Left)
-				newProps.Set(k, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](modified))
-			} else {
-				newProps.Set(k, v)
+		found := false
+		if schema.Properties != nil {
+			for k, v := range schema.Properties.All() {
+				if k == key {
+					found = true
+				}
+				if k == key && resolvedLeft(v) != nil {
+					// Modify this property
+					modified := modifyFn(resolvedLeft(v))
+					newProps.Set(k, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](modified))
+				} else {
+					newProps.Set(k, v)
+				}
 			}
+		}
+		if createMissing && !found {
+			child := missingPathContainer(remainingPath)
+			newProps.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](modifyFn(child)))
+			result.Required = append([]string(nil), schema.Required...)
+			if !isRequired(result.Required, key) {
+				result.Required = append(result.Required, key)
+			}
+		} else if createMissing && found && !isRequired(result.Required, key) {
+			result.Required = append(append([]string(nil), schema.Required...), key)
 		}
 		result.Properties = newProps
 		return &result
@@ -450,4 +628,21 @@ func navigateAndModify(schema *oas3.Schema, seg PathSegment, remainingPath []Pat
 	}
 
 	return schema
+}
+
+func missingPathContainer(remainingPath []PathSegment) *oas3.Schema {
+	if len(remainingPath) == 0 {
+		return Top()
+	}
+	next := remainingPath[0]
+	if _, ok := next.Key.(string); ok && !next.IsSymbolic {
+		return ObjectType()
+	}
+	if _, ok := next.Key.(int); ok && !next.IsSymbolic {
+		zero := int64(0)
+		result := ArrayType(Bottom())
+		result.MaxItems = &zero
+		return result
+	}
+	return ArrayType(Top())
 }

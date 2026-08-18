@@ -34,8 +34,9 @@ type execState struct {
 	forkUpdates          []*forkControl          // Updates shared with eager fork alternatives
 
 	// Path collection (for del/getpath/setpath operations)
-	pathMode    bool          // Are we collecting a path (between opPathBegin/opPathEnd)?
-	currentPath []PathSegment // Current path segments being collected
+	pathMode      bool          // Are we collecting a path (between opPathBegin/opPathEnd)?
+	currentPath   []PathSegment // Current path segments being collected
+	pathEvalBases []int         // Path lengths saved while evaluating dynamic index expressions
 
 	// State tracking for logging
 	id       int    // Unique state ID
@@ -195,6 +196,7 @@ type forkContinuation struct {
 	depth          int
 	pathMode       bool
 	currentPath    []PathSegment
+	pathEvalBases  []int
 	tryDepth       int
 	control        *forkControl
 	shapeHash      [sha256.Size]byte
@@ -415,6 +417,11 @@ func forkContinuationShapeHash(fork forkContinuation) [sha256.Size]byte {
 	buf.WriteByte(':')
 	buf.WriteString(pathSegmentsKey(fork.currentPath))
 	buf.WriteByte(':')
+	for _, base := range fork.pathEvalBases {
+		buf.WriteString(strconv.Itoa(base))
+		buf.WriteByte(',')
+	}
+	buf.WriteByte(':')
 	buf.WriteString(strconv.Itoa(fork.tryDepth))
 	return sha256.Sum256([]byte(buf.String()))
 }
@@ -546,6 +553,7 @@ type forkControl struct {
 }
 
 type schemaReplacement struct {
+	key string
 	old *oas3.Schema
 	new *oas3.Schema
 }
@@ -669,6 +677,7 @@ func (s *execState) clone() *execState {
 	forkUpdatesCopy := append([]*forkControl(nil), s.forkUpdates...)
 
 	pathCopy := s.currentPath
+	pathEvalBasesCopy := append([]int(nil), s.pathEvalBases...)
 
 	// Clone intent/history maps (per-state tracking)
 	histCopy := make(map[string]map[string]struct{}, len(s.varAllocHistory))
@@ -709,6 +718,7 @@ func (s *execState) clone() *execState {
 		forkUpdates:          forkUpdatesCopy,
 		pathMode:             s.pathMode,
 		currentPath:          pathCopy,
+		pathEvalBases:        pathEvalBasesCopy,
 		id:                   s.id,       // Clone inherits ID initially, will be reassigned
 		parentID:             s.parentID, // Clone inherits parent
 		lineage:              s.lineage,  // Clone inherits lineage, will be extended
@@ -745,6 +755,11 @@ func joinForkContinuations(a, b forkContinuations) forkContinuations {
 		fork.depth = maxInt(fork.depth, bValues[i].depth)
 		for j := range fork.stack {
 			fork.stack[j].Schema = joinTwoSchemas(fork.stack[j].Schema, bValues[i].stack[j].Schema)
+			if !sameValueProvenance(fork.stack[j], bValues[i].stack[j]) {
+				fork.stack[j].origin = nil
+				fork.stack[j].rootVar = ""
+				fork.stack[j].path = nil
+			}
 		}
 		for j := range fork.scopes {
 			for key, bValue := range bValues[i].scopes[j] {
@@ -761,16 +776,20 @@ func joinForkContinuations(a, b forkContinuations) forkContinuations {
 }
 
 func compatibleForkContinuations(a, b forkContinuation) bool {
-	return a.kind == b.kind &&
-		a.targetPC == b.targetPC &&
-		a.arrayAppendKey == b.arrayAppendKey &&
-		len(a.stack) == len(b.stack) &&
-		a.scopeDepth == b.scopeDepth &&
-		a.callstackLen == b.callstackLen &&
-		a.pathMode == b.pathMode &&
-		a.tryDepth == b.tryDepth &&
-		equalCallStacks(a.callstack, b.callstack) &&
-		reflect.DeepEqual(a.currentPath, b.currentPath)
+	if a.kind != b.kind ||
+		a.targetPC != b.targetPC ||
+		a.arrayAppendKey != b.arrayAppendKey ||
+		len(a.stack) != len(b.stack) ||
+		a.scopeDepth != b.scopeDepth ||
+		a.callstackLen != b.callstackLen ||
+		a.pathMode != b.pathMode ||
+		a.tryDepth != b.tryDepth ||
+		!equalCallStacks(a.callstack, b.callstack) ||
+		!reflect.DeepEqual(a.currentPath, b.currentPath) ||
+		!reflect.DeepEqual(a.pathEvalBases, b.pathEvalBases) {
+		return false
+	}
+	return true
 }
 
 func cloneScopeMaps(scopes []map[string]*oas3.Schema) []map[string]*oas3.Schema {
@@ -843,17 +862,44 @@ func (s *execState) recordDesiredFP(key string, items *oas3.Schema) {
 
 // push pushes a schema onto the stack.
 func (s *execState) push(schema *oas3.Schema) {
-	s.stack = append(s.stack, SValue{Schema: schema})
+	s.stack = append(s.stack, SValue{Schema: schema, origin: new(valueOrigin)})
+	s.invalidateShapeKey()
+}
+
+func (s *execState) pushLoadedVar(schema *oas3.Schema, key string) {
+	s.stack = append(s.stack, SValue{Schema: schema, origin: new(valueOrigin), rootVar: key})
+	s.invalidateShapeKey()
+}
+
+func (s *execState) pushValue(value SValue) {
+	s.stack = append(s.stack, value)
+	s.invalidateShapeKey()
+}
+
+func (s *execState) pushDerived(schema *oas3.Schema, base SValue, segment PathSegment) {
+	path := make([]PathSegment, len(base.path)+1)
+	copy(path, base.path)
+	path[len(base.path)] = segment
+	s.stack = append(s.stack, SValue{
+		Schema:  schema,
+		origin:  base.origin,
+		rootVar: base.rootVar,
+		path:    path,
+	})
 	s.invalidateShapeKey()
 }
 
 // pop removes and returns the top schema.
 func (s *execState) pop() *oas3.Schema {
+	return s.popValue().Schema
+}
+
+func (s *execState) popValue() SValue {
 	if len(s.stack) == 0 {
 		// Stack underflow - should not happen in correct bytecode
-		return nil
+		return SValue{}
 	}
-	top := s.stack[len(s.stack)-1].Schema
+	top := s.stack[len(s.stack)-1]
 	s.stack = s.stack[:len(s.stack)-1]
 	s.invalidateShapeKey()
 	return top
@@ -865,6 +911,17 @@ func (s *execState) top() *oas3.Schema {
 		return nil
 	}
 	return s.stack[len(s.stack)-1].Schema
+}
+
+func (s *execState) topValue() SValue {
+	if len(s.stack) == 0 {
+		return SValue{}
+	}
+	return s.stack[len(s.stack)-1]
+}
+
+func sameValueProvenance(a, b SValue) bool {
+	return a.origin == b.origin && a.rootVar == b.rootVar && reflect.DeepEqual(a.path, b.path)
 }
 
 // pushFrame creates a new scope.

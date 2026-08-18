@@ -1,9 +1,12 @@
 package schemaexec
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -26,9 +29,22 @@ var builtinRegistry = map[string]builtinFunc{
 	"has":           builtinHas,
 
 	// Type conversions
-	"tonumber": builtinToNumber,
-	"tostring": builtinToString,
-	"toarray":  builtinToArray,
+	"tonumber":   builtinToNumber,
+	"tostring":   builtinToString,
+	"toarray":    builtinToArray,
+	"explode":    builtinExplode,
+	"implode":    builtinImplode,
+	"tojson":     builtinToJSON,
+	"fromjson":   builtinFromJSON,
+	"format":     builtinFormatString,
+	"_tohtml":    builtinFormatString,
+	"_touri":     builtinFormatString,
+	"_tourid":    builtinFormatString,
+	"_tocsv":     builtinFormatString,
+	"_totsv":     builtinFormatString,
+	"_tosh":      builtinFormatString,
+	"_tobase64":  builtinToBase64,
+	"_tobase64d": builtinFromBase64,
 
 	// Array operations
 	"add":     builtinAdd,
@@ -178,19 +194,25 @@ func builtinLength(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*
 
 // builtinKeys returns an array of string keys (or indices for arrays).
 func builtinKeys(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	result := distributeBuiltinInput(input, env, func(branch *oas3.Schema) *oas3.Schema {
+		return keysBranch(branch, env)
+	})
+	return []*oas3.Schema{result}, nil
+}
+
+func keysBranch(input *oas3.Schema, env *schemaEnv) *oas3.Schema {
 	// jq: keys on an ARRAY yields the index list [0, 1, ...].
 	if getType(input) == "array" {
 		idx := IntegerType()
 		zero := 0.0
 		idx.Minimum = &zero
-		return []*oas3.Schema{ArrayType(idx)}, nil
+		return ArrayType(idx)
 	}
-	if !MightBeObject(input) && !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
+	if getType(input) == "" {
+		return env.NewTopWithCause("keys receiver type is unknown")
 	}
 	if getType(input) != "object" {
-		// Could be an object or an array: keys are strings or indices.
-		return []*oas3.Schema{ArrayType(Top())}, nil
+		return Bottom()
 	}
 
 	// Collect known keys
@@ -241,32 +263,49 @@ func builtinKeys(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 		itemSchema = StringType()
 	}
 
-	return []*oas3.Schema{ArrayType(itemSchema)}, nil
+	return ArrayType(itemSchema)
 }
 
 // builtinValues returns an array of all values.
 func builtinValues(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeObject(input) && !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
-	}
-
-	// For objects: return array of value schemas
-	if MightBeObject(input) {
-		valueSchema := unionAllObjectValues(input, env.opts)
-		if valueSchema == nil {
-			valueSchema = Bottom()
+	result := distributeBuiltinInput(input, env, func(branch *oas3.Schema) *oas3.Schema {
+		switch getType(branch) {
+		case "object":
+			return ArrayType(unionAllObjectValues(branch, env.opts))
+		case "array":
+			return branch
+		case "":
+			return env.NewTopWithCause("values receiver type is unknown")
+		default:
+			return Bottom()
 		}
-		return []*oas3.Schema{ArrayType(valueSchema)}, nil
-	}
-
-	// For arrays: same as input
-	return []*oas3.Schema{input}, nil
+	})
+	return []*oas3.Schema{result}, nil
 }
 
 // builtinHas checks if object has a property.
 func builtinHas(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	result := distributeBuiltinInput(input, env, func(branch *oas3.Schema) *oas3.Schema {
+		return hasBranch(branch, args, env)
+	})
+	return []*oas3.Schema{result}, nil
+}
+
+func hasBranch(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) *oas3.Schema {
 	if len(args) == 0 {
-		return []*oas3.Schema{BoolType()}, nil
+		return BoolType()
+	}
+	if getType(input) == "" {
+		return env.NewTopWithCause("has receiver type is unknown")
+	}
+	if getType(input) == "array" {
+		if getType(args[0]) == "integer" || getType(args[0]) == "number" || isTopSchema(args[0]) {
+			return BoolType()
+		}
+		return Bottom()
+	}
+	if getType(input) != "object" {
+		return Bottom()
 	}
 
 	// Check if the key is a constant string
@@ -280,11 +319,11 @@ func builtinHas(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 				// Check if required
 				for _, req := range input.Required {
 					if req == keyStr {
-						return []*oas3.Schema{ConstBool(true)}, nil
+						return ConstBool(true)
 					}
 				}
 				// Exists but optional - could be true or false
-				return []*oas3.Schema{BoolType()}, nil
+				return BoolType()
 			}
 		}
 
@@ -294,7 +333,7 @@ func builtinHas(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 			for pattern := range input.PatternProperties.All() {
 				re, err := regexp.Compile(pattern)
 				if err != nil || re.MatchString(keyStr) {
-					return []*oas3.Schema{BoolType()}, nil
+					return BoolType()
 				}
 			}
 		}
@@ -304,22 +343,22 @@ func builtinHas(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 		if input.AdditionalProperties != nil {
 			if input.AdditionalProperties.Left != nil ||
 				(input.AdditionalProperties.Right != nil && *input.AdditionalProperties.Right) {
-				return []*oas3.Schema{BoolType()}, nil
+				return BoolType()
 			}
 			// additionalProperties: false — definitely doesn't exist
-			return []*oas3.Schema{ConstBool(false)}, nil
+			return ConstBool(false)
 		}
 
 		// Absent additionalProperties: closed world under Speakeasy
 		// semantics (key definitely absent), open under raw semantics.
 		if env.opts.Semantics == SchemaSemanticsRaw {
-			return []*oas3.Schema{BoolType()}, nil
+			return BoolType()
 		}
-		return []*oas3.Schema{ConstBool(false)}, nil
+		return ConstBool(false)
 	}
 
 	// Unknown key - could be true or false
-	return []*oas3.Schema{BoolType()}, nil
+	return BoolType()
 }
 
 // ============================================================================
@@ -336,13 +375,108 @@ func builtinToString(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([
 	return []*oas3.Schema{StringType()}, nil
 }
 
+func builtinExplode(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	return []*oas3.Schema{ArrayType(IntegerType())}, nil
+}
+
+func builtinImplode(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	return []*oas3.Schema{StringType()}, nil
+}
+
+func builtinToJSON(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if value, ok := extractConstValue(input); ok {
+		if encoded, err := json.Marshal(value); err == nil {
+			return []*oas3.Schema{ConstString(string(encoded))}, nil
+		}
+	}
+	return []*oas3.Schema{StringType()}, nil
+}
+
+func builtinFromJSON(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	return []*oas3.Schema{Top()}, nil
+}
+
+func builtinFormatString(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	return []*oas3.Schema{StringType()}, nil
+}
+
+func builtinToBase64(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if value, ok := extractConstString(input); ok {
+		return []*oas3.Schema{ConstString(base64.StdEncoding.EncodeToString([]byte(value)))}, nil
+	}
+	return []*oas3.Schema{StringType()}, nil
+}
+
+func builtinFromBase64(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if value, ok := extractConstString(input); ok {
+		decoded, err := base64.StdEncoding.DecodeString(value)
+		if err == nil {
+			return []*oas3.Schema{ConstString(string(decoded))}, nil
+		}
+	}
+	return []*oas3.Schema{StringType()}, nil
+}
+
 // builtinToArray converts to array.
 func builtinToArray(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if MightBeArray(input) {
-		return []*oas3.Schema{input}, nil
+	result := distributeBuiltinInput(input, env, func(branch *oas3.Schema) *oas3.Schema {
+		if getType(branch) == "array" {
+			return branch
+		}
+		return ArrayType(branch)
+	})
+	return []*oas3.Schema{result}, nil
+}
+
+func distributeBuiltinInput(input *oas3.Schema, env *schemaEnv, leaf func(*oas3.Schema) *oas3.Schema) *oas3.Schema {
+	return distributeBuiltinInputSeen(input, env, leaf, make(map[*oas3.Schema]bool))
+}
+
+func distributeBuiltinInputSeen(input *oas3.Schema, env *schemaEnv, leaf func(*oas3.Schema) *oas3.Schema, seen map[*oas3.Schema]bool) *oas3.Schema {
+	if input == nil {
+		return Bottom()
 	}
-	// Wrap in array
-	return []*oas3.Schema{ArrayType(input)}, nil
+	if seen[input] {
+		return env.NewTopWithCause("builtin receiver has a recursive union")
+	}
+	if branches, ok := disjunctiveBranches(input); ok {
+		seen[input] = true
+		results := make([]*oas3.Schema, 0, len(branches))
+		for _, branch := range branches {
+			results = append(results, distributeBuiltinInputSeen(branch, env, leaf, seen))
+		}
+		delete(seen, input)
+		return Union(results, env.opts)
+	}
+	if input.Nullable != nil && *input.Nullable {
+		nonNull := cloneSchema(input)
+		nonNull.Nullable = nil
+		return Union([]*oas3.Schema{
+			distributeBuiltinInputSeen(nonNull, env, leaf, seen),
+			leaf(ConstNull()),
+		}, env.opts)
+	}
+	return leaf(input)
+}
+
+func distributeArrayBuiltin(input *oas3.Schema, env *schemaEnv, transform func(*oas3.Schema) *oas3.Schema) []*oas3.Schema {
+	result := distributeBuiltinInput(input, env, func(branch *oas3.Schema) *oas3.Schema {
+		if isTopSchema(branch) {
+			return env.NewTopWithCause("array builtin receiver type is unknown")
+		}
+		typ := getType(branch)
+		if getTypeExplicit(branch) == "" && typ != "array" {
+			return env.NewTopWithCause("array builtin receiver type is unknown")
+		}
+		if typ == "" {
+			return env.NewTopWithCause("array builtin receiver type is unknown")
+		}
+		if typ != "array" {
+			return Bottom()
+		}
+		return transform(branch)
+	})
+	return []*oas3.Schema{result}
 }
 
 // ============================================================================
@@ -351,103 +485,86 @@ func builtinToArray(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 
 // builtinAdd sums array elements (for numbers) or concatenates.
 func builtinAdd(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
-	}
+	return distributeArrayBuiltin(input, env, func(array *oas3.Schema) *oas3.Schema {
+		return addArraySchema(array, env)
+	}), nil
+}
 
+func addArraySchema(input *oas3.Schema, env *schemaEnv) *oas3.Schema {
 	// jq: add over an EMPTY array yields null. Unless minItems proves the
 	// array non-empty, null is a possible output.
 	maybeEmpty := input.MinItems == nil || *input.MinItems == 0
-	withEmptyNull := func(result *oas3.Schema) []*oas3.Schema {
+	withEmptyNull := func(result *oas3.Schema) *oas3.Schema {
 		if maybeEmpty {
-			return []*oas3.Schema{Union([]*oas3.Schema{result, ConstNull()}, env.opts)}
+			return Union([]*oas3.Schema{result, ConstNull()}, env.opts)
 		}
-		return []*oas3.Schema{result}
+		return result
 	}
 
-	// Get item type ($ref'd items followed via resolvedLeft)
-	var itemType string
-	if left := resolvedLeft(input.Items); left != nil {
-		itemType = getType(left)
-	}
+	items := arrayElementUnion(input, env.opts)
+	itemType := getType(items)
 
 	// add on number array -> number
 	if itemType == "number" || itemType == "integer" {
-		return withEmptyNull(NumberType()), nil
+		return withEmptyNull(NumberType())
 	}
 
 	// add on string array -> string
 	if itemType == "string" {
-		return withEmptyNull(StringType()), nil
+		return withEmptyNull(StringType())
 	}
 
 	// add on array array -> array (concatenation)
 	if itemType == "array" {
-		if left := resolvedLeft(input.Items); left != nil {
-			return withEmptyNull(left), nil
-		}
+		return withEmptyNull(items)
 	}
 
 	// add on object array -> object (merge)
 	if itemType == "object" {
-		if left := resolvedLeft(input.Items); left != nil {
-			return withEmptyNull(left), nil
-		}
+		return withEmptyNull(items)
 	}
 
 	// Unknown item type: jq's add can produce null (empty array), a number,
 	// a string, an array, or an object depending on the items — narrowing to
 	// number would discard valid outputs. Widen.
-	return []*oas3.Schema{Top()}, nil
+	return Top()
 }
 
 // builtinReverse reverses an array.
 func builtinReverse(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
-	}
-	return []*oas3.Schema{eraseArrayPositions(input, env.opts)}, nil
+	return distributeArrayBuiltin(input, env, func(array *oas3.Schema) *oas3.Schema {
+		return eraseArrayPositions(array, env.opts)
+	}), nil
 }
 
 // builtinSort sorts an array.
 func builtinSort(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
-	}
-	return []*oas3.Schema{eraseArrayPositions(input, env.opts)}, nil
+	return distributeArrayBuiltin(input, env, func(array *oas3.Schema) *oas3.Schema {
+		return eraseArrayPositions(array, env.opts)
+	}), nil
 }
 
 // builtinUnique removes duplicates.
 func builtinUnique(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
-	}
-	if getType(input) != "array" {
-		return []*oas3.Schema{input}, nil
-	}
-	result := eraseArrayPositions(input, env.opts)
-	result.MinItems = nil
-	return []*oas3.Schema{result}, nil
+	return distributeArrayBuiltin(input, env, func(array *oas3.Schema) *oas3.Schema {
+		result := eraseArrayPositions(array, env.opts)
+		result.MinItems = nil
+		return result
+	}), nil
 }
 
 // builtinMinMax returns min or max element.
 func builtinMinMax(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
-	}
-
-	// jq: min/max of an EMPTY array is null.
-	maybeEmpty := input.MinItems == nil || *input.MinItems == 0
-
-	// Return item type (∪ null when the array may be empty)
-	if left := resolvedLeft(input.Items); left != nil {
-		if maybeEmpty {
-			return []*oas3.Schema{Union([]*oas3.Schema{left, ConstNull()}, env.opts)}, nil
+	return distributeArrayBuiltin(input, env, func(array *oas3.Schema) *oas3.Schema {
+		item := arrayElementUnion(array, env.opts)
+		if item == nil {
+			return ConstNull()
 		}
-		return []*oas3.Schema{left}, nil
-	}
-
-	return []*oas3.Schema{Top()}, nil
+		if array.MinItems == nil || *array.MinItems == 0 {
+			return Union([]*oas3.Schema{item, ConstNull()}, env.opts)
+		}
+		return item
+	}), nil
 }
 
 // ============================================================================
@@ -456,27 +573,33 @@ func builtinMinMax(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*
 
 // builtinToEntries converts {a:1, b:2} to [{key:"a", value:1}, {key:"b", value:2}]
 func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	result := distributeBuiltinInput(input, env, func(branch *oas3.Schema) *oas3.Schema {
+		return toEntriesBranch(branch, env)
+	})
+	return []*oas3.Schema{result}, nil
+}
+
+func toEntriesBranch(input *oas3.Schema, env *schemaEnv) *oas3.Schema {
 	// jq: to_entries on an ARRAY yields [{key: index, value: item}, ...].
 	if getType(input) == "array" {
 		idx := IntegerType()
 		zero := 0.0
 		idx.Minimum = &zero
-		itemVal := Top()
-		if left := resolvedLeft(input.Items); left != nil {
-			itemVal = left
+		itemVal := arrayElementUnion(input, env.opts)
+		if itemVal == nil {
+			return ArrayType(Bottom())
 		}
 		entry := BuildObject(map[string]*oas3.Schema{
 			"key":   idx,
 			"value": itemVal,
 		}, []string{"key", "value"})
-		return []*oas3.Schema{ArrayType(entry)}, nil
+		return ArrayType(entry)
 	}
-	if !MightBeObject(input) && !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
+	if getType(input) == "" {
+		return env.NewTopWithCause("to_entries receiver type is unknown")
 	}
 	if getType(input) != "object" {
-		// Could be an object or an array: entry shape unknown.
-		return []*oas3.Schema{ArrayType(Top())}, nil
+		return Bottom()
 	}
 
 	// DEBUG: Log input object structure
@@ -517,7 +640,7 @@ func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 		if env.opts.EnableWarnings {
 			env.logger.Debugf("builtinToEntries: provably empty object -> empty array")
 		}
-		return []*oas3.Schema{ArrayType(nil)}, nil
+		return ArrayType(nil)
 	}
 
 	if env.opts.EnableWarnings {
@@ -541,42 +664,109 @@ func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 			resultIsEmpty, resultHasItems, itemType)
 	}
 
-	return []*oas3.Schema{result}, nil
+	return result
 }
 
 // builtinFromEntries converts [{key:"a", value:1}] to {a:1}
 func builtinFromEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
+	return distributeArrayBuiltin(input, env, func(array *oas3.Schema) *oas3.Schema {
+		return fromEntriesArray(array, env.opts)
+	}), nil
+}
+
+func fromEntriesArray(input *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	if input.MaxItems != nil && *input.MaxItems == 0 {
+		return ObjectType()
 	}
 
-	// Get item schema
-	var itemSchema *oas3.Schema
-	if input.Items != nil && input.Items.Left != nil {
-		itemSchema = input.Items.Left
-	} else {
-		return []*oas3.Schema{ObjectType()}, nil
+	type entryCandidate struct {
+		schema   *oas3.Schema
+		required bool
+	}
+	entries := make([]entryCandidate, 0, len(input.PrefixItems)+1)
+	for i, wrapper := range input.PrefixItems {
+		entry, ok := derefJSONSchema(collapseContextForOptions(opts), wrapper)
+		if !ok {
+			entry = Top()
+		}
+		entries = append(entries, entryCandidate{
+			schema:   entry,
+			required: input.MinItems != nil && int64(i) < *input.MinItems,
+		})
+	}
+	if item, ok := derefJSONSchema(collapseContextForOptions(opts), input.Items); ok && item != nil {
+		entries = append(entries, entryCandidate{schema: item})
+	}
+	if len(entries) == 0 {
+		return OpenObjectType(Top())
 	}
 
-	// Extract value type from items
-	var valueSchema *oas3.Schema
-	if itemSchema.Properties != nil {
-		if valProp, ok := itemSchema.Properties.Get("value"); ok {
-			if valProp.Left != nil {
-				valueSchema = valProp.Left
+	props := make(map[string]*oas3.Schema)
+	required := make(map[string]bool)
+	unknownValues := make([]*oas3.Schema, 0)
+	for _, candidate := range entries {
+		key, value, ok := entryKeyValue(candidate.schema, opts)
+		if !ok {
+			unknownValues = append(unknownValues, Top())
+			continue
+		}
+		if key == "" {
+			unknownValues = append(unknownValues, value)
+			continue
+		}
+		if old := props[key]; old != nil {
+			props[key] = Union([]*oas3.Schema{old, value}, opts)
+		} else {
+			props[key] = value
+		}
+		if candidate.required {
+			required[key] = true
+		}
+	}
+	requiredKeys := make([]string, 0, len(required))
+	for key := range required {
+		requiredKeys = append(requiredKeys, key)
+	}
+	sort.Strings(requiredKeys)
+	result := BuildObject(props, requiredKeys)
+	if len(unknownValues) > 0 {
+		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Union(unknownValues, opts))
+	}
+	return result
+}
+
+func entryKeyValue(entry *oas3.Schema, opts SchemaExecOptions) (string, *oas3.Schema, bool) {
+	if entry == nil || isTopSchema(entry) {
+		return "", Top(), false
+	}
+	if getType(entry) != "object" || entry.Properties == nil {
+		return "", nil, false
+	}
+	var keySchema, valueSchema *oas3.Schema
+	for _, name := range []string{"key", "Key", "name", "Name"} {
+		if wrapper, ok := entry.Properties.Get(name); ok {
+			keySchema, _ = derefJSONSchema(collapseContextForOptions(opts), wrapper)
+			if keySchema != nil {
+				break
 			}
 		}
 	}
-
+	for _, name := range []string{"value", "Value"} {
+		if wrapper, ok := entry.Properties.Get(name); ok {
+			valueSchema, _ = derefJSONSchema(collapseContextForOptions(opts), wrapper)
+			if valueSchema != nil {
+				break
+			}
+		}
+	}
 	if valueSchema == nil {
 		valueSchema = Top()
 	}
-
-	// Result is object with unknown keys and the value type
-	result := ObjectType()
-	result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](valueSchema)
-
-	return []*oas3.Schema{result}, nil
+	key, constant := extractConstString(keySchema)
+	if !constant {
+		return "", valueSchema, true
+	}
+	return key, valueSchema, true
 }
 
 // builtinWithEntries is a helper for object transformations.
@@ -589,10 +779,7 @@ func builtinWithEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv)
 
 	// TODO: Apply transformation to entry objects
 	// For now, return object with Top values
-	result := ObjectType()
-	result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Top())
-
-	return []*oas3.Schema{result}, nil
+	return []*oas3.Schema{OpenObjectType(Top())}, nil
 }
 
 // ============================================================================
@@ -969,50 +1156,29 @@ func builtinPow(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas
 
 // builtinGroupBy groups array elements by key expression
 func builtinGroupBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
-	}
-
-	// Get item type
-	itemType := Top()
-	if left := resolvedLeft(input.Items); left != nil {
-		itemType = left
-	} else if len(input.PrefixItems) > 0 {
-		// For tuples, union all items
-		items := make([]*oas3.Schema, 0, len(input.PrefixItems))
-		for _, item := range input.PrefixItems {
-			if left := resolvedLeft(item); left != nil {
-				items = append(items, left)
-			}
+	return distributeArrayBuiltin(input, env, func(array *oas3.Schema) *oas3.Schema {
+		itemType := arrayElementUnion(array, env.opts)
+		if itemType == nil {
+			itemType = Top()
 		}
-		itemType = Union(items, env.opts)
-	}
-
-	// group_by: array<T> → array<array<T>>
-	return []*oas3.Schema{ArrayType(ArrayType(itemType))}, nil
+		return ArrayType(ArrayType(itemType))
+	}), nil
 }
 
 // builtinSortBy sorts array by key expression
 func builtinSortBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
-	}
-
-	return []*oas3.Schema{eraseArrayPositions(input, env.opts)}, nil
+	return distributeArrayBuiltin(input, env, func(array *oas3.Schema) *oas3.Schema {
+		return eraseArrayPositions(array, env.opts)
+	}), nil
 }
 
 // builtinUniqueBy removes duplicates by key expression
 func builtinUniqueBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
-	}
-	if getType(input) != "array" {
-		return []*oas3.Schema{input}, nil
-	}
-
-	result := eraseArrayPositions(input, env.opts)
-	result.MinItems = nil
-	return []*oas3.Schema{result}, nil
+	return distributeArrayBuiltin(input, env, func(array *oas3.Schema) *oas3.Schema {
+		result := eraseArrayPositions(array, env.opts)
+		result.MinItems = nil
+		return result
+	}), nil
 }
 
 // builtinMinMaxBy returns min/max element by key (reuses min/max logic)
@@ -1027,10 +1193,6 @@ func builtinMinMaxBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([
 
 // builtinFlatten flattens nested arrays
 func builtinFlatten(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeArray(input) {
-		return []*oas3.Schema{Bottom()}, nil
-	}
-
 	// Determine flatten depth
 	depth := -1 // -1 means fully flatten
 	if len(args) > 0 {
@@ -1041,8 +1203,9 @@ func builtinFlatten(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 		}
 	}
 
-	result := flattenSchemaRecursive(input, depth, env.opts)
-	return []*oas3.Schema{result}, nil
+	return distributeArrayBuiltin(input, env, func(array *oas3.Schema) *oas3.Schema {
+		return flattenSchemaRecursive(array, depth, env.opts)
+	}), nil
 }
 
 // flattenSchemaRecursive recursively flattens array schema
@@ -2090,7 +2253,7 @@ func plusPair(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 
 	// Objects: use allOf merge semantics
 	if lt == "object" && rt == "object" {
-		return mergeObjectsForPlus(a, b)
+		return mergeObjectsForPlus(a, b, opts)
 	}
 
 	// Mixed/incompatible: jq would error; abstract as Top
@@ -2102,7 +2265,7 @@ func plusPair(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 // - This correctly handles required properties based on what's actually constructed
 // - Example: `. + .` preserves original required set
 // - Example: `. + {id: "x"}` makes `id` required because it's explicitly constructed
-func mergeObjectsForPlus(a, b *oas3.Schema) *oas3.Schema {
+func mergeObjectsForPlus(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	if a == nil && b == nil {
 		return Bottom()
 	}
@@ -2115,7 +2278,7 @@ func mergeObjectsForPlus(a, b *oas3.Schema) *oas3.Schema {
 
 	// Use allOf to combine the schemas, then collapse
 	// This delegates to the existing MergeObjects logic which handles required correctly
-	return MergeObjects(a, b, SchemaExecOptions{})
+	return MergeObjects(a, b, opts)
 }
 
 // builtinMinus implements - for two values.

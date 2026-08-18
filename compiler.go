@@ -12,6 +12,8 @@ import (
 type compiler struct {
 	moduleLoader         ModuleLoader
 	environLoader        func() []string
+	environValue         any
+	hasEnvironValue      bool
 	variables            []string
 	customFuncs          map[string]function
 	inputIter            Iter
@@ -918,6 +920,10 @@ func (c *compiler) compileFunc(e *Func) error {
 			}
 			return nil
 		} else if e.Name == "$ENV" || e.Name == "env" {
+			if c.hasEnvironValue {
+				c.append(&code{op: opconst, v: c.environValue})
+				return nil
+			}
 			env := make(map[string]any)
 			if c.environLoader != nil {
 				for _, kv := range c.environLoader() {

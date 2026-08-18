@@ -1357,6 +1357,7 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		// Legacy fallback: single-map materialization (kept for safety)
 		result = env.materializeArrays(result, sharedAccum, sharedSchemaToAlloc)
 	}
+	result = stripInternalSchemaMarkers(result)
 
 	// Log execution completion
 	env.logger.With(map[string]any{
@@ -2181,7 +2182,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 						key, isEmpty, hasItems, itemType)
 				}
 			}
-			next.push(finalVal)
+			next.pushLoadedVar(finalVal, key)
 		} else {
 			if env.strict {
 				return nil, fmt.Errorf("strict mode: variable %s not found at pc=%d (state=%d)", key, state.pc, next.id)
@@ -2194,6 +2195,14 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 
 	case opRet:
 		// Return from closure
+		if next.pathMode && len(next.pathEvalBases) > 0 {
+			last := len(next.pathEvalBases) - 1
+			base := next.pathEvalBases[last]
+			if base < len(next.currentPath) {
+				next.currentPath = next.currentPath[:base]
+			}
+			next.pathEvalBases = next.pathEvalBases[:last]
+		}
 		next.popFrame()
 		if retPC, callstack, ok := next.callstack.pop(); ok {
 			// Pop return address and jump back
@@ -2211,8 +2220,8 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		return []*execState{next}, nil
 
 	case opDup:
-		if top := next.top(); top != nil {
-			next.push(top)
+		if top := next.topValue(); top.Schema != nil {
+			next.pushValue(top)
 		}
 		return []*execState{next}, nil
 
@@ -2267,6 +2276,9 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 				return []*execState{next}, nil
 			}
 			// Push return address (next.pc is already incremented by executeOpMultiState)
+			if next.pathMode && env.returnsToDynamicIndex(next.pc) {
+				next.pathEvalBases = append(next.pathEvalBases[:len(next.pathEvalBases):len(next.pathEvalBases)], len(next.currentPath))
+			}
 			next.callstack = next.callstack.append(next.pc, pc)
 			next.invalidateShapeKey()
 
@@ -2343,6 +2355,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 		pathSchema := buildPathSchemaFromSegments(next.currentPath)
 		next.push(pathSchema)
 		next.currentPath = nil
+		next.pathEvalBases = nil
 		return []*execState{next}, nil
 
 	case opForkLabel:
@@ -2544,13 +2557,14 @@ func (env *schemaEnv) execIndexMulti(state *execState, c *codeOp) ([]*execState,
 	}
 
 	// NORMAL MODE: Navigate schema
-	base := state.pop()
+	baseValue := state.popValue()
+	base := baseValue.Schema
 	if base == nil {
 		return []*execState{state}, nil
 	}
 
 	result := env.indexSchema(base, c.value, make(map[*oas3.Schema]bool))
-	state.push(result)
+	state.pushDerived(result, baseValue, PathSegment{Key: c.value})
 	return []*execState{state}, nil
 }
 
@@ -3186,6 +3200,7 @@ func (env *schemaEnv) execFork(state *execState, c *codeOp) ([]*execState, error
 		depth:          state.depth,
 		pathMode:       state.pathMode,
 		currentPath:    state.currentPath,
+		pathEvalBases:  state.pathEvalBases,
 		tryDepth:       state.tryDepth,
 		control:        control,
 	})
@@ -3259,6 +3274,7 @@ func restoreForkContinuation(state *execState, fork forkContinuation) {
 	state.depth = fork.depth
 	state.pathMode = fork.pathMode
 	state.currentPath = fork.currentPath
+	state.pathEvalBases = fork.pathEvalBases
 	state.tryDepth = fork.tryDepth
 	state.invalidateShapeKey()
 }
@@ -3272,7 +3288,8 @@ func (env *schemaEnv) execForkAlt(state *execState, c *codeOp) ([]*execState, er
 
 // execJumpIfNot handles conditional jump.
 func (env *schemaEnv) execJumpIfNot(state *execState, c *codeOp) ([]*execState, error) {
-	val := state.pop()
+	tested := state.popValue()
+	val := tested.Schema
 
 	// For schemas, we conservatively explore both paths
 	// unless we can definitely determine truthiness
@@ -3303,9 +3320,9 @@ func (env *schemaEnv) execJumpIfNot(state *execState, c *codeOp) ([]*execState, 
 	if val != nil {
 		if nn := stripNullUnion(val, env.opts); nn != nil && !schemaEqual(nn, val) {
 			// Then-branch: value is non-null
-			refineVarRefs(continueState, val, nn)
+			refineTestedValue(continueState, tested, nn, env.opts)
 			// Else-branch: value is null
-			refineVarRefs(jumpState, val, ConstNull())
+			refineTestedValue(jumpState, tested, ConstNull(), env.opts)
 		}
 	}
 
@@ -3331,7 +3348,8 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 		if len(state.stack) == 0 {
 			return nil, fmt.Errorf("stack underflow on call input")
 		}
-		input := state.pop()
+		inputValue := state.popValue()
+		input := inputValue.Schema
 
 		// Then pop args in left-to-right order (matching the push order from compiler)
 		args := make([]*oas3.Schema, argCount)
@@ -3343,6 +3361,11 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 		}
 		if funcName == "_break" {
 			return env.execBreak(state, input)
+		}
+		if state.pathMode && funcName == "_index" {
+			state.currentPath = append(state.currentPath[:len(state.currentPath):len(state.currentPath)], dynamicPathSegment(input, args))
+			state.push(Top())
+			return []*execState{state}, nil
 		}
 
 		// DEBUG: Trace builtin calls
@@ -3364,19 +3387,13 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 			return []*execState{state}, nil
 		}
 
-		// Rebind accumulator variables for setpath to ensure pointer identity is updated
+		// Propagate compiler-owned accumulator updates to queued iterations.
 		if (funcName == "setpath" || funcName == "_setpath") && len(results) == 1 && results[0] != nil {
-			refineVarRefs(state, input, results[0])
-			// Dynamic-key reducers update an executor-owned object accumulator.
-			// Carry that copy-on-write AP change to queued reduce continuations;
-			// ordinary path updates remain functional and must not rewrite sibling
-			// states that still observe the original input.
-			if getType(input) == "object" && getType(results[0]) == "object" &&
-				input.AdditionalProperties != results[0].AdditionalProperties {
-				refineForkRefs(state, input, results[0])
+			for _, accumulatorKey := range env.setpathAccumulatorKeys(state, inputValue) {
+				refineForkVarRefs(state, accumulatorKey, input, results[0])
 			}
 			if env.opts.EnableWarnings {
-				env.logger.Debugf("execCallMulti: rebinding vars after %s (old ptr=%p, new ptr=%p)",
+				env.logger.Debugf("execCallMulti: processed %s result (old ptr=%p, new ptr=%p)",
 					funcName, input, results[0])
 			}
 		}
@@ -3453,6 +3470,74 @@ func (env *schemaEnv) execCallMulti(state *execState, c *codeOp) ([]*execState, 
 	}
 }
 
+func (env *schemaEnv) setpathAccumulatorKeys(state *execState, input SValue) []string {
+	if state == nil || input.rootVar == "" || state.pc < 0 || state.pc >= len(env.codes) {
+		return nil
+	}
+	next := env.codes[state.pc]
+	if next.op != opStore || fmt.Sprintf("%v", next.value) != input.rootVar {
+		return nil
+	}
+	keys := []string{input.rootVar}
+	seen := map[string]struct{}{input.rootVar: {}}
+	for call := state.callstack.tail; call != nil; call = call.prev {
+		if call.returnPC < 0 || call.returnPC >= len(env.codes) {
+			continue
+		}
+		store := env.codes[call.returnPC]
+		if store.op != opStore {
+			continue
+		}
+		key := fmt.Sprintf("%v", store.value)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; !ok {
+			keys = append(keys, key)
+			seen[key] = struct{}{}
+		}
+	}
+	return keys
+}
+
+func (env *schemaEnv) returnsToDynamicIndex(returnPC int) bool {
+	for pc := returnPC; pc < len(env.codes) && pc < returnPC+8; pc++ {
+		code := env.codes[pc]
+		if code.op == opRet || code.op == opCallPC {
+			return false
+		}
+		if code.op != opCall {
+			continue
+		}
+		if value, ok := code.value.([3]any); ok {
+			name, _ := value[2].(string)
+			return name == "_index"
+		}
+		return false
+	}
+	return false
+}
+
+func dynamicPathSegment(input *oas3.Schema, args []*oas3.Schema) PathSegment {
+	candidates := append(append(make([]*oas3.Schema, 0, len(args)+1), args...), input)
+	for _, candidate := range candidates {
+		if key, ok := extractConstString(candidate); ok {
+			return PathSegment{Key: key}
+		}
+		if value, ok := extractConstValue(candidate); ok {
+			if number, ok := value.(float64); ok && number == math.Trunc(number) {
+				return PathSegment{Key: int(number)}
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		if getType(candidate) == "string" || getType(candidate) == "integer" || getType(candidate) == "number" {
+			return PathSegment{Key: PathWildcard{}, IsSymbolic: true}
+		}
+	}
+	return PathSegment{Key: PathWildcard{}, IsSymbolic: true}
+}
+
 // valueToSchema converts a constant value to a schema.
 func (env *schemaEnv) valueToSchema(v any) *oas3.Schema {
 	switch val := v.(type) {
@@ -3469,6 +3554,8 @@ func (env *schemaEnv) valueToSchema(v any) *oas3.Schema {
 		return ConstBool(val)
 	case nil:
 		return ConstNull()
+	case symbolicEnvironment:
+		return OpenObjectType(StringType())
 	case map[string]any:
 		return buildObjectFromLiteral(val)
 	case []any:
@@ -3522,7 +3609,18 @@ func unionAllObjectValues(obj *oas3.Schema, opts SchemaExecOptions) *oas3.Schema
 		schemas = append(schemas, Top())
 	}
 
-	// TODO: Add patternProperties
+	if obj.PatternProperties != nil {
+		for pattern, wrapper := range obj.PatternProperties.All() {
+			if schema, ok := derefJSONSchema(collapseContextForOptions(opts), wrapper); ok {
+				schemas = append(schemas, schema)
+				if opts.EnableWarnings {
+					opts.debugf("unionAllObjectValues: patternProperty %s type=%s", pattern, getType(schema))
+				}
+			} else {
+				schemas = append(schemas, Top())
+			}
+		}
+	}
 
 	if len(schemas) == 0 {
 		if opts.EnableWarnings {
@@ -3570,33 +3668,18 @@ func buildArrayFromLiteral(arr []any) *oas3.Schema {
 		return emptyArray
 	}
 
-	// Build prefixItems for tuple if heterogeneous
+	// Constant array literals have exact positional contents.
 	prefixItems := make([]*oas3.Schema, len(arr))
-	itemsSchema := Top()
-
-	allSameType := true
-	firstType := ""
 
 	for i, v := range arr {
-		schema := valueToSchemaStatic(v)
-		prefixItems[i] = schema
-
-		typ := getType(schema)
-		if i == 0 {
-			firstType = typ
-			itemsSchema = schema
-		} else if typ != firstType {
-			allSameType = false
-		}
+		prefixItems[i] = valueToSchemaStatic(v)
 	}
-
-	if allSameType && len(arr) > 0 {
-		// Homogeneous array - use items schema
-		return ArrayType(itemsSchema)
-	}
-
-	// Heterogeneous array - use prefixItems
-	return BuildArray(Top(), prefixItems)
+	result := BuildArray(nil, prefixItems)
+	length := int64(len(arr))
+	result.MinItems = &length
+	result.MaxItems = &length
+	result.Items = oas3.NewJSONSchemaFromBool(false)
+	return result
 }
 
 // valueToSchemaStatic converts a constant value to a schema (static version, no env).
@@ -4154,6 +4237,9 @@ func subsumesState(dom, sub *execState) bool {
 
 	// Check stack subsumption
 	for i := range dom.stack {
+		if !sameValueProvenance(dom.stack[i], sub.stack[i]) {
+			return false
+		}
 		if !schemaSubsumes(dom.stack[i].Schema, sub.stack[i].Schema) {
 			return false
 		}
@@ -4374,14 +4460,17 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 
 		mergedForks := joinForkContinuations(a.forks, b.forks)
 		merged := &execState{
-			pc:        a.pc,
-			stack:     make([]SValue, len(a.stack)),
-			scopes:    make([]map[string]*oas3.Schema, len(a.scopes)),
-			depth:     maxInt(a.depth, b.depth),
-			callstack: a.callstack,
-			forks:     mergedForks,
-			labels:    joinLabelContinuations(a.labels, b.labels, mergedForks.len()),
-			tryDepth:  a.tryDepth,
+			pc:            a.pc,
+			stack:         make([]SValue, len(a.stack)),
+			scopes:        make([]map[string]*oas3.Schema, len(a.scopes)),
+			depth:         maxInt(a.depth, b.depth),
+			callstack:     a.callstack,
+			forks:         mergedForks,
+			labels:        joinLabelContinuations(a.labels, b.labels, mergedForks.len()),
+			tryDepth:      a.tryDepth,
+			pathMode:      a.pathMode,
+			currentPath:   a.currentPath,
+			pathEvalBases: append([]int(nil), a.pathEvalBases...),
 			depthWidenBlocked: a.depthWidenBlocked || b.depthWidenBlocked ||
 				!equalArrayGeneratorContexts(a.forks, b.forks),
 			id:       a.id,
@@ -4452,7 +4541,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 
 		// Join stack values
 		for i := range a.stack {
-			merged.stack[i] = SValue{Schema: joinTwoSchemas(a.stack[i].Schema, b.stack[i].Schema)}
+			merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i])
 		}
 
 		// Join scopes
@@ -4709,14 +4798,17 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 	// States have same accum map - normal join
 	mergedForks := joinForkContinuations(a.forks, b.forks)
 	merged := &execState{
-		pc:        a.pc,
-		stack:     make([]SValue, len(a.stack)),
-		scopes:    make([]map[string]*oas3.Schema, len(a.scopes)),
-		depth:     maxInt(a.depth, b.depth),
-		callstack: a.callstack, // Assume same callstack in partition
-		forks:     mergedForks,
-		labels:    joinLabelContinuations(a.labels, b.labels, mergedForks.len()),
-		tryDepth:  a.tryDepth,
+		pc:            a.pc,
+		stack:         make([]SValue, len(a.stack)),
+		scopes:        make([]map[string]*oas3.Schema, len(a.scopes)),
+		depth:         maxInt(a.depth, b.depth),
+		callstack:     a.callstack, // Assume same callstack in partition
+		forks:         mergedForks,
+		labels:        joinLabelContinuations(a.labels, b.labels, mergedForks.len()),
+		tryDepth:      a.tryDepth,
+		pathMode:      a.pathMode,
+		currentPath:   a.currentPath,
+		pathEvalBases: append([]int(nil), a.pathEvalBases...),
 		depthWidenBlocked: a.depthWidenBlocked || b.depthWidenBlocked ||
 			!equalArrayGeneratorContexts(a.forks, b.forks),
 		id:       a.id,
@@ -4815,14 +4907,15 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 						opts.debugf("joinState: preserving canonical ptr for allocID=%s (stack pos %d), canonical NOT TAGGED! Re-tagging now.", aAlloc, i)
 						merged.schemaToAlloc[canonical] = aAlloc
 					}
-					merged.stack[i] = SValue{Schema: canonical}
+					merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i])
+					merged.stack[i].Schema = canonical
 					continue
 				}
 			}
 		}
 
 		// Default: join via union
-		merged.stack[i] = SValue{Schema: joinTwoSchemas(aSchema, bSchema)}
+		merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i])
 	}
 
 	// Join scopes (union keys, join shared values)
@@ -5132,6 +5225,9 @@ func compatibleStateShapes(a, b *execState, relaxScopeKeys bool) bool {
 				}
 			}
 		}
+	}
+	if !reflect.DeepEqual(a.pathEvalBases, b.pathEvalBases) {
+		return false
 	}
 	labelForkDepth := 0
 	if a.labels.tail != nil {

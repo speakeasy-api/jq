@@ -22,6 +22,14 @@ func WithEnvironLoader(environLoader func() []string) CompilerOption {
 	}
 }
 
+// WithEnvironValue supplies the value compiled for env and $ENV.
+func WithEnvironValue(value any) CompilerOption {
+	return func(c *compiler) {
+		c.environValue = value
+		c.hasEnvironValue = true
+	}
+}
+
 // WithVariables is a compiler option for variable names. The variables can be
 // used in the query. You have to give the values to [*Code.Run] in the same order.
 func WithVariables(variables []string) CompilerOption {

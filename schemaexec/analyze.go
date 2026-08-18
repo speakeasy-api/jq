@@ -104,6 +104,9 @@ func Analyze(ctx context.Context, q *gojq.Query, input *oas3.Schema, opts ...Sch
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if q == nil {
+		return nil, fmt.Errorf("query cannot be nil")
+	}
 	opt := DefaultOptions()
 	if len(opts) > 0 {
 		opt = normalizeOptions(opts[0])
@@ -111,7 +114,10 @@ func Analyze(ctx context.Context, q *gojq.Query, input *oas3.Schema, opts ...Sch
 	// Classification requires the completed lenient output schema.
 	opt.StrictMode = false
 
-	code, err := gojq.Compile(q, gojq.WithSkipLibraryExpansion("gsub", "sub", "test"))
+	code, err := gojq.Compile(q,
+		gojq.WithSkipLibraryExpansion("gsub", "sub", "test"),
+		gojq.WithEnvironValue(symbolicEnvironment{}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile query: %w", err)
 	}

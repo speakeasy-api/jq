@@ -2,6 +2,7 @@ package schemaexec
 
 import (
 	"fmt"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -352,11 +353,22 @@ func eraseArrayPositions(arr *oas3.Schema, opts SchemaExecOptions) *oas3.Schema 
 	return result
 }
 
-// ObjectType creates a basic object schema (unconstrained).
+// ObjectType creates an object schema with no declared members.
 func ObjectType() *oas3.Schema {
 	return &oas3.Schema{
 		Type: oas3.NewTypeFromString(oas3.SchemaTypeObject),
 	}
+}
+
+// OpenObjectType creates an object schema that admits undeclared members.
+func OpenObjectType(values *oas3.Schema) *oas3.Schema {
+	result := ObjectType()
+	if values == nil || isTopSchema(values) {
+		result.AdditionalProperties = oas3.NewJSONSchemaFromBool(true)
+	} else {
+		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](values)
+	}
+	return result
 }
 
 // ============================================================================
@@ -1474,7 +1486,7 @@ func widenUnion(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 					byType[typ] = ArrayType(Top())
 				case oas3.SchemaTypeObject:
 					// Keep as generic object
-					byType[typ] = ObjectType()
+					byType[typ] = OpenObjectType(Top())
 				default:
 					byType[typ] = Top()
 				}
@@ -1882,6 +1894,8 @@ func MergeObjects(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	// Merge AdditionalProperties
 	// true dominates (most permissive), then schemas are unioned, false is preserved if both forbid
 	switch {
+	case opts.Semantics == SchemaSemanticsRaw && (a.AdditionalProperties == nil || b.AdditionalProperties == nil):
+		result.AdditionalProperties = oas3.NewJSONSchemaFromBool(true)
 	case a.AdditionalProperties != nil && a.AdditionalProperties.Right != nil && *a.AdditionalProperties.Right:
 		// true on a dominates
 		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Top())
@@ -2742,39 +2756,123 @@ func stripNullUnion(s *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	return s
 }
 
-// refineVarRefs replaces state-local references to old with nw. Scope frames
-// are shared between cloned states, so changed frames are copied first.
-func refineVarRefs(st *execState, old, nw *oas3.Schema) {
-	if st == nil || old == nil || nw == nil {
-		return
+func joinedStackValue(a, b SValue) SValue {
+	result := SValue{Schema: joinTwoSchemas(a.Schema, b.Schema)}
+	if sameValueProvenance(a, b) {
+		result.origin = a.origin
+		result.rootVar = a.rootVar
+		result.path = a.path
 	}
-	refineStateSchemaValues(st, old, nw)
+	return result
 }
 
-func refineStateSchemaValues(st *execState, old, nw *oas3.Schema) {
+func refineTestedValue(st *execState, tested SValue, nw *oas3.Schema, opts SchemaExecOptions) {
+	if st == nil || tested.Schema == nil || nw == nil {
+		return
+	}
+	requirePath := getType(nw) != "null"
+	if tested.rootVar != "" {
+		refineScopeVarPath(st, tested.rootVar, tested.path, nw, opts, requirePath)
+	}
+	if tested.origin == nil {
+		return
+	}
 	for i := range st.stack {
-		if st.stack[i].Schema == old {
+		value := &st.stack[i]
+		if value.origin != tested.origin || !pathPrefix(value.path, tested.path) {
+			continue
+		}
+		remaining := tested.path[len(value.path):]
+		value.Schema = refineSchemaPath(value.Schema, remaining, nw, opts, requirePath)
+	}
+}
+
+func refineScopeVarPath(st *execState, key string, path []PathSegment, nw *oas3.Schema, opts SchemaExecOptions, requirePath bool) {
+	for i := len(st.scopes) - 1; i >= 0; i-- {
+		old, ok := st.scopes[i][key]
+		if !ok {
+			continue
+		}
+		frames := append([]map[string]*oas3.Schema(nil), st.scopes...)
+		frame := cloneScopeMap(st.scopes[i])
+		frame[key] = refineSchemaPath(old, path, nw, opts, requirePath)
+		frames[i] = frame
+		st.scopes = frames
+		return
+	}
+}
+
+func pathPrefix(prefix, path []PathSegment) bool {
+	if len(prefix) > len(path) {
+		return false
+	}
+	for i := range prefix {
+		if !reflect.DeepEqual(prefix[i], path[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func refineSchemaPath(schema *oas3.Schema, path []PathSegment, nw *oas3.Schema, opts SchemaExecOptions, requirePath bool) *oas3.Schema {
+	if len(path) == 0 {
+		return nw
+	}
+	if schema == nil {
+		return schema
+	}
+	segment := path[0]
+	if key, ok := segment.Key.(string); ok && !segment.IsSymbolic && getType(schema) == "object" && schema.Properties != nil {
+		property, ok := schema.Properties.Get(key)
+		if !ok {
+			return schema
+		}
+		child, ok := derefJSONSchema(collapseContextForOptions(opts), property)
+		if !ok {
+			return schema
+		}
+		result := cloneSchema(schema)
+		result.Properties = cloneSchemaMap(schema.Properties)
+		result.Properties.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](refineSchemaPath(child, path[1:], nw, opts, requirePath)))
+		if requirePath && !isRequired(result.Required, key) {
+			result.Required = append(append([]string(nil), result.Required...), key)
+			sort.Strings(result.Required)
+		}
+		return result
+	}
+	return schema
+}
+
+func cloneSchemaMap(src *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]]) *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]] {
+	result := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+	for key, value := range src.All() {
+		result.Set(key, value)
+	}
+	return result
+}
+
+func refineForkVarRefs(st *execState, key string, old, nw *oas3.Schema) {
+	if st == nil || key == "" || old == nil || nw == nil || old == nw {
+		return
+	}
+	for i := range st.stack {
+		if st.stack[i].rootVar == key && st.stack[i].Schema == old {
 			st.stack[i].Schema = nw
 		}
 	}
-	if scopes, changed := refinedScopeValues(st.scopes, old, nw); changed {
+	if scopes, changed := refinedScopeVariable(st.scopes, key, old, nw); changed {
 		st.scopes = scopes
-	}
-}
-
-func refineForkRefs(st *execState, old, nw *oas3.Schema) {
-	if st == nil || old == nil || nw == nil || old == nw {
-		return
 	}
 	seen := make(map[*forkControl]struct{}, st.forks.len()+len(st.forkUpdates))
 	if forks, changed := mapForkContinuations(st.forks, func(fork forkContinuation) (forkContinuation, bool) {
-		if fork.control != nil {
+		updated, forkChanged := refinedForkVariable(fork, key, old, nw)
+		if forkChanged && fork.control != nil {
 			if _, ok := seen[fork.control]; !ok {
-				fork.control.replacements = append(fork.control.replacements, schemaReplacement{old: old, new: nw})
+				fork.control.replacements = append(fork.control.replacements, schemaReplacement{key: key, old: old, new: nw})
 				seen[fork.control] = struct{}{}
 			}
 		}
-		return refinedForkContinuation(fork, old, nw)
+		return updated, forkChanged
 	}); changed {
 		st.forks = forks
 	}
@@ -2785,7 +2883,7 @@ func refineForkRefs(st *execState, old, nw *oas3.Schema) {
 		if _, ok := seen[control]; ok {
 			continue
 		}
-		control.replacements = append(control.replacements, schemaReplacement{old: old, new: nw})
+		control.replacements = append(control.replacements, schemaReplacement{key: key, old: old, new: nw})
 		seen[control] = struct{}{}
 	}
 }
@@ -2796,9 +2894,16 @@ func (s *execState) applyForkUpdates() {
 			continue
 		}
 		for _, replacement := range control.replacements {
-			refineStateSchemaValues(s, replacement.old, replacement.new)
+			for i := range s.stack {
+				if s.stack[i].rootVar == replacement.key && s.stack[i].Schema == replacement.old {
+					s.stack[i].Schema = replacement.new
+				}
+			}
+			if scopes, changed := refinedScopeVariable(s.scopes, replacement.key, replacement.old, replacement.new); changed {
+				s.scopes = scopes
+			}
 			if forks, changed := mapForkContinuations(s.forks, func(fork forkContinuation) (forkContinuation, bool) {
-				return refinedForkContinuation(fork, replacement.old, replacement.new)
+				return refinedForkVariable(fork, replacement.key, replacement.old, replacement.new)
 			}); changed {
 				s.forks = forks
 			}
@@ -2806,10 +2911,10 @@ func (s *execState) applyForkUpdates() {
 	}
 }
 
-func refinedForkContinuation(fork forkContinuation, old, nw *oas3.Schema) (forkContinuation, bool) {
+func refinedForkVariable(fork forkContinuation, key string, old, nw *oas3.Schema) (forkContinuation, bool) {
 	changed := false
 	for i := range fork.stack {
-		if fork.stack[i].Schema != old {
+		if fork.stack[i].rootVar != key || fork.stack[i].Schema != old {
 			continue
 		}
 		if !changed {
@@ -2818,35 +2923,24 @@ func refinedForkContinuation(fork forkContinuation, old, nw *oas3.Schema) (forkC
 		}
 		fork.stack[i].Schema = nw
 	}
-	if scopes, scopesChanged := refinedScopeValues(fork.scopes, old, nw); scopesChanged {
+	if scopes, changed := refinedScopeVariable(fork.scopes, key, old, nw); changed {
 		fork.scopes = scopes
-		changed = true
+		return fork, true
 	}
 	return fork, changed
 }
 
-func refinedScopeValues(scopes []map[string]*oas3.Schema, old, nw *oas3.Schema) ([]map[string]*oas3.Schema, bool) {
+func refinedScopeVariable(scopes []map[string]*oas3.Schema, key string, old, nw *oas3.Schema) ([]map[string]*oas3.Schema, bool) {
 	var result []map[string]*oas3.Schema
 	for i, scope := range scopes {
-		frameChanged := false
-		for _, value := range scope {
-			if value == old {
-				frameChanged = true
-				break
-			}
-		}
-		if !frameChanged {
+		if value, ok := scope[key]; !ok || value != old {
 			continue
 		}
 		if result == nil {
 			result = append([]map[string]*oas3.Schema(nil), scopes...)
 		}
 		frame := cloneScopeMap(scope)
-		for key, value := range frame {
-			if value == old {
-				frame[key] = nw
-			}
-		}
+		frame[key] = nw
 		result[i] = frame
 	}
 	if result == nil {

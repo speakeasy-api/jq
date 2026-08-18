@@ -112,7 +112,8 @@ Untyped schemas are typed by structural inference (`impliedTypeOf` in
 | Schema structure (no explicit `type`, no `allOf`/`anyOf`/`oneOf`/`not`/`if`/`then`/`else`) | Implied type |
 |---|---|
 | `enum` present | `string` |
-| `const` present | the const's scalar type |
+| `const` present (non-null) | the const's scalar type |
+| `const: null` | unknown (mirrors the generator) |
 | `properties` (non-empty) | `object` |
 | `additionalProperties` present | `object` |
 | `items` present | `array` |

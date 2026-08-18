@@ -7,8 +7,15 @@ import (
 // SValue wraps a schema for the schema VM stack.
 // This is the value type that flows through the schema virtual machine.
 type SValue struct {
-	Schema *oas3.Schema
+	Schema  *oas3.Schema
+	origin  *valueOrigin
+	rootVar string
+	path    []PathSegment
 }
+
+type valueOrigin byte
+
+type symbolicEnvironment struct{}
 
 // SchemaSemantics selects how the executor interprets schemas that do not
 // fully specify their shape.
