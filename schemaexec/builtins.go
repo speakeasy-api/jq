@@ -573,9 +573,11 @@ func builtinMinMax(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*
 
 // builtinToEntries converts {a:1, b:2} to [{key:"a", value:1}, {key:"b", value:2}]
 func builtinToEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	fmt.Printf("TOENTRIES input=%s fp=%s cause=%q\n", schemaTypeSummary(input, 3), schemaFingerprint(input), env.topCauses[input])
 	result := distributeBuiltinInput(input, env, func(branch *oas3.Schema) *oas3.Schema {
 		return toEntriesBranch(branch, env)
 	})
+	fmt.Printf("TOENTRIES result=%s\n", schemaTypeSummary(result, 3))
 	return []*oas3.Schema{result}, nil
 }
 
@@ -1167,8 +1169,11 @@ func builtinGroupBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]
 
 // builtinSortBy sorts array by key expression
 func builtinSortBy(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	fmt.Printf("SORTBY input=%s max=%v items=%v\n", schemaTypeSummary(input, 3), input.MaxItems, input.Items)
 	return distributeArrayBuiltin(input, env, func(array *oas3.Schema) *oas3.Schema {
-		return eraseArrayPositions(array, env.opts)
+		result := eraseArrayPositions(array, env.opts)
+		fmt.Printf("SORTBY result=%s max=%v items=%v\n", schemaTypeSummary(result, 3), result.MaxItems, result.Items)
+		return result
 	}), nil
 }
 
@@ -1752,7 +1757,14 @@ func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 				if env.opts.EnableWarnings {
 					env.logger.Debugf("builtinSetpath: detected wildcard string key pattern (non-empty), updating additionalProperties")
 				}
-				return []*oas3.Schema{setDynamicProperty(input, valueArg, env.opts)}, nil
+				writeValue := valueArg
+				exactlyOne := pathArg.MinItems != nil && pathArg.MaxItems != nil &&
+					*pathArg.MinItems == 1 && *pathArg.MaxItems == 1
+				hasDeclaredProperties := input.Properties != nil && input.Properties.Len() > 0
+				if !exactlyOne && hasDeclaredProperties {
+					writeValue = env.NewTopWithCause("setpath: dynamic path depth is unknown")
+				}
+				return []*oas3.Schema{setDynamicProperty(input, writeValue, env.opts)}, nil
 			}
 		}
 
@@ -1817,21 +1829,24 @@ func setDynamicProperty(obj *oas3.Schema, value *oas3.Schema, opts SchemaExecOpt
 
 	result := cloneSchema(obj)
 
-	// Get existing additionalProperties
 	var existingAP *oas3.Schema
-	if result.AdditionalProperties != nil && result.AdditionalProperties.Left != nil {
-		existingAP = result.AdditionalProperties.Left
+	if result.AdditionalProperties != nil {
+		var possible bool
+		existingAP, possible = schemaFacetValue(result.AdditionalProperties, opts)
+		if !possible {
+			existingAP = nil
+		}
+	} else if opts.Semantics == SchemaSemanticsRaw {
+		existingAP = Top()
 	}
 
-	// Union existing additionalProperties with new value type
-	var newAP *oas3.Schema
-	if existingAP != nil {
-		newAP = Union([]*oas3.Schema{existingAP, value}, opts)
+	newAP := Union([]*oas3.Schema{existingAP, value}, opts)
+	if isTopSchema(newAP) {
+		result.AdditionalProperties = oas3.NewJSONSchemaFromBool(true)
 	} else {
-		newAP = value
+		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newAP)
 	}
 
-	result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newAP)
 	return result
 }
 
@@ -2485,24 +2500,30 @@ func mergeObjectsForMultiply(lhs, rhs *oas3.Schema, env *schemaEnv, seen map[sch
 	}
 	result := MergeObjects(lhs, rhs, env.opts)
 	seen[pair] = result
-	if result.Properties == nil || lhs.Properties == nil || rhs.Properties == nil {
+	if result.Properties == nil || lhs.Properties == nil {
 		return result
 	}
 	result = cloneSchema(result)
 	result.Properties = cloneSchemaMap(result.Properties)
 	seen[pair] = result
 	for key, leftProperty := range lhs.Properties.All() {
-		rightProperty, ok := rhs.Properties.Get(key)
-		if !ok {
+		leftValue, leftPossible := schemaFacetValue(leftProperty, env.opts)
+		if !leftPossible {
 			continue
 		}
-		leftValue, rightValue := resolvedLeft(leftProperty), resolvedLeft(rightProperty)
-		if leftValue == nil || rightValue == nil {
-			result.Properties.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](
-				env.NewTopWithCause("recursive object merge property could not be resolved")))
+		rightProperty, declared := objectDeclaredProperty(rhs, key)
+		rightValue, rightPossible := schemaFacetValue(rightProperty, env.opts)
+		if !declared {
+			rightValue, rightPossible = objectUndeclaredValueForKey(rhs, key, env.opts)
+		}
+		if !rightPossible {
 			continue
 		}
-		merged := recursiveMultiplyProperty(leftValue, rightValue, env, seen)
+		overridden := recursiveMultiplyProperty(leftValue, rightValue, env, seen)
+		merged := overridden
+		if !declared || !isRequired(rhs.Required, key) {
+			merged = Union([]*oas3.Schema{leftValue, overridden}, env.opts)
+		}
 		result.Properties.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](merged))
 	}
 	return result
@@ -2607,25 +2628,15 @@ func concatArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema 
 		return ArrayType(Bottom()) // Empty array
 	}
 
-	items := make([]*oas3.Schema, 0, 8)
+	items := make([]*oas3.Schema, 0, 2)
 	collectArrayItemCandidates := func(arr *oas3.Schema) {
 		if arr == nil {
 			return
 		}
-		// Skip empty arrays - they contribute no items
 		if arr.MaxItems != nil && *arr.MaxItems == 0 {
 			return
 		}
-		if arr.PrefixItems != nil {
-			for _, pi := range arr.PrefixItems {
-				if pi.Left != nil {
-					items = append(items, pi.Left)
-				}
-			}
-		}
-		if arr.Items != nil && arr.Items.Left != nil {
-			items = append(items, arr.Items.Left)
-		}
+		items = append(items, arrayElementUnion(arr, opts))
 	}
 	collectArrayItemCandidates(a)
 	collectArrayItemCandidates(b)
@@ -2679,30 +2690,7 @@ func subtractArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 		return ArrayType(Bottom())
 	}
 
-	// For schema analysis: array subtraction returns an array with potentially the same item types as lhs
-	// We cannot narrow the type further without concrete values
-	var itemType *oas3.Schema
-	if a.Items != nil && a.Items.Left != nil {
-		itemType = a.Items.Left
-	} else if len(a.PrefixItems) > 0 {
-		// For tuples, union all item types
-		items := make([]*oas3.Schema, 0, len(a.PrefixItems))
-		for _, item := range a.PrefixItems {
-			if item.Left != nil {
-				items = append(items, item.Left)
-			}
-		}
-		if len(items) > 0 {
-			itemType = Union(items, opts)
-		}
-	}
-
-	if itemType == nil {
-		itemType = Top()
-	}
-
-	// Return array with same item type as lhs (conservative - we can't narrow without concrete values)
-	return ArrayType(itemType)
+	return ArrayType(arrayElementUnion(a, opts))
 }
 
 // concatStringSchemas concatenates strings with const folding.

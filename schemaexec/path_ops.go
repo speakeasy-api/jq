@@ -578,7 +578,13 @@ func navigateAndModify(schema *oas3.Schema, seg PathSegment, remainingPath []Pat
 			}
 			return widenArrayAfterWrite(schema, newItems, nil, opts)
 		}
-		// For objects, would need to modify all properties (complex)
+		if getType(schema) == "object" {
+			candidates := []*oas3.Schema{modifyFn(missingPathContainer(remainingPath))}
+			if existing := dynamicObjectValueUnion(schema, opts); existing != nil {
+				candidates = append(candidates, modifyFn(existing))
+			}
+			return setDynamicProperty(schema, Union(candidates, opts), opts)
+		}
 		return schema
 	}
 
@@ -628,6 +634,32 @@ func navigateAndModify(schema *oas3.Schema, seg PathSegment, remainingPath []Pat
 	}
 
 	return schema
+}
+
+func dynamicObjectValueUnion(schema *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
+	values := make([]*oas3.Schema, 0)
+	if schema.Properties != nil {
+		for _, wrapper := range schema.Properties.All() {
+			if value, possible := schemaFacetValue(wrapper, opts); possible {
+				values = append(values, value)
+			}
+		}
+	}
+	if schema.PatternProperties != nil {
+		for _, wrapper := range schema.PatternProperties.All() {
+			if value, possible := schemaFacetValue(wrapper, opts); possible {
+				values = append(values, value)
+			}
+		}
+	}
+	if schema.AdditionalProperties != nil {
+		if value, possible := schemaFacetValue(schema.AdditionalProperties, opts); possible {
+			values = append(values, value)
+		}
+	} else if opts.Semantics == SchemaSemanticsRaw {
+		values = append(values, Top())
+	}
+	return Union(values, opts)
 }
 
 func missingPathContainer(remainingPath []PathSegment) *oas3.Schema {

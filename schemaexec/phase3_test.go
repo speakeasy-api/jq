@@ -110,12 +110,11 @@ func TestMergeObjects(t *testing.T) {
 		t.Errorf("Expected 3 properties (a, b, c), got %d", result.Properties.Len())
 	}
 
-	// b should be from obj2 (override)
+	// b is optional on obj2, so either the original or override can remain.
 	if bSchema, ok := result.Properties.Get("b"); ok {
 		if bSchema.Left != nil {
-			bType := getType(bSchema.Left)
-			if bType != "boolean" {
-				t.Errorf("Expected b to be boolean (from obj2), got %s", bType)
+			if !MightBeNumber(bSchema.Left) || !mightBeType(bSchema.Left, oas3.SchemaTypeBoolean) {
+				t.Errorf("Expected b to admit number and boolean, got %s", schemaTypeSummary(bSchema.Left, 3))
 			}
 		}
 	}

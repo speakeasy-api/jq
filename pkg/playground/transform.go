@@ -512,6 +512,7 @@ func ensurePropertiesInitializedSeen(schema *oas3.Schema, seen map[*oas3.Schema]
 // finite, sound over-approximation that standard YAML encoders can marshal.
 func schemaForSerialization(schema *oas3.Schema, maxDepth int) *oas3.Schema {
 	active := make(map[*oas3.Schema]bool)
+	memo := make(map[*oas3.Schema]*oas3.Schema)
 	var clone func(*oas3.Schema, int) *oas3.Schema
 	wrap := func(js *oas3.JSONSchema[oas3.Referenceable], depth int) *oas3.JSONSchema[oas3.Referenceable] {
 		if js == nil {
@@ -555,10 +556,14 @@ func schemaForSerialization(schema *oas3.Schema, maxDepth int) *oas3.Schema {
 		if depth <= 0 || active[src] {
 			return &oas3.Schema{}
 		}
+		if result, ok := memo[src]; ok {
+			return result
+		}
 		active[src] = true
 		defer delete(active, src)
 
 		result := *src
+		memo[src] = &result
 		nextDepth := depth - 1
 		result.Properties = cloneMap(src.Properties, nextDepth)
 		result.PatternProperties = cloneMap(src.PatternProperties, nextDepth)

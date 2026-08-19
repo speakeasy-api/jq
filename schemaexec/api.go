@@ -26,6 +26,9 @@ func RunSchema(ctx context.Context, query *gojq.Query, input *oas3.Schema, opts 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if query == nil {
+		return nil, fmt.Errorf("query cannot be nil")
+	}
 	// Use default options if none provided
 	opt := DefaultOptions()
 	if len(opts) > 0 {
@@ -51,6 +54,9 @@ func RunSchema(ctx context.Context, query *gojq.Query, input *oas3.Schema, opts 
 func ExecSchema(ctx context.Context, code *gojq.Code, input *oas3.Schema, opts SchemaExecOptions) (*SchemaExecResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if code == nil {
+		return nil, fmt.Errorf("code cannot be nil")
 	}
 	opts = normalizeOptions(opts)
 

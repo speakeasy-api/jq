@@ -2,11 +2,21 @@ package schemaexec
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	gojq "github.com/speakeasy-api/jq"
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 )
+
+func TestExecutionRejectsNilPrograms(t *testing.T) {
+	if _, err := RunSchema(context.Background(), nil, StringType()); err == nil || !strings.Contains(err.Error(), "query cannot be nil") {
+		t.Fatalf("RunSchema nil query error = %v", err)
+	}
+	if _, err := ExecSchema(context.Background(), nil, StringType(), DefaultOptions()); err == nil || !strings.Contains(err.Error(), "code cannot be nil") {
+		t.Fatalf("ExecSchema nil code error = %v", err)
+	}
+}
 
 func TestRunSchema_BasicUsage(t *testing.T) {
 	// Parse a simple jq query

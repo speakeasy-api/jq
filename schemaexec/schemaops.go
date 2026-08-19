@@ -1019,6 +1019,9 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 		if getType(s) != "object" {
 			return nil
 		}
+		if objectUnionNeedsBranches(s) {
+			return nil
+		}
 	}
 
 	// DEBUG: Track tryMergeObjects calls
@@ -1089,8 +1092,8 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 		for _, s := range schemas {
 			if s.Properties != nil {
 				if propSchema, ok := s.Properties.Get(propName); ok {
-					if left := resolvedLeft(propSchema); left != nil {
-						propSchemas = append(propSchemas, left)
+					if value, possible := schemaFacetValue(propSchema, opts); possible {
+						propSchemas = append(propSchemas, value)
 						continue
 					}
 				}
@@ -1105,10 +1108,8 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 			// Ignoring this contribution would narrow the merged property to
 			// the declaring branches only, discarding possible values.
 			if s.AdditionalProperties != nil {
-				if apLeft := resolvedLeft(s.AdditionalProperties); apLeft != nil {
-					propSchemas = append(propSchemas, apLeft)
-				} else if s.AdditionalProperties.Right != nil && *s.AdditionalProperties.Right {
-					propSchemas = append(propSchemas, Top())
+				if value, possible := schemaFacetValue(s.AdditionalProperties, opts); possible {
+					propSchemas = append(propSchemas, value)
 				}
 				// AP false: contributes nothing
 			} else if opts.Semantics == SchemaSemanticsRaw {
@@ -1184,6 +1185,13 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 
 	// Build merged object with intersected required set
 	result := BuildObject(mergedProps, requiredIntersection)
+	for _, schema := range schemas {
+		if schema.Nullable != nil && *schema.Nullable {
+			nullable := true
+			result.Nullable = &nullable
+			break
+		}
+	}
 
 	// Merge AdditionalProperties across branches
 	var apSchemas []*oas3.Schema
@@ -1191,13 +1199,12 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 	nilCount := 0
 	for _, s := range schemas {
 		if s.AdditionalProperties != nil {
-			if s.AdditionalProperties.Right != nil {
-				if *s.AdditionalProperties.Right {
+			if value, possible := schemaFacetValue(s.AdditionalProperties, opts); possible {
+				if isTopSchema(value) {
 					seenTrue = true
+				} else {
+					apSchemas = append(apSchemas, value)
 				}
-			}
-			if left := resolvedLeft(s.AdditionalProperties); left != nil {
-				apSchemas = append(apSchemas, left)
 			}
 		} else {
 			nilCount++
@@ -1233,6 +1240,28 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 	}
 
 	return result
+}
+
+func objectUnionNeedsBranches(schema *oas3.Schema) bool {
+	return (schema.PatternProperties != nil && schema.PatternProperties.Len() > 0) ||
+		(schema.DependentSchemas != nil && schema.DependentSchemas.Len() > 0) ||
+		schema.PropertyNames != nil || schema.UnevaluatedProperties != nil || schema.UnevaluatedItems != nil ||
+		schema.MinProperties != nil || schema.MaxProperties != nil ||
+		schema.Not != nil || schema.If != nil || schema.Then != nil || schema.Else != nil
+}
+
+func schemaFacetValue(wrapper *oas3.JSONSchema[oas3.Referenceable], opts SchemaExecOptions) (*oas3.Schema, bool) {
+	if wrapper == nil {
+		return nil, false
+	}
+	value, ok := derefJSONSchema(collapseContextForOptions(opts), wrapper)
+	if !ok {
+		return Top(), true
+	}
+	if value == nil {
+		return nil, false
+	}
+	return value, true
 }
 
 // deduplicateSchemas removes duplicate schemas from a list.
@@ -1525,9 +1554,13 @@ func widenUnion(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	case 1:
 		// Conservative: group by type, keep one base schema per type
 		byType := make(map[string]*oas3.Schema)
+		admitsNull := false
 
 		for _, s := range schemas {
 			typ := getType(s)
+			if typ == string(oas3.SchemaTypeNull) || (s.Nullable != nil && *s.Nullable) {
+				admitsNull = true
+			}
 			if typ == "" {
 				typ = "any"
 			}
@@ -1557,11 +1590,18 @@ func widenUnion(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 				}
 			}
 		}
-
+		if admitsNull {
+			byType[string(oas3.SchemaTypeNull)] = NullType()
+		}
 		// Collect widened schemas
-		widened := make([]*oas3.Schema, 0, len(byType))
-		for _, s := range byType {
-			widened = append(widened, s)
+		types := make([]string, 0, len(byType))
+		for typ := range byType {
+			types = append(types, typ)
+		}
+		sort.Strings(types)
+		widened := make([]*oas3.Schema, 0, len(types))
+		for _, typ := range types {
+			widened = append(widened, byType[typ])
 		}
 
 		if len(widened) == 1 {
@@ -1895,38 +1935,12 @@ func HasProperty(obj *oas3.Schema, key string, opts SchemaExecOptions) *oas3.Sch
 
 // MergeObjects combines two object schemas (for the + operator on objects).
 func MergeObjects(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
-
 	if a == nil {
 		return b
 	}
 	if b == nil {
 		return a
 	}
-
-	// Merge properties from both objects
-	// Properties from b override properties from a
-	propMap := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
-
-	// Add all from a
-	if a.Properties != nil {
-		for k, v := range a.Properties.All() {
-			propMap.Set(k, v)
-		}
-	}
-
-	// Add/override with b
-	if b.Properties != nil {
-		for k, v := range b.Properties.All() {
-			propMap.Set(k, v)
-		}
-	}
-
-	// Merge required lists, but only for properties that actually exist in the merged map
-	propNames := make(map[string]struct{})
-	for k := range propMap.All() {
-		propNames[k] = struct{}{}
-	}
-
 	reqA := make(map[string]struct{}, len(a.Required))
 	for _, r := range a.Required {
 		reqA[r] = struct{}{}
@@ -1936,14 +1950,75 @@ func MergeObjects(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		reqB[r] = struct{}{}
 	}
 
-	required := make([]string, 0, len(propNames))
-	for k := range propNames {
-		if _, ok := reqA[k]; ok {
-			required = append(required, k)
+	keys := make([]string, 0)
+	seenKeys := make(map[string]struct{})
+	addKey := func(key string) {
+		if _, exists := seenKeys[key]; exists {
+			return
+		}
+		seenKeys[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	if a.Properties != nil {
+		for key := range a.Properties.All() {
+			addKey(key)
+		}
+	}
+	if b.Properties != nil {
+		for key := range b.Properties.All() {
+			addKey(key)
+		}
+	}
+	for _, key := range a.Required {
+		addKey(key)
+	}
+	for _, key := range b.Required {
+		addKey(key)
+	}
+
+	propMap := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+	for _, key := range keys {
+		leftValue, leftPossible := objectValueForKey(a, key, opts)
+		rightProperty, rightDeclared := objectDeclaredProperty(b, key)
+		rightValue, rightPossible := schemaFacetValue(rightProperty, opts)
+		_, rightRequired := reqB[key]
+
+		var merged *oas3.Schema
+		switch {
+		case rightDeclared && rightRequired && rightPossible:
+			merged = rightValue
+		case rightDeclared:
+			parts := make([]*oas3.Schema, 0, 2)
+			if leftPossible {
+				parts = append(parts, leftValue)
+			}
+			if rightPossible {
+				parts = append(parts, rightValue)
+			}
+			merged = Union(parts, opts)
+		default:
+			parts := make([]*oas3.Schema, 0, 2)
+			if leftPossible {
+				parts = append(parts, leftValue)
+			}
+			if override, possible := objectUndeclaredValueForKey(b, key, opts); possible {
+				parts = append(parts, override)
+			}
+			merged = Union(parts, opts)
+		}
+		if merged != nil {
+			propMap.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](merged))
+		}
+	}
+
+	required := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if _, ok := reqA[key]; ok {
+			required = append(required, key)
 			continue
 		}
-		if _, ok := reqB[k]; ok {
-			required = append(required, k)
+		if _, ok := reqB[key]; ok {
+			required = append(required, key)
 		}
 	}
 
@@ -1956,35 +2031,87 @@ func MergeObjects(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		Required:   required,
 	}
 
-	// Merge AdditionalProperties
-	// true dominates (most permissive), then schemas are unioned, false is preserved if both forbid
-	switch {
-	case opts.Semantics == SchemaSemanticsRaw && (a.AdditionalProperties == nil || b.AdditionalProperties == nil):
+	apParts := make([]*oas3.Schema, 0, 4)
+	open := false
+	collectOpenValues := func(schema *oas3.Schema) {
+		if schema.AdditionalProperties == nil {
+			if opts.Semantics == SchemaSemanticsRaw {
+				open = true
+			}
+		} else if value, possible := schemaFacetValue(schema.AdditionalProperties, opts); possible {
+			if isTopSchema(value) {
+				open = true
+			} else {
+				apParts = append(apParts, value)
+			}
+		}
+		if schema.PatternProperties != nil {
+			for _, wrapper := range schema.PatternProperties.All() {
+				if value, possible := schemaFacetValue(wrapper, opts); possible {
+					if isTopSchema(value) {
+						open = true
+					} else {
+						apParts = append(apParts, value)
+					}
+				}
+			}
+		}
+	}
+	collectOpenValues(a)
+	collectOpenValues(b)
+	if open {
 		result.AdditionalProperties = oas3.NewJSONSchemaFromBool(true)
-	case a.AdditionalProperties != nil && a.AdditionalProperties.Right != nil && *a.AdditionalProperties.Right:
-		// true on a dominates
-		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Top())
-	case b.AdditionalProperties != nil && b.AdditionalProperties.Right != nil && *b.AdditionalProperties.Right:
-		// true on b dominates
-		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Top())
-	default:
-		var apParts []*oas3.Schema
-		if a.AdditionalProperties != nil && a.AdditionalProperties.Left != nil {
-			apParts = append(apParts, a.AdditionalProperties.Left)
-		}
-		if b.AdditionalProperties != nil && b.AdditionalProperties.Left != nil {
-			apParts = append(apParts, b.AdditionalProperties.Left)
-		}
-		if len(apParts) > 0 {
-			result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Union(apParts, opts))
-		} else if (a.AdditionalProperties != nil && a.AdditionalProperties.Right != nil && !*a.AdditionalProperties.Right) ||
-			(b.AdditionalProperties != nil && b.AdditionalProperties.Right != nil && !*b.AdditionalProperties.Right) {
-			// preserve false if any side explicitly forbids
-			result.AdditionalProperties = oas3.NewJSONSchemaFromBool(false)
-		}
+	} else if len(apParts) > 0 {
+		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Union(apParts, opts))
+	} else if a.AdditionalProperties != nil || b.AdditionalProperties != nil {
+		result.AdditionalProperties = oas3.NewJSONSchemaFromBool(false)
 	}
 
 	return result
+}
+
+func objectDeclaredProperty(object *oas3.Schema, key string) (*oas3.JSONSchema[oas3.Referenceable], bool) {
+	if object == nil || object.Properties == nil {
+		return nil, false
+	}
+	return object.Properties.Get(key)
+}
+
+func objectValueForKey(object *oas3.Schema, key string, opts SchemaExecOptions) (*oas3.Schema, bool) {
+	if property, declared := objectDeclaredProperty(object, key); declared {
+		return schemaFacetValue(property, opts)
+	}
+	return objectUndeclaredValueForKey(object, key, opts)
+}
+
+func objectUndeclaredValueForKey(object *oas3.Schema, key string, opts SchemaExecOptions) (*oas3.Schema, bool) {
+	if object == nil {
+		return nil, false
+	}
+	patternValues := make([]*oas3.Schema, 0)
+	if object.PatternProperties != nil {
+		for pattern, wrapper := range object.PatternProperties.All() {
+			matcher, err := regexp.Compile(pattern)
+			if err != nil {
+				return Top(), true
+			}
+			if matcher.MatchString(key) {
+				if value, possible := schemaFacetValue(wrapper, opts); possible {
+					patternValues = append(patternValues, value)
+				}
+			}
+		}
+	}
+	if len(patternValues) > 0 {
+		return Union(patternValues, opts), true
+	}
+	if object.AdditionalProperties != nil {
+		return schemaFacetValue(object.AdditionalProperties, opts)
+	}
+	if opts.Semantics == SchemaSemanticsRaw {
+		return Top(), true
+	}
+	return nil, false
 }
 
 // BuildArray creates an array schema from element schemas.
