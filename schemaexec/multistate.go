@@ -34,14 +34,6 @@ type execState struct {
 	depthWidenBlocked    bool                                // Joined incompatible control contexts must fall back to output Top
 	forkUpdates          []*forkControl                      // Updates shared with eager fork alternatives
 
-	// joinedValueSources maps a schema pointer created by a state join to the
-	// per-side pointers it replaced. Update delivery to pending eager fork
-	// alternatives is pointer-keyed (forkControl replacements); a join breaks
-	// that pointer chain, so a write recorded against the joined pointer must
-	// also be recorded against its source pointers (lazy rebase in
-	// refineForkVarRefs). Populated only by joinState; shared on clone.
-	joinedValueSources map[*oas3.Schema][]*oas3.Schema
-
 	// Path collection (for del/getpath/setpath operations)
 	pathMode      bool          // Are we collecting a path (between opPathBegin/opPathEnd)?
 	currentPath   []PathSegment // Current path segments being collected
@@ -848,7 +840,6 @@ func (s *execState) clone() *execState {
 		tryDepth:             s.tryDepth,
 		depthWidenBlocked:    s.depthWidenBlocked,
 		forkUpdates:          forkUpdatesCopy,
-		joinedValueSources:   s.joinedValueSources, // SHARED (append-only via fresh maps in joinState)
 		pathMode:             s.pathMode,
 		currentPath:          pathCopy,
 		pathEvalBases:        pathEvalBasesCopy,
@@ -873,7 +864,7 @@ func cloneForkContinuation(fork forkContinuation) forkContinuation {
 	return cloned
 }
 
-func joinForkContinuations(a, b forkContinuations) forkContinuations {
+func joinForkContinuations(a, b forkContinuations, opts SchemaExecOptions) forkContinuations {
 	aValues, bValues := a.values(), b.values()
 	limit := min(len(aValues), len(bValues))
 	joined := make([]forkContinuation, 0, limit)
@@ -888,7 +879,7 @@ func joinForkContinuations(a, b forkContinuations) forkContinuations {
 		fork.depth = maxInt(fork.depth, bValues[i].depth)
 		fork.loopRound = maxInt(fork.loopRound, bValues[i].loopRound)
 		for j := range fork.stack {
-			fork.stack[j].Schema = joinTwoSchemas(fork.stack[j].Schema, bValues[i].stack[j].Schema)
+			fork.stack[j].Schema = joinTwoSchemas(fork.stack[j].Schema, bValues[i].stack[j].Schema, opts)
 			if !sameValueProvenance(fork.stack[j], bValues[i].stack[j]) {
 				fork.stack[j].origin = nil
 				fork.stack[j].rootVar = ""
@@ -898,7 +889,7 @@ func joinForkContinuations(a, b forkContinuations) forkContinuations {
 		for j := range fork.scopes {
 			for key, bValue := range bValues[i].scopes[j] {
 				if aValue, ok := fork.scopes[j][key]; ok {
-					fork.scopes[j][key] = joinTwoSchemas(aValue, bValue)
+					fork.scopes[j][key] = joinTwoSchemas(aValue, bValue, opts)
 				} else {
 					fork.scopes[j][key] = bValue
 				}

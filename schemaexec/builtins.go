@@ -1590,8 +1590,7 @@ func builtinDelpathsWeak(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 	// per-state must-cardinality (follow-up).
 	result := input
 	for _, path := range paths {
-		deleted := deletePathFromSchema(result, path, env.opts)
-		result = Union([]*oas3.Schema{result, deleted}, env.opts)
+		result = weakDeletePathFromSchema(result, path, env.opts)
 	}
 	return []*oas3.Schema{result}, nil
 }
@@ -1644,13 +1643,15 @@ func builtinDelpaths(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([
 	// Definite paths (exact collected tuples) delete strongly; variants
 	// expanded from disjunctively merged tuples only possibly name the
 	// deleted key, so they apply weakly (untouched ∪ deleted).
+	// jq deletes in descending path order so earlier deletes never shift the
+	// indices later deletes target; the strong loop must match.
+	sortDeletePathsDescending(paths)
 	result := input
 	for _, path := range paths {
 		result = deletePathFromSchema(result, path, env.opts)
 	}
 	for _, path := range possible {
-		deleted := deletePathFromSchema(result, path, env.opts)
-		result = Union([]*oas3.Schema{result, deleted}, env.opts)
+		result = weakDeletePathFromSchema(result, path, env.opts)
 	}
 
 	if env.opts.EnableWarnings {

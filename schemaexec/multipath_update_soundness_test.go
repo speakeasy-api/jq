@@ -75,6 +75,38 @@ func TestMixedDepthMultiPathUpdateStaysSound(t *testing.T) {
 	}
 }
 
+// unionForkUpdates merges the pending update controls of two joined states.
+// A 35-case A/B showed its differing-controls precondition is currently
+// unreachable in practice (both sides always carry identical control lists),
+// so this pins the contract as defensive depth for future join changes:
+// pointer-identity dedupe, nil filtering, and the empty-side shortcuts that
+// return the other slice unchanged.
+func TestUnionForkUpdates(t *testing.T) {
+	c1, c2, c3 := &forkControl{}, &forkControl{}, &forkControl{}
+
+	if got := unionForkUpdates(nil, nil); got != nil {
+		t.Errorf("union(nil, nil) = %v, want nil", got)
+	}
+	a := []*forkControl{c1, c2}
+	if got := unionForkUpdates(a, nil); len(got) != 2 || &got[0] != &a[0] {
+		t.Errorf("union(a, nil) must return a unchanged, got %v", got)
+	}
+	if got := unionForkUpdates(nil, a); len(got) != 2 || &got[0] != &a[0] {
+		t.Errorf("union(nil, a) must return a unchanged, got %v", got)
+	}
+
+	got := unionForkUpdates([]*forkControl{c1, nil, c2}, []*forkControl{c2, c3, nil, c1})
+	if len(got) != 3 || got[0] != c1 || got[1] != c2 || got[2] != c3 {
+		t.Errorf("union must dedupe by pointer and drop nils, got %v", got)
+	}
+
+	// Duplicates within one side collapse too.
+	got = unionForkUpdates([]*forkControl{c1, c1}, []*forkControl{c1})
+	if len(got) != 1 || got[0] != c1 {
+		t.Errorf("union must collapse within-side duplicates, got %v", got)
+	}
+}
+
 func assertMultiDelDropsRequired(t *testing.T, names []string) {
 	t.Helper()
 	props := map[string]*oas3.Schema{}
@@ -133,9 +165,10 @@ func TestMultiPathDeleteSevenPlusKnownUnsound(t *testing.T) {
 // KNOWN UNSOUNDNESS (pre-existing, reproduced): when the RHS branches of a
 // multi-path update reconverge and merge mid-update, a post-merge write can
 // fail to reach the pending eager alternative's snapshot (its pointer-keyed
-// replacement chain was broken by the value join). The provenance-based lazy
-// rebase (joinedValueSources) repairs scope-level joins, but this shape
-// breaks through a channel it does not yet cover.
+// replacement chain was broken by the value join). A provenance-based lazy
+// rebase (joinedValueSources) was tried and removed for its quadratic cost
+// (see git history); an epoch-keyed redesign of update delivery is the
+// tracked follow-up.
 func TestPostMergeWriteReachesPendingAlternativeKnownUnsound(t *testing.T) {
 	t.Skip("known pre-existing unsoundness: post-merge writes can miss pending update alternatives; see PR #3 follow-ups")
 	arm := func(v int64) *oas3.Schema {

@@ -3016,8 +3016,8 @@ func stripNullUnion(s *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	return s
 }
 
-func joinedStackValue(a, b SValue) SValue {
-	result := SValue{Schema: joinTwoSchemas(a.Schema, b.Schema)}
+func joinedStackValue(a, b SValue, opts SchemaExecOptions) SValue {
+	result := SValue{Schema: joinTwoSchemas(a.Schema, b.Schema, opts)}
 	if sameValueProvenance(a, b) {
 		result.origin = a.origin
 		result.rootVar = a.rootVar
@@ -3115,34 +3115,6 @@ func refineForkVarRefs(st *execState, key string, old, nw *oas3.Schema) {
 	if st == nil || key == "" || old == nil || nw == nil || old == nw {
 		return
 	}
-	// Lazy rebase across state joins: pending eager fork alternatives resolve
-	// variable updates through pointer-keyed replacement chains, and a state
-	// join replaces the chain's endpoint with a fresh joined pointer. A write
-	// recorded only against the joined pointer would never reach a chain (or
-	// fork snapshot) that still ends at a pre-join pointer, silently dropping
-	// the update for that alternative. Deliver the write against the joined
-	// pointer AND, transitively, every source pointer the join replaced;
-	// replacements apply on exact key+pointer matches, so extra deliveries
-	// are no-ops wherever the source pointer is not referenced.
-	targets := []*oas3.Schema{old}
-	if len(st.joinedValueSources) > 0 {
-		seen := map[*oas3.Schema]bool{old: true}
-		for i := 0; i < len(targets); i++ {
-			for _, source := range st.joinedValueSources[targets[i]] {
-				if source == nil || seen[source] || source == nw {
-					continue
-				}
-				seen[source] = true
-				targets = append(targets, source)
-			}
-		}
-	}
-	for _, target := range targets {
-		refineForkVarRefsOne(st, key, target, nw)
-	}
-}
-
-func refineForkVarRefsOne(st *execState, key string, old, nw *oas3.Schema) {
 	for i := range st.stack {
 		if st.stack[i].rootVar == key && st.stack[i].Schema == old {
 			st.stack[i].Schema = nw

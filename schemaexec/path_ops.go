@@ -1,6 +1,10 @@
 package schemaexec
 
 import (
+	"regexp"
+	"sort"
+	"strings"
+
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
 	"github.com/speakeasy-api/openapi/sequencedmap"
 	"gopkg.in/yaml.v3"
@@ -194,6 +198,56 @@ func extractPathsFromSchema(pathSchema *oas3.Schema) [][]PathSegment {
 	return nil
 }
 
+// weakDeletePathFromSchema over-approximates a delete that only POSSIBLY
+// happens: the result must admit both the untouched and the deleted concrete
+// value. Rather than building Union(input, deleted) — which keeps two anyOf
+// branches alive per update round and grows exponentially through reduce
+// fixpoints — it weakens in place: member schemas survive, the targeted key
+// stops being required, and count/value facets the delete could invalidate
+// are dropped. The in-place form is a superset of both outcomes, hence sound.
+func weakDeletePathFromSchema(schema *oas3.Schema, path []PathSegment, opts SchemaExecOptions) *oas3.Schema {
+	if schema == nil || len(path) == 0 {
+		return schema
+	}
+	if len(path) == 1 {
+		return weakDeleteSegment(schema, path[0], opts)
+	}
+	// Intermediate navigation installs the weakened child, which is a
+	// superset of the untouched child, so the strong set stays sound.
+	return navigateAndModify(schema, path[0], path[1:], opts, false, func(child *oas3.Schema) *oas3.Schema {
+		return weakDeletePathFromSchema(child, path[1:], opts)
+	})
+}
+
+func weakDeleteSegment(schema *oas3.Schema, seg PathSegment, opts SchemaExecOptions) *oas3.Schema {
+	if seg.IsSymbolic {
+		// The symbolic delete is already weak: values survive, required and
+		// lower bounds are dropped.
+		return deleteSegment(schema, seg, opts)
+	}
+	if key, ok := seg.Key.(string); ok && getType(schema) == "object" {
+		result := cloneSchema(schema)
+		required := make([]string, 0, len(schema.Required))
+		for _, name := range schema.Required {
+			if name != key {
+				required = append(required, name)
+			}
+		}
+		result.Required = required
+		result.MinProperties = nil
+		result.Const = nil
+		result.Enum = nil
+		result.DependentSchemas = nil
+		return result
+	}
+	if _, ok := seg.Key.(int); ok && getType(schema) == "array" {
+		result := arrayWriteSurvivors(eraseArrayPositions(schema, opts))
+		result.MinItems = nil
+		return result
+	}
+	return schema
+}
+
 // maxExpandedDeletePaths bounds the cartesian expansion of enum-headed path
 // tuples; beyond it the caller falls back to weakDeleteUnknown.
 const maxExpandedDeletePaths = 64
@@ -255,7 +309,10 @@ func expandPathTuple(tuple *oas3.Schema) (paths [][]PathSegment, multi bool, ok 
 		if left == nil {
 			continue
 		}
-		candidates := pathSegmentCandidates(left)
+		candidates, candidatesOK := pathSegmentCandidates(left)
+		if !candidatesOK {
+			return nil, false, false
+		}
 		if len(candidates) > 1 {
 			multi = true
 		}
@@ -274,34 +331,90 @@ func expandPathTuple(tuple *oas3.Schema) (paths [][]PathSegment, multi bool, ok 
 	return paths, multi, true
 }
 
-func pathSegmentCandidates(schema *oas3.Schema) []PathSegment {
+// pathSegmentCandidates expands one path-tuple position into its candidate
+// segments. ok=false means a multi-value enum member could not be decoded
+// (nil, non-scalar, or failed decoding); falling back to Enum[0] there would
+// silently drop candidates, so the caller must treat the whole tuple as
+// unextractable and take the weak unknown-delete fallback.
+func pathSegmentCandidates(schema *oas3.Schema) ([]PathSegment, bool) {
 	isAllElements := getType(schema) == "integer" && schema.Format != nil && *schema.Format == allElementsPathFormat
 	if !isAllElements && len(schema.Enum) > 1 {
 		switch getType(schema) {
 		case "string":
 			out := make([]PathSegment, 0, len(schema.Enum))
 			for _, node := range schema.Enum {
-				if node.Kind == yaml.ScalarNode {
-					out = append(out, PathSegment{Key: node.Value})
+				if node == nil || node.Kind != yaml.ScalarNode {
+					return nil, false
 				}
+				out = append(out, PathSegment{Key: node.Value})
 			}
-			if len(out) == len(schema.Enum) {
-				return out
-			}
+			return out, true
 		case "integer":
 			out := make([]PathSegment, 0, len(schema.Enum))
 			for _, node := range schema.Enum {
 				var idx int64
-				if node.Kind == yaml.ScalarNode && node.Decode(&idx) == nil {
-					out = append(out, PathSegment{Key: int(idx)})
+				if node == nil || node.Kind != yaml.ScalarNode || node.Decode(&idx) != nil {
+					return nil, false
 				}
+				out = append(out, PathSegment{Key: int(idx)})
 			}
-			if len(out) == len(schema.Enum) {
-				return out
-			}
+			return out, true
 		}
 	}
-	return []PathSegment{extractSegmentFromSchema(schema)}
+	return []PathSegment{extractSegmentFromSchema(schema)}, true
+}
+
+// sortDeletePathsDescending orders paths in descending jq path order — the
+// order jq applies deletes in (from the end), so an earlier delete never
+// shifts the indices a later delete targets.
+func sortDeletePathsDescending(paths [][]PathSegment) {
+	sort.SliceStable(paths, func(i, j int) bool {
+		return compareDeletePaths(paths[i], paths[j]) > 0
+	})
+}
+
+func compareDeletePaths(a, b []PathSegment) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if c := compareDeleteSegments(a[i], b[i]); c != 0 {
+			return c
+		}
+	}
+	// Equal prefix: the longer path sorts greater so the descending order
+	// deletes it first — the shorter (ancestor) path deletes last.
+	switch {
+	case len(a) > len(b):
+		return 1
+	case len(a) < len(b):
+		return -1
+	}
+	return 0
+}
+
+func compareDeleteSegments(a, b PathSegment) int {
+	aIdx, aInt := a.Key.(int)
+	bIdx, bInt := b.Key.(int)
+	aKey, aStr := a.Key.(string)
+	bKey, bStr := b.Key.(string)
+	switch {
+	case aInt && bInt:
+		switch {
+		case aIdx > bIdx:
+			return 1
+		case aIdx < bIdx:
+			return -1
+		}
+		return 0
+	case aStr && bStr:
+		return strings.Compare(aKey, bKey)
+	case aInt && bStr:
+		// jq orders numbers before strings.
+		return -1
+	case aStr && bInt:
+		return 1
+	}
+	// Symbolic segments have no concrete order; treat as equal so the stable
+	// sort keeps their collected order.
+	return 0
 }
 
 // extractSinglePath extracts path segments from a single path array schema
@@ -464,6 +577,19 @@ func deleteProperty(schema *oas3.Schema, propName string) *oas3.Schema {
 			}
 		}
 		result.Required = newRequired
+	}
+
+	// The removal invalidates container-level value facets and lowers the
+	// guaranteed key count by one.
+	result.Const = nil
+	result.Enum = nil
+	result.DependentSchemas = nil
+	if schema.MinProperties != nil {
+		value := *schema.MinProperties - 1
+		if value < 0 {
+			value = 0
+		}
+		result.MinProperties = &value
 	}
 
 	return &result
@@ -730,6 +856,7 @@ func navigateAndModify(schema *oas3.Schema, seg PathSegment, remainingPath []Pat
 		// Clone properties
 		newProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
 		found := false
+		childModified := false
 		if schema.Properties != nil {
 			for k, v := range schema.Properties.All() {
 				if k == key {
@@ -737,7 +864,9 @@ func navigateAndModify(schema *oas3.Schema, seg PathSegment, remainingPath []Pat
 				}
 				if k == key && resolvedLeft(v) != nil {
 					// Modify this property
-					modified := modifyFn(resolvedLeft(v))
+					original := resolvedLeft(v)
+					modified := modifyFn(original)
+					childModified = childModified || modified != original
 					newProps.Set(k, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](modified))
 				} else {
 					newProps.Set(k, v)
@@ -753,6 +882,18 @@ func navigateAndModify(schema *oas3.Schema, seg PathSegment, remainingPath []Pat
 			}
 		} else if createMissing && found && !isRequired(result.Required, key) {
 			result.Required = append(append([]string(nil), schema.Required...), key)
+		} else if !createMissing && !found {
+			// Delete traversal into a key covered only by a dynamic-key facet
+			// (patternProperties/additionalProperties): silently returning the
+			// input would skip the delete for that member. Weakly update the
+			// covering facet instead.
+			childModified = modifyCoveringDynamicFacet(&result, key, opts, modifyFn) || childModified
+		}
+		if childModified {
+			// Interior modification invalidates container-level value facets.
+			result.Const = nil
+			result.Enum = nil
+			result.DependentSchemas = nil
 		}
 		result.Properties = newProps
 		return &result
@@ -761,10 +902,67 @@ func navigateAndModify(schema *oas3.Schema, seg PathSegment, remainingPath []Pat
 	if idx, ok := seg.Key.(int); ok && getType(schema) == "array" {
 		child := getArrayElement(schema, idx, opts)
 		modified := modifyFn(child)
-		return widenArrayAfterWrite(schema, modified, &idx, opts)
+		// Delete traversal (createMissing=false) must not bump MinItems to
+		// idx+1: deletes never pad, so a concrete array shorter than idx+1
+		// passes through unchanged and must stay admitted.
+		index := &idx
+		if !createMissing {
+			index = nil
+		}
+		return widenArrayAfterWrite(schema, modified, index, opts)
 	}
 
 	return schema
+}
+
+// modifyCoveringDynamicFacet applies modifyFn to the value schema of the
+// dynamic-key facet covering key (the first matching patternProperties entry,
+// else a schema-valued additionalProperties) and installs Union(old, modified)
+// back into that facet. The union keeps the update weak: other dynamic keys
+// matched by the same facet keep their old shape. Reports whether a facet was
+// updated. result is a shallow copy of the input, so the facet maps it points
+// at are shared and must be replaced, never mutated in place.
+func modifyCoveringDynamicFacet(result *oas3.Schema, key string, opts SchemaExecOptions, modifyFn func(*oas3.Schema) *oas3.Schema) bool {
+	install := func(old *oas3.Schema) (*oas3.JSONSchema[oas3.Referenceable], bool) {
+		modified := modifyFn(old)
+		if modified == old {
+			return nil, false
+		}
+		return oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Union([]*oas3.Schema{old, modified}, opts)), true
+	}
+	if result.PatternProperties != nil {
+		for pattern, wrapper := range result.PatternProperties.All() {
+			re, err := regexp.Compile(pattern)
+			if err != nil || !re.MatchString(key) {
+				continue
+			}
+			old := resolvedLeft(wrapper)
+			if old == nil {
+				return false
+			}
+			updated, ok := install(old)
+			if !ok {
+				return false
+			}
+			newPatterns := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+			for k, v := range result.PatternProperties.All() {
+				if k == pattern {
+					newPatterns.Set(k, updated)
+				} else {
+					newPatterns.Set(k, v)
+				}
+			}
+			result.PatternProperties = newPatterns
+			return true
+		}
+	}
+	if old := resolvedLeft(result.AdditionalProperties); old != nil {
+		if updated, ok := install(old); ok {
+			result.AdditionalProperties = updated
+			return true
+		}
+	}
+	return false
 }
 
 // weakDeleteUnknown over-approximates a delpaths whose path set could not be
@@ -843,6 +1041,12 @@ func weakDeleteUnknown(schema *oas3.Schema, opts SchemaExecOptions, seen map[*oa
 	}
 	result.AnyOf = mapWrappers(schema.AnyOf)
 	result.OneOf = mapWrappers(schema.OneOf)
+	// A delete at unknown depth can invalidate conditional/negation facets
+	// (they describe the pre-delete value), so they cannot be carried over.
+	result.Not = nil
+	result.If = nil
+	result.Then = nil
+	result.Else = nil
 	return result
 }
 

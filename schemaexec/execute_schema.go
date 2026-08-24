@@ -2147,7 +2147,7 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 				redirect[id] = root
 				// Ensure we have an entry at the root and union siblings there
 				if rootArr, ok := mergedAccum[root]; ok && rootArr != mergedAccum[id] {
-					mergedAccum[root] = joinTwoSchemas(rootArr, mergedAccum[id])
+					mergedAccum[root] = joinTwoSchemas(rootArr, mergedAccum[id], env.opts)
 					env.logger.Debugf("DSU computeAllocRedirect: merged %s into root %s", id, root)
 				} else if _, ok := mergedAccum[root]; !ok {
 					mergedAccum[root] = mergedAccum[id]
@@ -2330,7 +2330,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 								case arr2 == nil:
 									merged = arr1
 								default:
-									merged = joinTwoSchemas(arr1, arr2)
+									merged = joinTwoSchemas(arr1, arr2, env.opts)
 								}
 								if merged != nil {
 									next.accum[root] = merged
@@ -5110,40 +5110,6 @@ func accumMapsEqualByIdentity(m1, m2 map[string]*oas3.Schema) bool {
 	return true
 }
 
-// recordJoinedValueSources builds the merged state's join-provenance map:
-// every scope value the join replaced with a fresh joined pointer is recorded
-// as a source of that pointer, so a later write against the joined pointer
-// can be lazily rebased onto the pointer chains that pending eager fork
-// alternatives still resolve through (see refineForkVarRefs).
-func recordJoinedValueSources(merged, a, b *execState, aScope, bScope, mergedScope map[string]*oas3.Schema) {
-	if merged.joinedValueSources == nil {
-		// The merged state owns a fresh map (clones share maps, so appending
-		// into a parent's map would leak provenance across states).
-		combined := make(map[*oas3.Schema][]*oas3.Schema, len(a.joinedValueSources)+len(b.joinedValueSources))
-		for k, v := range a.joinedValueSources {
-			combined[k] = v
-		}
-		for k, v := range b.joinedValueSources {
-			combined[k] = append(append([]*oas3.Schema(nil), combined[k]...), v...)
-		}
-		merged.joinedValueSources = combined
-	}
-	record := func(source, joined *oas3.Schema) {
-		if source == nil || joined == nil || source == joined {
-			return
-		}
-		merged.joinedValueSources[joined] = append(merged.joinedValueSources[joined], source)
-	}
-	for key, mergedValue := range mergedScope {
-		if aValue, ok := aScope[key]; ok {
-			record(aValue, mergedValue)
-		}
-		if bValue, ok := bScope[key]; ok {
-			record(bValue, mergedValue)
-		}
-	}
-}
-
 // unionForkUpdates merges the pending update controls of two joined states so
 // writes that happen after the merge reach the eager alternatives of both.
 func unionForkUpdates(a, b []*forkControl) []*forkControl {
@@ -5305,7 +5271,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			}
 		}
 
-		mergedForks := joinForkContinuations(a.forks, b.forks)
+		mergedForks := joinForkContinuations(a.forks, b.forks, opts)
 		merged := &execState{
 			pc:            a.pc,
 			stack:         make([]SValue, len(a.stack)),
@@ -5392,7 +5358,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 
 		// Join stack values
 		for i := range a.stack {
-			merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i])
+			merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i], opts)
 		}
 
 		// Join scopes
@@ -5440,7 +5406,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 								root := a.dsu.Find(aAlloc)
 
 								// Merge canonical arrays and bind canonical to merged scope
-								joined := joinTwoSchemas(aVal, bVal)
+								joined := joinTwoSchemas(aVal, bVal, opts)
 								if joined != nil {
 									merged.accum[root] = joined
 									merged.schemaToAlloc[joined] = root
@@ -5570,7 +5536,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 						}
 
 						// Case 3: Join arrays and tag the result
-						joined := joinTwoSchemas(aVal, bVal)
+						joined := joinTwoSchemas(aVal, bVal, opts)
 						if getType(joined) == "array" {
 							if _, tagged := merged.schemaToAlloc[joined]; !tagged {
 								*merged.allocCounter++
@@ -5632,7 +5598,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 					}
 
 					// Non-array or only one side array: default join
-					mergedScope[k] = joinTwoSchemas(aVal, bVal)
+					mergedScope[k] = joinTwoSchemas(aVal, bVal, opts)
 				} else if aHas {
 					mergedScope[k] = aVal
 				} else {
@@ -5640,7 +5606,6 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 				}
 			}
 
-			recordJoinedValueSources(merged, a, b, aScope, bScope, mergedScope)
 			merged.scopes[i] = mergedScope
 		}
 
@@ -5648,7 +5613,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 	}
 
 	// States have same accum map - normal join
-	mergedForks := joinForkContinuations(a.forks, b.forks)
+	mergedForks := joinForkContinuations(a.forks, b.forks, opts)
 	merged := &execState{
 		pc:            a.pc,
 		stack:         make([]SValue, len(a.stack)),
@@ -5763,7 +5728,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 						opts.debugf("joinState: preserving canonical ptr for allocID=%s (stack pos %d), canonical NOT TAGGED! Re-tagging now.", aAlloc, i)
 						merged.schemaToAlloc[canonical] = aAlloc
 					}
-					merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i])
+					merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i], opts)
 					merged.stack[i].Schema = canonical
 					continue
 				}
@@ -5771,7 +5736,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 		}
 
 		// Default: join via union
-		merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i])
+		merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i], opts)
 	}
 
 	// Join scopes (union keys, join shared values)
@@ -5820,7 +5785,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 							root := a.dsu.Find(aAlloc)
 
 							// Merge canonical arrays and bind canonical to merged scope
-							joined := joinTwoSchemas(aVal, bVal)
+							joined := joinTwoSchemas(aVal, bVal, opts)
 							if joined != nil {
 								merged.accum[root] = joined
 								merged.schemaToAlloc[joined] = root
@@ -5941,7 +5906,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 					}
 
 					// Case 3: Join arrays and tag the result
-					joined := joinTwoSchemas(aVal, bVal)
+					joined := joinTwoSchemas(aVal, bVal, opts)
 					if getType(joined) == "array" {
 						if _, tagged := merged.schemaToAlloc[joined]; !tagged {
 							*merged.allocCounter++
@@ -5997,7 +5962,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 				}
 
 				// Non-array or only one side array: default join
-				mergedScope[k] = joinTwoSchemas(aVal, bVal)
+				mergedScope[k] = joinTwoSchemas(aVal, bVal, opts)
 			} else if aHas {
 				// Only a has it: keep a's value
 				mergedScope[k] = aVal
@@ -6007,7 +5972,6 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			}
 		}
 
-		recordJoinedValueSources(merged, a, b, aScope, bScope, mergedScope)
 		merged.scopes[i] = mergedScope
 	}
 
@@ -6031,12 +5995,12 @@ func joinForeachLoops(a, b map[foreachLoopKey]foreachLoopState, opts SchemaExecO
 		loop.previous = Union([]*oas3.Schema{left.previous, right.previous}, opts)
 		loop.round = maxInt(left.round, right.round)
 		loop.continuation = cloneForkContinuation(left.continuation)
-		loop.forks = joinForkContinuations(left.forks, right.forks)
+		loop.forks = joinForkContinuations(left.forks, right.forks, opts)
 		loop.labels = joinLabelContinuations(left.labels, right.labels, loop.forks.len())
 		loop.forkUpdates = append([]*forkControl(nil), left.forkUpdates...)
 		for index := range loop.continuation.stack {
 			loop.continuation.stack[index] = joinedStackValue(
-				left.continuation.stack[index], right.continuation.stack[index])
+				left.continuation.stack[index], right.continuation.stack[index], opts)
 			loop.continuation.stack[index].Schema = Union([]*oas3.Schema{
 				left.continuation.stack[index].Schema,
 				right.continuation.stack[index].Schema,
@@ -6059,14 +6023,14 @@ func joinForeachLoops(a, b map[foreachLoopKey]foreachLoopState, opts SchemaExecO
 }
 
 // joinTwoSchemas performs schema-level join (LUB) using Union.
-func joinTwoSchemas(a, b *oas3.Schema) *oas3.Schema {
+func joinTwoSchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	// CRITICAL FIX: If pointers are identical, return immediately to preserve pointer identity
 	// This prevents unnecessary cloning and preserves tags in schemaToAlloc
 	if a == b {
 		return a
 	}
 
-	return Union([]*oas3.Schema{a, b}, SchemaExecOptions{})
+	return Union([]*oas3.Schema{a, b}, opts)
 }
 
 // partitionByShape groups states with compatible layouts.
