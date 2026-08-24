@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/speakeasy-api/openapi/jsonschema/oas3"
+	"github.com/speakeasy-api/openapi/sequencedmap"
 	"gopkg.in/yaml.v3"
 )
 
@@ -137,8 +138,8 @@ var builtinRegistry = map[string]builtinFunc{
 
 	// Internal
 	"_allocator": builtinAllocator,
-	"_setpath":   builtinSetpath,  // Reuse public version
-	"_delpaths":  builtinDelpaths, // Reuse public version
+	"_setpath":   builtinSetpath, // Reuse public version
+	"_delpaths":  builtinDelpathsWeak,
 }
 
 // ============================================================================
@@ -150,35 +151,23 @@ func builtinType(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 	if input == nil {
 		return []*oas3.Schema{ConstString("null")}, nil
 	}
-
-	// Get all possible types from the schema
-	types := input.GetType()
-
-	if len(types) == 0 {
-		// No type specified - could be anything
-		// Return union of all type strings
-		typeStrings := []string{"null", "boolean", "number", "string", "array", "object"}
-		schemas := make([]*oas3.Schema, len(typeStrings))
-		for i, t := range typeStrings {
-			schemas[i] = ConstString(t)
+	result := distributeBuiltinInput(input, env, func(branch *oas3.Schema) *oas3.Schema {
+		types := branch.GetType()
+		if len(types) == 0 {
+			typeStrings := []string{"null", "boolean", "number", "string", "array", "object"}
+			schemas := make([]*oas3.Schema, len(typeStrings))
+			for i, typ := range typeStrings {
+				schemas[i] = ConstString(typ)
+			}
+			return Union(schemas, env.opts)
 		}
-		return schemas, nil
-	}
-
-	if len(types) == 1 {
-		// Single type - return const string ("null" joins for nullable)
-		if input.Nullable != nil && *input.Nullable {
-			return []*oas3.Schema{ConstString(string(types[0])), ConstString("null")}, nil
+		schemas := make([]*oas3.Schema, len(types))
+		for i, typ := range types {
+			schemas[i] = ConstString(string(typ))
 		}
-		return []*oas3.Schema{ConstString(string(types[0]))}, nil
-	}
-
-	// Multiple types - return union of type strings
-	schemas := make([]*oas3.Schema, len(types))
-	for i, t := range types {
-		schemas[i] = ConstString(string(t))
-	}
-	return schemas, nil
+		return Union(schemas, env.opts)
+	})
+	return []*oas3.Schema{result}, nil
 }
 
 // builtinLength returns a number schema (length is always a number).
@@ -1554,6 +1543,58 @@ func builtinAllocator(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 
 // builtinDelpaths implements delpaths(paths) - delete multiple paths from input
 // Used by del() which compiles to delpaths
+// delpathsUnextracted handles a paths argument no concrete path could be
+// extracted from. A provably empty path set deletes nothing; anything else
+// may delete some member at some depth, so returning the input unchanged
+// would be unsound — widen with the weak unknown-delete transform instead.
+func delpathsUnextracted(input, pathsArg *oas3.Schema, env *schemaEnv) *oas3.Schema {
+	// "Provably empty" must be internally consistent: joins can leave a stale
+	// maxItems=0 on an accumulator that also records appended items, and
+	// trusting it would turn real deletes into no-ops.
+	provablyEmpty := pathsArg != nil && pathsArg.MaxItems != nil && *pathsArg.MaxItems == 0 &&
+		(pathsArg.MinItems == nil || *pathsArg.MinItems == 0) &&
+		pathsArg.Items == nil && len(pathsArg.PrefixItems) == 0
+	if pathsArg == nil || !MightBeArray(pathsArg) || provablyEmpty {
+		return input
+	}
+	if env.opts.EnableWarnings {
+		env.addWarning("delpaths: paths not extractable; applying weak unknown-delete")
+	}
+	return weakDeleteUnknown(input, env.opts, make(map[*oas3.Schema]*oas3.Schema))
+}
+
+// builtinDelpathsWeak backs the |= desugaring's trailing _delpaths call. Its
+// paths accumulator is populated only on the branches where the update body
+// yielded empty, so every path in it is merely POSSIBLE: a strong delete
+// would remove members that survive in the concrete run (the accumulator is
+// empty whenever the body yields a value). Model each delete weakly as
+// (untouched ∪ deleted), which keeps member schemas and drops requiredness.
+func builtinDelpathsWeak(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
+	if len(args) == 0 {
+		return []*oas3.Schema{input}, nil
+	}
+	definite, possible, complete := expandDeletePaths(args[0])
+	if !complete {
+		return []*oas3.Schema{delpathsUnextracted(input, args[0], env)}, nil
+	}
+	paths := append(definite, possible...)
+	if len(paths) == 0 {
+		return []*oas3.Schema{delpathsUnextracted(input, args[0], env)}, nil
+	}
+	// Every path here is merely POSSIBLE (even the "definite" ones: this
+	// accumulator is populated only on branches where the update body yielded
+	// empty). Allocation cardinality cannot make a path definite either: the
+	// cardinality map is shared between cloned branches, so a lower bound
+	// proves some explored branch appended, not that every represented
+	// execution did. Strong recovery of `.n |= empty` precision needs
+	// per-state must-cardinality (follow-up).
+	result := input
+	for _, path := range paths {
+		result = weakDeletePathFromSchema(result, path, env.opts)
+	}
+	return []*oas3.Schema{result}, nil
+}
+
 func builtinDelpaths(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
 	if env.opts.EnableWarnings {
 		env.addWarning("delpaths called: input type=%s, args count=%d", getType(input), len(args))
@@ -1582,7 +1623,11 @@ func builtinDelpaths(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([
 	}
 
 	// Extract paths from the schema (array of path arrays)
-	paths := extractPathsFromSchema(pathsArg)
+	definite, possible, complete := expandDeletePaths(pathsArg)
+	if !complete {
+		return []*oas3.Schema{delpathsUnextracted(input, pathsArg, env)}, nil
+	}
+	paths := definite
 
 	if env.opts.EnableWarnings {
 		env.addWarning("delpaths: extracted %d paths", len(paths))
@@ -1591,18 +1636,22 @@ func builtinDelpaths(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([
 		}
 	}
 
-	if len(paths) == 0 {
-		// No paths to delete
-		if env.opts.EnableWarnings {
-			env.addWarning("delpaths: no paths extracted, returning input unchanged")
-		}
-		return []*oas3.Schema{input}, nil
+	if len(paths) == 0 && len(possible) == 0 {
+		return []*oas3.Schema{delpathsUnextracted(input, pathsArg, env)}, nil
 	}
 
-	// Apply deletion for each path
+	// Definite paths (exact collected tuples) delete strongly; variants
+	// expanded from disjunctively merged tuples only possibly name the
+	// deleted key, so they apply weakly (untouched ∪ deleted).
+	// jq deletes in descending path order so earlier deletes never shift the
+	// indices later deletes target; the strong loop must match.
+	sortDeletePathsDescending(paths)
 	result := input
 	for _, path := range paths {
 		result = deletePathFromSchema(result, path, env.opts)
+	}
+	for _, path := range possible {
+		result = weakDeletePathFromSchema(result, path, env.opts)
 	}
 
 	if env.opts.EnableWarnings {
@@ -1752,7 +1801,15 @@ func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 				if env.opts.EnableWarnings {
 					env.logger.Debugf("builtinSetpath: detected wildcard string key pattern (non-empty), updating additionalProperties")
 				}
-				return []*oas3.Schema{setDynamicProperty(input, valueArg, env.opts)}, nil
+				writeValue := valueArg
+				exactlyOne := pathArg.MinItems != nil && pathArg.MaxItems != nil &&
+					*pathArg.MinItems == 1 && *pathArg.MaxItems == 1
+				if !exactlyOne {
+					// A longer path nests the value inside containers this
+					// depth-1 model cannot represent; widen the written value.
+					writeValue = env.NewTopWithCause("setpath: dynamic path depth is unknown")
+				}
+				return []*oas3.Schema{setDynamicProperty(input, writeValue, env.opts)}, nil
 			}
 		}
 
@@ -1815,23 +1872,57 @@ func setDynamicProperty(obj *oas3.Schema, value *oas3.Schema, opts SchemaExecOpt
 		return result
 	}
 
-	result := cloneSchema(obj)
+	// The post-write schema keeps only what a dynamic-key write leaves
+	// valid: existing keys stay present (required, minProperties) and member
+	// schemas are widened below. The write may add a previously absent key,
+	// so key-set bounds (maxProperties, propertyNames) and value-dependent
+	// facets (const/enum, dependentSchemas, combinators) do not survive.
+	result := &oas3.Schema{
+		Type:          oas3.NewTypeFromString(oas3.SchemaTypeObject),
+		Required:      obj.Required,
+		MinProperties: obj.MinProperties,
+		Nullable:      obj.Nullable,
+	}
 
-	// Get existing additionalProperties
+	// The dynamic key may collide with any declared or pattern property, in
+	// which case that property now holds the written value. Union it in so
+	// the result admits both the untouched and the overwritten outcome.
+	widen := func(values *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]]) *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]] {
+		if values == nil || values.Len() == 0 {
+			return values
+		}
+		widened := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
+		for key, wrapper := range values.All() {
+			parts := make([]*oas3.Schema, 0, 2)
+			if existing, possible := schemaFacetValue(wrapper, opts); possible {
+				parts = append(parts, existing)
+			}
+			parts = append(parts, value)
+			widened.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](Union(parts, opts)))
+		}
+		return widened
+	}
+	result.Properties = widen(obj.Properties)
+	result.PatternProperties = widen(obj.PatternProperties)
+
 	var existingAP *oas3.Schema
-	if result.AdditionalProperties != nil && result.AdditionalProperties.Left != nil {
-		existingAP = result.AdditionalProperties.Left
+	if obj.AdditionalProperties != nil {
+		var possible bool
+		existingAP, possible = schemaFacetValue(obj.AdditionalProperties, opts)
+		if !possible {
+			existingAP = nil
+		}
+	} else if opts.Semantics == SchemaSemanticsRaw {
+		existingAP = Top()
 	}
 
-	// Union existing additionalProperties with new value type
-	var newAP *oas3.Schema
-	if existingAP != nil {
-		newAP = Union([]*oas3.Schema{existingAP, value}, opts)
+	newAP := Union([]*oas3.Schema{existingAP, value}, opts)
+	if isTopSchema(newAP) {
+		result.AdditionalProperties = oas3.NewJSONSchemaFromBool(true)
 	} else {
-		newAP = value
+		result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newAP)
 	}
 
-	result.AdditionalProperties = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](newAP)
 	return result
 }
 
@@ -2485,24 +2576,30 @@ func mergeObjectsForMultiply(lhs, rhs *oas3.Schema, env *schemaEnv, seen map[sch
 	}
 	result := MergeObjects(lhs, rhs, env.opts)
 	seen[pair] = result
-	if result.Properties == nil || lhs.Properties == nil || rhs.Properties == nil {
+	if result.Properties == nil || lhs.Properties == nil {
 		return result
 	}
 	result = cloneSchema(result)
 	result.Properties = cloneSchemaMap(result.Properties)
 	seen[pair] = result
 	for key, leftProperty := range lhs.Properties.All() {
-		rightProperty, ok := rhs.Properties.Get(key)
-		if !ok {
+		leftValue, leftPossible := schemaFacetValue(leftProperty, env.opts)
+		if !leftPossible {
 			continue
 		}
-		leftValue, rightValue := resolvedLeft(leftProperty), resolvedLeft(rightProperty)
-		if leftValue == nil || rightValue == nil {
-			result.Properties.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](
-				env.NewTopWithCause("recursive object merge property could not be resolved")))
+		rightProperty, declared := objectDeclaredProperty(rhs, key)
+		rightValue, rightPossible := schemaFacetValue(rightProperty, env.opts)
+		if !declared {
+			rightValue, rightPossible = objectUndeclaredValueForKey(rhs, key, env.opts)
+		}
+		if !rightPossible {
 			continue
 		}
-		merged := recursiveMultiplyProperty(leftValue, rightValue, env, seen)
+		overridden := recursiveMultiplyProperty(leftValue, rightValue, env, seen)
+		merged := overridden
+		if !declared || !isRequired(rhs.Required, key) {
+			merged = Union([]*oas3.Schema{leftValue, overridden}, env.opts)
+		}
 		result.Properties.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](merged))
 	}
 	return result
@@ -2607,25 +2704,15 @@ func concatArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema 
 		return ArrayType(Bottom()) // Empty array
 	}
 
-	items := make([]*oas3.Schema, 0, 8)
+	items := make([]*oas3.Schema, 0, 2)
 	collectArrayItemCandidates := func(arr *oas3.Schema) {
 		if arr == nil {
 			return
 		}
-		// Skip empty arrays - they contribute no items
 		if arr.MaxItems != nil && *arr.MaxItems == 0 {
 			return
 		}
-		if arr.PrefixItems != nil {
-			for _, pi := range arr.PrefixItems {
-				if pi.Left != nil {
-					items = append(items, pi.Left)
-				}
-			}
-		}
-		if arr.Items != nil && arr.Items.Left != nil {
-			items = append(items, arr.Items.Left)
-		}
+		items = append(items, arrayElementUnion(arr, opts))
 	}
 	collectArrayItemCandidates(a)
 	collectArrayItemCandidates(b)
@@ -2679,30 +2766,7 @@ func subtractArraySchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 		return ArrayType(Bottom())
 	}
 
-	// For schema analysis: array subtraction returns an array with potentially the same item types as lhs
-	// We cannot narrow the type further without concrete values
-	var itemType *oas3.Schema
-	if a.Items != nil && a.Items.Left != nil {
-		itemType = a.Items.Left
-	} else if len(a.PrefixItems) > 0 {
-		// For tuples, union all item types
-		items := make([]*oas3.Schema, 0, len(a.PrefixItems))
-		for _, item := range a.PrefixItems {
-			if item.Left != nil {
-				items = append(items, item.Left)
-			}
-		}
-		if len(items) > 0 {
-			itemType = Union(items, opts)
-		}
-	}
-
-	if itemType == nil {
-		itemType = Top()
-	}
-
-	// Return array with same item type as lhs (conservative - we can't narrow without concrete values)
-	return ArrayType(itemType)
+	return ArrayType(arrayElementUnion(a, opts))
 }
 
 // concatStringSchemas concatenates strings with const folding.

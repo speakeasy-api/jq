@@ -139,8 +139,9 @@ func newSchemaEnv(ctx context.Context, opts SchemaExecOptions) *schemaEnv {
 	// operations (Union, merges, ...) can log through it.
 	opts.logger = logger
 	if opts.norm == nil {
-		opts.norm = newNormCtx(ctx)
+		opts.norm = newNormCtxForSemantics(ctx, opts.Semantics)
 	}
+	opts.norm.semantics = opts.Semantics
 	opts.norm.logger = logger
 
 	return &schemaEnv{
@@ -290,6 +291,7 @@ type normCtx struct {
 	memo       map[*oas3.Schema]*oas3.Schema
 	normalized map[*oas3.Schema]struct{}
 	logger     Logger
+	semantics  SchemaSemantics
 }
 
 func newNormCtx(ctx context.Context) *normCtx {
@@ -301,6 +303,19 @@ func newNormCtx(ctx context.Context) *normCtx {
 		memo:       make(map[*oas3.Schema]*oas3.Schema, 256),
 		normalized: make(map[*oas3.Schema]struct{}, 256),
 	}
+}
+
+func newNormCtxForSemantics(ctx context.Context, semantics SchemaSemantics) *normCtx {
+	nctx := newNormCtx(ctx)
+	nctx.semantics = semantics
+	return nctx
+}
+
+func (nctx *normCtx) schemaType(schema *oas3.Schema) string {
+	if nctx != nil && nctx.semantics == SchemaSemanticsRaw {
+		return getTypeExplicit(schema)
+	}
+	return getType(schema)
 }
 
 func (nctx *normCtx) debugf(format string, args ...any) {
@@ -335,7 +350,8 @@ func newCollapseContext() context.Context {
 
 func collapseContextForOptions(opts SchemaExecOptions) context.Context {
 	if opts.norm == nil {
-		return newCollapseContext()
+		ctx := context.Background()
+		return withNormCtx(ctx, newNormCtxForSemantics(ctx, opts.Semantics))
 	}
 	return withNormCtx(opts.norm.ctx, opts.norm)
 }
@@ -396,6 +412,17 @@ func normalizeSchema(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, er
 	if err := normalizeSchemaChildren(ctx, result); err != nil {
 		return nil, err
 	}
+	if expandSchemaTypeArray(result) {
+		bottom, err := normalizeExpandedTypeBranches(ctx, result, nctx)
+		if err != nil {
+			return nil, err
+		}
+		if bottom {
+			nctx.memo[schema] = nil
+			return nil, nil
+		}
+		return result, nil
+	}
 	bottom, err := collapseNormalizedCombinators(ctx, result, nctx)
 	if err != nil {
 		return nil, err
@@ -405,6 +432,69 @@ func normalizeSchema(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, er
 		return nil, nil
 	}
 	return result, nil
+}
+
+// expandSchemaTypeArray represents a JSON Schema type union using the same
+// disjunctive shape the executor already distributes over. Each branch keeps
+// the original facets: JSON Schema keywords only constrain instances of the
+// types to which they apply, so retaining (for example) items on the null
+// branch is semantically neutral while preserving it on the array branch.
+func expandSchemaTypeArray(schema *oas3.Schema) bool {
+	types := append([]oas3.SchemaType(nil), schema.GetType()...)
+	if len(types) <= 1 {
+		return false
+	}
+	sort.Slice(types, func(i, j int) bool { return types[i] < types[j] })
+	unique := types[:0]
+	for _, typ := range types {
+		if len(unique) == 0 || unique[len(unique)-1] != typ {
+			unique = append(unique, typ)
+		}
+	}
+	if len(unique) == 1 {
+		schema.Type = oas3.NewTypeFromString(unique[0])
+		return false
+	}
+
+	base := cloneSchema(schema)
+	branches := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(unique))
+	for _, typ := range unique {
+		branch := cloneSchema(base)
+		branch.Type = oas3.NewTypeFromString(typ)
+		branches = append(branches, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branch))
+	}
+	*schema = oas3.Schema{AnyOf: branches}
+	return true
+}
+
+// normalizeExpandedTypeBranches collapses the original schema's combinators
+// inside each single-type branch. The generated outer anyOf intentionally
+// remains intact: flattening it through primary-type helpers would turn mixed
+// types back into an unknown type and could drop a listed alternative.
+func normalizeExpandedTypeBranches(ctx context.Context, schema *oas3.Schema, nctx *normCtx) (bool, error) {
+	branches := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(schema.AnyOf))
+	for _, wrapper := range schema.AnyOf {
+		branch := resolvedLeft(wrapper)
+		if branch == nil {
+			continue
+		}
+		bottom, err := collapseNormalizedCombinators(ctx, branch, nctx)
+		if err != nil {
+			return false, err
+		}
+		if bottom {
+			continue
+		}
+		if err := markNormalizedGraph(ctx, branch, nctx, make(map[*oas3.Schema]bool)); err != nil {
+			return false, err
+		}
+		branches = append(branches, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branch))
+	}
+	if len(branches) == 0 {
+		return true, nil
+	}
+	schema.AnyOf = branches
+	return false, nil
 }
 
 func normalizeSchemaChildren(ctx context.Context, schema *oas3.Schema) error {
@@ -558,10 +648,10 @@ func collapseNormalizedCombinators(ctx context.Context, schema *oas3.Schema, nct
 		return false, nil
 	}
 
-	commonType := getType(branches[0])
+	commonType := nctx.schemaType(branches[0])
 	allSameType := commonType != ""
 	for _, branch := range branches[1:] {
-		if getType(branch) != commonType {
+		if nctx.schemaType(branch) != commonType {
 			allSameType = false
 			break
 		}
@@ -575,7 +665,7 @@ func collapseNormalizedCombinators(ctx context.Context, schema *oas3.Schema, nct
 	flattened := true
 	for i := 1; i < len(branches); i++ {
 		var err error
-		merged, err = mergeSchemasMode(merged, branches[i], MergeDisjunctive)
+		merged, err = mergeSchemasModeWithSemantics(merged, branches[i], MergeDisjunctive, nctx.semantics)
 		if err != nil {
 			if !errors.Is(err, errCannotFlatten) {
 				nctx.debugf("normalization: disjunctive merge kept anyOf branches: %v", err)
@@ -787,6 +877,101 @@ func disjunctiveFacetsMergeable(s1, s2 *oas3.Schema) bool {
 	return true
 }
 
+type schemaFacetKind uint8
+
+const (
+	facetAbsent schemaFacetKind = iota
+	facetTrue
+	facetFalse
+	facetSchema
+	facetUnresolved
+)
+
+func classifySchemaFacet(wrapper *oas3.JSONSchema[oas3.Referenceable]) (schemaFacetKind, *oas3.Schema) {
+	if wrapper == nil {
+		return facetAbsent, nil
+	}
+	if value, ok := resolvedBooleanSchema(wrapper); ok {
+		if value {
+			return facetTrue, nil
+		}
+		return facetFalse, nil
+	}
+	if schema := resolvedLeft(wrapper); schema != nil {
+		return facetSchema, schema
+	}
+	return facetUnresolved, nil
+}
+
+func mergeSchemaFacets(a, b *oas3.JSONSchema[oas3.Referenceable], mode MergeMode, absentIsTrue bool, semantics SchemaSemantics, inProgress map[mergePair]bool) (*oas3.JSONSchema[oas3.Referenceable], error) {
+	ka, sa := classifySchemaFacet(a)
+	kb, sb := classifySchemaFacet(b)
+	if absentIsTrue {
+		if ka == facetAbsent {
+			ka = facetTrue
+		}
+		if kb == facetAbsent {
+			kb = facetTrue
+		}
+	}
+	// An unresolved reference could denote any schema. Treating it as true is
+	// the conservative choice for both union and intersection.
+	if ka == facetUnresolved {
+		ka = facetTrue
+	}
+	if kb == facetUnresolved {
+		kb = facetTrue
+	}
+
+	if mode == MergeDisjunctive {
+		switch {
+		case ka == facetTrue || kb == facetTrue:
+			return oas3.NewJSONSchemaFromBool(true), nil
+		case ka == facetFalse:
+			return cloneSchemaFacet(b, kb, sb), nil
+		case kb == facetFalse:
+			return cloneSchemaFacet(a, ka, sa), nil
+		}
+	} else {
+		switch {
+		case ka == facetFalse || kb == facetFalse:
+			return oas3.NewJSONSchemaFromBool(false), nil
+		case ka == facetTrue:
+			return cloneSchemaFacet(b, kb, sb), nil
+		case kb == facetTrue:
+			return cloneSchemaFacet(a, ka, sa), nil
+		}
+	}
+
+	if ka == facetAbsent {
+		return cloneSchemaFacet(b, kb, sb), nil
+	}
+	if kb == facetAbsent {
+		return cloneSchemaFacet(a, ka, sa), nil
+	}
+	merged, err := mergeSchemasModeGuarded(sa, sb, mode, semantics, inProgress)
+	if err != nil {
+		return nil, err
+	}
+	if merged == nil {
+		return oas3.NewJSONSchemaFromBool(false), nil
+	}
+	return oas3.NewJSONSchemaFromSchema[oas3.Referenceable](merged), nil
+}
+
+func cloneSchemaFacet(original *oas3.JSONSchema[oas3.Referenceable], kind schemaFacetKind, schema *oas3.Schema) *oas3.JSONSchema[oas3.Referenceable] {
+	switch kind {
+	case facetTrue, facetUnresolved:
+		return oas3.NewJSONSchemaFromBool(true)
+	case facetFalse:
+		return oas3.NewJSONSchemaFromBool(false)
+	case facetSchema:
+		return oas3.NewJSONSchemaFromSchema[oas3.Referenceable](cloneSchema(schema))
+	default:
+		return original
+	}
+}
+
 // mergeDisjunctiveValueFacets computes the union of the enum/const value
 // facets for a disjunctive (anyOf) merge and applies it to result:
 //   - both sides constrained (enum or const): union of the value sets;
@@ -833,7 +1018,11 @@ type mergePair struct {
 // mergeSchemasMode deep merges two schemas according to the specified mode.
 // Returns an error if the schemas have incompatible constraints.
 func mergeSchemasMode(s1, s2 *oas3.Schema, mode MergeMode) (*oas3.Schema, error) {
-	return mergeSchemasModeGuarded(s1, s2, mode, make(map[mergePair]bool))
+	return mergeSchemasModeWithSemantics(s1, s2, mode, SchemaSemanticsSpeakeasy)
+}
+
+func mergeSchemasModeWithSemantics(s1, s2 *oas3.Schema, mode MergeMode, semantics SchemaSemantics) (*oas3.Schema, error) {
+	return mergeSchemasModeGuarded(s1, s2, mode, semantics, make(map[mergePair]bool))
 }
 
 // mergeSchemasModeGuarded is mergeSchemasMode with a pair-keyed in-progress
@@ -845,7 +1034,7 @@ func mergeSchemasMode(s1, s2 *oas3.Schema, mode MergeMode) (*oas3.Schema, error)
 //     intersection, hence sound;
 //   - disjunctive (anyOf): an anyOf of both sides, representing the union
 //     without further merging.
-func mergeSchemasModeGuarded(s1, s2 *oas3.Schema, mode MergeMode, inProgress map[mergePair]bool) (*oas3.Schema, error) {
+func mergeSchemasModeGuarded(s1, s2 *oas3.Schema, mode MergeMode, semantics SchemaSemantics, inProgress map[mergePair]bool) (*oas3.Schema, error) {
 	// Handle nil cases
 	if s1 == nil && s2 == nil {
 		return nil, nil
@@ -948,35 +1137,65 @@ func mergeSchemasModeGuarded(s1, s2 *oas3.Schema, mode MergeMode, inProgress map
 	}
 
 	// Merge properties (union of keys, recursively merge overlapping)
-	if s2.Properties != nil && s2.Properties.Len() > 0 {
+	if (s1.Properties != nil && s1.Properties.Len() > 0) || (s2.Properties != nil && s2.Properties.Len() > 0) {
 		// COPY-ON-WRITE: cloneSchema is shallow, so result.Properties is the
 		// SAME map as s1.Properties. s1 may be a resolved component schema
 		// shared across the document; mutating it in place would corrupt the
 		// input and make results depend on merge order. Build a fresh map.
 		mergedProps := sequencedmap.New[string, *oas3.JSONSchema[oas3.Referenceable]]()
-		if result.Properties != nil {
-			for key, prop := range result.Properties.All() {
-				mergedProps.Set(key, prop)
+		keys := make([]string, 0)
+		seenKeys := make(map[string]bool)
+		collectKeys := func(properties *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]]) {
+			if properties == nil {
+				return
+			}
+			for key := range properties.All() {
+				if !seenKeys[key] {
+					seenKeys[key] = true
+					keys = append(keys, key)
+				}
 			}
 		}
+		collectKeys(s1.Properties)
+		collectKeys(s2.Properties)
 		result.Properties = mergedProps
 
-		for key, prop2 := range s2.Properties.All() {
-			if prop1, exists := result.Properties.Get(key); exists {
-				// Merge the two property schemas ($refs followed via resolvedLeft)
-				left1, left2 := resolvedLeft(prop1), resolvedLeft(prop2)
-				if left1 != nil && left2 != nil {
-					merged, err := mergeSchemasModeGuarded(left1, left2, mode, inProgress)
-					if err != nil {
-						return nil, fmt.Errorf("incompatible property %q: %w", key, err)
-					}
-					result.Properties.Set(key, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](merged))
-				} else if prop2 != nil {
-					result.Properties.Set(key, prop2)
+		mergeOneSided := func(declared *oas3.JSONSchema[oas3.Referenceable], other *oas3.Schema, key string) *oas3.JSONSchema[oas3.Referenceable] {
+			if mode == MergeConjunctive {
+				return declared
+			}
+			opts := SchemaExecOptions{Semantics: semantics}
+			parts := make([]*oas3.Schema, 0, 2)
+			if value, possible := schemaFacetValue(declared, opts); possible {
+				parts = append(parts, value)
+			}
+			if value, possible := objectUndeclaredValueForKey(other, key, opts); possible {
+				parts = append(parts, value)
+			}
+			value := Union(parts, opts)
+			if value == nil {
+				return oas3.NewJSONSchemaFromBool(false)
+			}
+			if isTopSchema(value) {
+				return oas3.NewJSONSchemaFromBool(true)
+			}
+			return oas3.NewJSONSchemaFromSchema[oas3.Referenceable](value)
+		}
+
+		for _, key := range keys {
+			prop1, exists1 := objectDeclaredProperty(s1, key)
+			prop2, exists2 := objectDeclaredProperty(s2, key)
+			switch {
+			case exists1 && exists2:
+				merged, err := mergeSchemaFacets(prop1, prop2, mode, false, semantics, inProgress)
+				if err != nil {
+					return nil, fmt.Errorf("incompatible property %q: %w", key, err)
 				}
-			} else {
-				// New property from s2
-				result.Properties.Set(key, prop2)
+				result.Properties.Set(key, merged)
+			case exists1:
+				result.Properties.Set(key, mergeOneSided(prop1, s2, key))
+			case exists2:
+				result.Properties.Set(key, mergeOneSided(prop2, s1, key))
 			}
 		}
 	}
@@ -1028,28 +1247,15 @@ func mergeSchemasModeGuarded(s1, s2 *oas3.Schema, mode MergeMode, inProgress map
 		}
 	}
 
-	// Merge array items ($refs followed via resolvedLeft)
-	items1, items2 := resolvedLeft(s1.Items), resolvedLeft(s2.Items)
-	switch {
-	case items1 != nil && items2 != nil:
-		merged, err := mergeSchemasModeGuarded(items1, items2, mode, inProgress)
-		if err != nil {
-			return nil, fmt.Errorf("incompatible array items: %w", err)
-		}
-		result.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](merged)
-	case items1 == nil && items2 != nil:
-		if mode == MergeDisjunctive {
-			// s1 admits items of any type; taking s2's items would narrow.
-			result.Items = nil
-		} else {
-			result.Items = s2.Items
-		}
-	case items1 != nil && items2 == nil:
-		if mode == MergeDisjunctive {
-			// s2 admits items of any type.
-			result.Items = nil
-		}
-		// conjunctive: keep s1's items (already cloned)
+	// An absent items facet is the boolean true schema in JSON Schema.
+	mergedItems, err := mergeSchemaFacets(s1.Items, s2.Items, mode, true, semantics, inProgress)
+	if err != nil {
+		return nil, fmt.Errorf("incompatible array items: %w", err)
+	}
+	if kind, _ := classifySchemaFacet(mergedItems); kind == facetTrue {
+		result.Items = nil
+	} else {
+		result.Items = mergedItems
 	}
 	// uniqueItems: disjunctive union of unique and non-unique is non-unique.
 	if mode == MergeDisjunctive {
@@ -1941,7 +2147,7 @@ func (env *schemaEnv) computeAllocRedirect(states []*execState, mergedAccum map[
 				redirect[id] = root
 				// Ensure we have an entry at the root and union siblings there
 				if rootArr, ok := mergedAccum[root]; ok && rootArr != mergedAccum[id] {
-					mergedAccum[root] = joinTwoSchemas(rootArr, mergedAccum[id])
+					mergedAccum[root] = joinTwoSchemas(rootArr, mergedAccum[id], env.opts)
 					env.logger.Debugf("DSU computeAllocRedirect: merged %s into root %s", id, root)
 				} else if _, ok := mergedAccum[root]; !ok {
 					mergedAccum[root] = mergedAccum[id]
@@ -2124,7 +2330,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 								case arr2 == nil:
 									merged = arr1
 								default:
-									merged = joinTwoSchemas(arr1, arr2)
+									merged = joinTwoSchemas(arr1, arr2, env.opts)
 								}
 								if merged != nil {
 									next.accum[root] = merged
@@ -4261,10 +4467,31 @@ func buildPathSchemaFromSegments(segments []PathSegment) *oas3.Schema {
 		return ArrayType(Bottom())
 	}
 
+	// An unknown-depth tail admits any number of further segments, so the
+	// path has no faithful tuple form. Emitting the known prefix as
+	// prefixItems would let setpath perform a strong write at the wrong
+	// depth; a homogeneous unknown-length key array routes every consumer to
+	// its conservative dynamic-path handling instead.
+	for _, seg := range segments {
+		if _, ok := seg.Key.(PathUnknownSubtree); ok {
+			result := ArrayType(Union([]*oas3.Schema{StringType(), IntegerType()}, SchemaExecOptions{}))
+			if known := int64(len(segments) - 1); known > 0 {
+				result.MinItems = &known
+			}
+			return result
+		}
+	}
+
 	prefixItems := make([]*oas3.Schema, len(segments))
 	for i, seg := range segments {
 		if _, ok := seg.Key.(PathAllElements); ok {
 			prefixItems[i] = allElementsPathSchema()
+		} else if _, ok := seg.Key.(PathUnknownStringKey); ok {
+			// Unknown single object key from a state join: non-const string.
+			prefixItems[i] = StringType()
+		} else if _, ok := seg.Key.(PathUnknownKey); ok {
+			// Unknown single key or index from a state join.
+			prefixItems[i] = Union([]*oas3.Schema{StringType(), IntegerType()}, SchemaExecOptions{})
 		} else if seg.IsSymbolic {
 			// Wildcard: represent as integer type (any index)
 			prefixItems[i] = IntegerType()
@@ -4715,6 +4942,9 @@ func (env *schemaEnv) mergeFrontierByPC(in []*execState) []*execState {
 		// At hot merge points, we relax scope-key matching to allow more aggressive merging
 		relaxScopeKeys := env.codes[pc].op != opIter || len(group) >= 8
 		partitions := partitionByShape(group, relaxScopeKeys)
+		if env.codes[pc].op == opJumpIfNot || pc+1 < len(env.codes) && env.codes[pc+1].op == opJumpIfNot {
+			partitions = partitionByConstantBoolean(partitions)
+		}
 
 		for _, partition := range partitions {
 			if len(partition) == 1 {
@@ -4767,6 +4997,17 @@ func (env *schemaEnv) mergeFrontierByPC(in []*execState) []*execState {
 // subsumesState checks if state 'dom' subsumes state 'sub' (dom ⊒ sub).
 // This means dom's abstract values are at least as general as sub's.
 func subsumesState(dom, sub *execState) bool {
+	// Subsumption discards sub entirely, so dom must cover more than sub's
+	// abstract values: a state's collected write path and its pending update
+	// controls are obligations, not values. Discarding a state that collected
+	// a different path deletes that write; discarding one with different
+	// pending controls starves its eager fork alternatives of updates.
+	if dom.pathMode != sub.pathMode || !reflect.DeepEqual(dom.currentPath, sub.currentPath) {
+		return false
+	}
+	if !equalForkUpdates(dom.forkUpdates, sub.forkUpdates) {
+		return false
+	}
 	if dom.pc != sub.pc {
 		return false
 	}
@@ -4869,6 +5110,32 @@ func accumMapsEqualByIdentity(m1, m2 map[string]*oas3.Schema) bool {
 	return true
 }
 
+// unionForkUpdates merges the pending update controls of two joined states so
+// writes that happen after the merge reach the eager alternatives of both.
+func unionForkUpdates(a, b []*forkControl) []*forkControl {
+	if len(b) == 0 {
+		return a
+	}
+	if len(a) == 0 {
+		return b
+	}
+	seen := make(map[*forkControl]struct{}, len(a)+len(b))
+	out := make([]*forkControl, 0, len(a)+len(b))
+	for _, controls := range [2][]*forkControl{a, b} {
+		for _, control := range controls {
+			if control == nil {
+				continue
+			}
+			if _, ok := seen[control]; ok {
+				continue
+			}
+			seen[control] = struct{}{}
+			out = append(out, control)
+		}
+	}
+	return out
+}
+
 // joinState merges two states using lattice join (LUB).
 // When scope keys differ, union them and treat missing keys as if they were present
 // with the value from the other state (join with implicit "undefined" = keep existing).
@@ -4928,20 +5195,21 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 						bCard = b.allocCardinality[k]
 					}
 
-					// Determine if either is definitely non-empty (MinItems >= 1)
-					aNonEmpty := aCard != nil && aCard.MinItems != nil && *aCard.MinItems >= 1
-					bNonEmpty := bCard != nil && bCard.MinItems != nil && *bCard.MinItems >= 1
+					// Skipping a side's items is only sound when that side is
+					// PROVABLY empty (maxItems==0): a merely maybe-empty side
+					// can still contribute element values at runtime.
+					aDefEmpty := (aCard != nil && aCard.MaxItems != nil && *aCard.MaxItems == 0) ||
+						(existing.MaxItems != nil && *existing.MaxItems == 0)
+					bDefEmpty := (bCard != nil && bCard.MaxItems != nil && *bCard.MaxItems == 0) ||
+						(v.MaxItems != nil && *v.MaxItems == 0)
 
-					// If one is non-empty and other is empty, prefer the non-empty one's items
 					var unionedItems *oas3.Schema
-					if aNonEmpty && !bNonEmpty && existingItems != Bottom() {
-						// Prefer 'a' (existing) items since it's non-empty
+					switch {
+					case bDefEmpty && !aDefEmpty:
 						unionedItems = existingItems
-					} else if bNonEmpty && !aNonEmpty && vItems != Bottom() {
-						// Prefer 'b' (v) items since it's non-empty
+					case aDefEmpty && !bDefEmpty:
 						unionedItems = vItems
-					} else {
-						// Both non-empty or both maybe-empty - union them
+					default:
 						unionedItems = Union([]*oas3.Schema{existingItems, vItems}, SchemaExecOptions{})
 					}
 
@@ -5003,7 +5271,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			}
 		}
 
-		mergedForks := joinForkContinuations(a.forks, b.forks)
+		mergedForks := joinForkContinuations(a.forks, b.forks, opts)
 		merged := &execState{
 			pc:            a.pc,
 			stack:         make([]SValue, len(a.stack)),
@@ -5015,7 +5283,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			foreachLoops:  joinForeachLoops(a.foreachLoops, b.foreachLoops, opts),
 			tryDepth:      a.tryDepth,
 			pathMode:      a.pathMode,
-			currentPath:   a.currentPath,
+			currentPath:   joinCurrentPaths(a.currentPath, b.currentPath),
 			pathEvalBases: append([]int(nil), a.pathEvalBases...),
 			depthWidenBlocked: a.depthWidenBlocked || b.depthWidenBlocked ||
 				!equalArrayGeneratorContexts(a.forks, b.forks),
@@ -5030,6 +5298,9 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			allocOrigin:      a.allocOrigin,     // SHARED (use from either)
 			allocCardinality: mergedCardinality, // Merged with lattice join
 			dsu:              a.dsu,             // SHARED (use from either)
+			// Post-merge writes must reach the eager alternatives of both
+			// joined states.
+			forkUpdates: unionForkUpdates(a.forkUpdates, b.forkUpdates),
 		}
 
 		// Merge var history and intent
@@ -5087,7 +5358,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 
 		// Join stack values
 		for i := range a.stack {
-			merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i])
+			merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i], opts)
 		}
 
 		// Join scopes
@@ -5127,7 +5398,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 						if aTagged && bTagged {
 							oa := a.allocOrigin[aAlloc]
 							ob := b.allocOrigin[bAlloc]
-							if oa != nil && ob != nil && oa.PC == ob.PC && oa.Context == ob.Context {
+							if sameOrigin(oa, ob) {
 								// Same origin => union classes
 								opts.debugf("DSU joinState(diff-accum): var=%s union %s with %s (same origin PC=%d, ctx=%s)",
 									k, aAlloc, bAlloc, oa.PC, oa.Context)
@@ -5135,7 +5406,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 								root := a.dsu.Find(aAlloc)
 
 								// Merge canonical arrays and bind canonical to merged scope
-								joined := joinTwoSchemas(aVal, bVal)
+								joined := joinTwoSchemas(aVal, bVal, opts)
 								if joined != nil {
 									merged.accum[root] = joined
 									merged.schemaToAlloc[joined] = root
@@ -5265,7 +5536,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 						}
 
 						// Case 3: Join arrays and tag the result
-						joined := joinTwoSchemas(aVal, bVal)
+						joined := joinTwoSchemas(aVal, bVal, opts)
 						if getType(joined) == "array" {
 							if _, tagged := merged.schemaToAlloc[joined]; !tagged {
 								*merged.allocCounter++
@@ -5327,7 +5598,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 					}
 
 					// Non-array or only one side array: default join
-					mergedScope[k] = joinTwoSchemas(aVal, bVal)
+					mergedScope[k] = joinTwoSchemas(aVal, bVal, opts)
 				} else if aHas {
 					mergedScope[k] = aVal
 				} else {
@@ -5342,7 +5613,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 	}
 
 	// States have same accum map - normal join
-	mergedForks := joinForkContinuations(a.forks, b.forks)
+	mergedForks := joinForkContinuations(a.forks, b.forks, opts)
 	merged := &execState{
 		pc:            a.pc,
 		stack:         make([]SValue, len(a.stack)),
@@ -5354,7 +5625,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 		foreachLoops:  joinForeachLoops(a.foreachLoops, b.foreachLoops, opts),
 		tryDepth:      a.tryDepth,
 		pathMode:      a.pathMode,
-		currentPath:   a.currentPath,
+		currentPath:   joinCurrentPaths(a.currentPath, b.currentPath),
 		pathEvalBases: append([]int(nil), a.pathEvalBases...),
 		depthWidenBlocked: a.depthWidenBlocked || b.depthWidenBlocked ||
 			!equalArrayGeneratorContexts(a.forks, b.forks),
@@ -5369,6 +5640,9 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 		allocOrigin:      a.allocOrigin,
 		allocCardinality: a.allocCardinality,
 		dsu:              a.dsu,
+		// Post-merge writes must reach the eager alternatives of both
+		// joined states.
+		forkUpdates: unionForkUpdates(a.forkUpdates, b.forkUpdates),
 	}
 
 	// Merge var history and intent (same-accum branch)
@@ -5454,7 +5728,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 						opts.debugf("joinState: preserving canonical ptr for allocID=%s (stack pos %d), canonical NOT TAGGED! Re-tagging now.", aAlloc, i)
 						merged.schemaToAlloc[canonical] = aAlloc
 					}
-					merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i])
+					merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i], opts)
 					merged.stack[i].Schema = canonical
 					continue
 				}
@@ -5462,7 +5736,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 		}
 
 		// Default: join via union
-		merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i])
+		merged.stack[i] = joinedStackValue(a.stack[i], b.stack[i], opts)
 	}
 
 	// Join scopes (union keys, join shared values)
@@ -5503,7 +5777,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 					if aTagged && bTagged {
 						oa := a.allocOrigin[aAlloc]
 						ob := b.allocOrigin[bAlloc]
-						if oa != nil && ob != nil && oa.PC == ob.PC && oa.Context == ob.Context {
+						if sameOrigin(oa, ob) {
 							// Same origin => union classes
 							opts.debugf("DSU joinState(same-accum): var=%s union %s with %s (same origin PC=%d, ctx=%s)",
 								k, aAlloc, bAlloc, oa.PC, oa.Context)
@@ -5511,7 +5785,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 							root := a.dsu.Find(aAlloc)
 
 							// Merge canonical arrays and bind canonical to merged scope
-							joined := joinTwoSchemas(aVal, bVal)
+							joined := joinTwoSchemas(aVal, bVal, opts)
 							if joined != nil {
 								merged.accum[root] = joined
 								merged.schemaToAlloc[joined] = root
@@ -5632,7 +5906,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 					}
 
 					// Case 3: Join arrays and tag the result
-					joined := joinTwoSchemas(aVal, bVal)
+					joined := joinTwoSchemas(aVal, bVal, opts)
 					if getType(joined) == "array" {
 						if _, tagged := merged.schemaToAlloc[joined]; !tagged {
 							*merged.allocCounter++
@@ -5688,7 +5962,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 				}
 
 				// Non-array or only one side array: default join
-				mergedScope[k] = joinTwoSchemas(aVal, bVal)
+				mergedScope[k] = joinTwoSchemas(aVal, bVal, opts)
 			} else if aHas {
 				// Only a has it: keep a's value
 				mergedScope[k] = aVal
@@ -5721,12 +5995,12 @@ func joinForeachLoops(a, b map[foreachLoopKey]foreachLoopState, opts SchemaExecO
 		loop.previous = Union([]*oas3.Schema{left.previous, right.previous}, opts)
 		loop.round = maxInt(left.round, right.round)
 		loop.continuation = cloneForkContinuation(left.continuation)
-		loop.forks = joinForkContinuations(left.forks, right.forks)
+		loop.forks = joinForkContinuations(left.forks, right.forks, opts)
 		loop.labels = joinLabelContinuations(left.labels, right.labels, loop.forks.len())
 		loop.forkUpdates = append([]*forkControl(nil), left.forkUpdates...)
 		for index := range loop.continuation.stack {
 			loop.continuation.stack[index] = joinedStackValue(
-				left.continuation.stack[index], right.continuation.stack[index])
+				left.continuation.stack[index], right.continuation.stack[index], opts)
 			loop.continuation.stack[index].Schema = Union([]*oas3.Schema{
 				left.continuation.stack[index].Schema,
 				right.continuation.stack[index].Schema,
@@ -5749,14 +6023,14 @@ func joinForeachLoops(a, b map[foreachLoopKey]foreachLoopState, opts SchemaExecO
 }
 
 // joinTwoSchemas performs schema-level join (LUB) using Union.
-func joinTwoSchemas(a, b *oas3.Schema) *oas3.Schema {
+func joinTwoSchemas(a, b *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 	// CRITICAL FIX: If pointers are identical, return immediately to preserve pointer identity
 	// This prevents unnecessary cloning and preserves tags in schemaToAlloc
 	if a == b {
 		return a
 	}
 
-	return Union([]*oas3.Schema{a, b}, SchemaExecOptions{})
+	return Union([]*oas3.Schema{a, b}, opts)
 }
 
 // partitionByShape groups states with compatible layouts.
@@ -5794,6 +6068,36 @@ func partitionByShape(states []*execState, relaxScopeKeys bool) [][]*execState {
 	return result
 }
 
+func partitionByConstantBoolean(partitions [][]*execState) [][]*execState {
+	result := make([][]*execState, 0, len(partitions))
+	for _, partition := range partitions {
+		var buckets [3][]*execState
+		var seen [3]bool
+		order := make([]int, 0, len(buckets))
+		for _, state := range partition {
+			bucket := 0
+			if value, ok := extractConstValue(state.top()); ok {
+				if boolean, ok := value.(bool); ok {
+					if boolean {
+						bucket = 2
+					} else {
+						bucket = 1
+					}
+				}
+			}
+			if !seen[bucket] {
+				seen[bucket] = true
+				order = append(order, bucket)
+			}
+			buckets[bucket] = append(buckets[bucket], state)
+		}
+		for _, bucket := range order {
+			result = append(result, buckets[bucket])
+		}
+	}
+	return result
+}
+
 // compatibleStateShapes verifies the hashed persistent-stack components used
 // by shapeKey. Pointer equality makes the common shared case O(1); the exact
 // fallback prevents hash collisions from merging incompatible control states.
@@ -5818,6 +6122,14 @@ func compatibleStateShapes(a, b *execState, relaxScopeKeys bool) bool {
 		}
 	}
 	if !reflect.DeepEqual(a.pathEvalBases, b.pathEvalBases) {
+		return false
+	}
+	// Merged states must agree on path-collection mode: joinState joins the
+	// collected paths themselves (segmentwise weak symbolic segments, with an
+	// unknown-depth tail for cross-depth joins), so differing path contents
+	// are mergeable — and must stay mergeable, because path enumeration over
+	// recursive inputs relies on these joins for termination.
+	if a.pathMode != b.pathMode {
 		return false
 	}
 	labelForkDepth := 0

@@ -182,6 +182,93 @@ type PathWildcard struct{}
 // PathAllElements represents every array index selected by .[] in path mode.
 type PathAllElements struct{}
 
+// PathUnknownStringKey represents an unknown single object key, produced when
+// joining states whose collected paths name different keys. Writes through it
+// must be weak (union with the previous member schemas), never strong.
+type PathUnknownStringKey struct{}
+
+// PathUnknownKey represents an unknown single key or index (string or int).
+type PathUnknownKey struct{}
+
+// PathUnknownSubtree represents a path tail of unknown depth (zero or more
+// further segments), produced when joining collected paths of different
+// lengths. Any write through it must widen conservatively at every depth.
+type PathUnknownSubtree struct{}
+
+// joinPathSegment computes the lattice join of two collected path segments.
+// Equal segments join to themselves; differing segments widen to a weak
+// unknown-single-location segment. The join deliberately never produces
+// PathAllElements: all-elements segments authorize strong updates of every
+// member, which would be unsound for a write that took only one of the two
+// joined paths.
+func joinPathSegment(a, b PathSegment) PathSegment {
+	if a == b {
+		return a
+	}
+	// Unknown-depth tails absorb any segment they join with.
+	if _, ok := a.Key.(PathUnknownSubtree); ok {
+		return a
+	}
+	if _, ok := b.Key.(PathUnknownSubtree); ok {
+		return b
+	}
+	intLike := func(seg PathSegment) bool {
+		switch seg.Key.(type) {
+		case int, PathWildcard:
+			return true
+		}
+		return false
+	}
+	stringLike := func(seg PathSegment) bool {
+		switch seg.Key.(type) {
+		case string, PathUnknownStringKey:
+			return true
+		}
+		return false
+	}
+	switch {
+	case intLike(a) && intLike(b):
+		return PathSegment{Key: PathWildcard{}, IsSymbolic: true}
+	case stringLike(a) && stringLike(b):
+		return PathSegment{Key: PathUnknownStringKey{}, IsSymbolic: true}
+	default:
+		return PathSegment{Key: PathUnknownKey{}, IsSymbolic: true}
+	}
+}
+
+// joinCurrentPaths joins the collected write paths of two states being
+// merged. Equal-length paths join segmentwise into weak symbolic segments;
+// different-length paths keep their joined common prefix and widen the
+// divergent tails into a single unknown-depth marker. Recursive inputs make
+// path enumeration (tostream, ..) rely on cross-depth merging for
+// termination, so refusing these joins is not an option.
+func joinCurrentPaths(a, b []PathSegment) []PathSegment {
+	short, long := a, b
+	if len(short) > len(long) {
+		short, long = long, short
+	}
+	joined := a
+	copied := len(a) != len(b)
+	if copied {
+		joined = append([]PathSegment(nil), short...)
+	}
+	for i := range short {
+		seg := joinPathSegment(short[i], long[i])
+		if seg == joined[i] {
+			continue
+		}
+		if !copied {
+			joined = append([]PathSegment(nil), a...)
+			copied = true
+		}
+		joined[i] = seg
+	}
+	if len(a) != len(b) {
+		joined = append(joined, PathSegment{Key: PathUnknownSubtree{}, IsSymbolic: true})
+	}
+	return joined
+}
+
 // forkContinuation is an immutable snapshot restored when control backtracks
 // through an opFork. Cloned execution states share these values; code that
 // refines or joins a continuation must construct a replacement value.
@@ -777,7 +864,7 @@ func cloneForkContinuation(fork forkContinuation) forkContinuation {
 	return cloned
 }
 
-func joinForkContinuations(a, b forkContinuations) forkContinuations {
+func joinForkContinuations(a, b forkContinuations, opts SchemaExecOptions) forkContinuations {
 	aValues, bValues := a.values(), b.values()
 	limit := min(len(aValues), len(bValues))
 	joined := make([]forkContinuation, 0, limit)
@@ -792,7 +879,7 @@ func joinForkContinuations(a, b forkContinuations) forkContinuations {
 		fork.depth = maxInt(fork.depth, bValues[i].depth)
 		fork.loopRound = maxInt(fork.loopRound, bValues[i].loopRound)
 		for j := range fork.stack {
-			fork.stack[j].Schema = joinTwoSchemas(fork.stack[j].Schema, bValues[i].stack[j].Schema)
+			fork.stack[j].Schema = joinTwoSchemas(fork.stack[j].Schema, bValues[i].stack[j].Schema, opts)
 			if !sameValueProvenance(fork.stack[j], bValues[i].stack[j]) {
 				fork.stack[j].origin = nil
 				fork.stack[j].rootVar = ""
@@ -802,7 +889,7 @@ func joinForkContinuations(a, b forkContinuations) forkContinuations {
 		for j := range fork.scopes {
 			for key, bValue := range bValues[i].scopes[j] {
 				if aValue, ok := fork.scopes[j][key]; ok {
-					fork.scopes[j][key] = joinTwoSchemas(aValue, bValue)
+					fork.scopes[j][key] = joinTwoSchemas(aValue, bValue, opts)
 				} else {
 					fork.scopes[j][key] = bValue
 				}

@@ -980,10 +980,8 @@ func TestFourBranchConcat(t *testing.T) {
 	if valueProp == nil || valueProp.Left == nil {
 		t.Fatal("Configs entry object missing 'value' property schema")
 	}
-	valueType := getType(valueProp.Left)
-
-	if valueType != "string" {
-		t.Errorf("❌ BUG: configs items value type is '%s', expected 'string'", valueType)
+	if getType(valueProp.Left) != "string" {
+		t.Errorf("❌ BUG: configs items value type is '%s', expected 'string'", getType(valueProp.Left))
 		t.FailNow()
 	}
 

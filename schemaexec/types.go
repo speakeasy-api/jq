@@ -65,7 +65,7 @@ type SchemaExecOptions struct {
 	// Behavior flags
 	StrictMode     bool // If true, fail on unsupported ops; if false, widen to Top (default: false)
 	EnableWarnings bool // If true, collect precision-loss warnings (default: true)
-	EnableMemo     bool // If true, enable memoization for performance (default: true)
+	EnableMemo     bool // Reserved for state memoization; currently unused (default: true)
 
 	// Widening level controls how aggressively we simplify schemas
 	// 0 = none (keep all precision)

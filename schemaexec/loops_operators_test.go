@@ -486,8 +486,11 @@ func TestTypedRecursiveLoopsTerminateAtAbstractFixpoint(t *testing.T) {
 			analysis := analyzeExpr(t, test.expression, input)
 			elapsed := time.Since(started)
 			t.Logf("analysis completed in %s", elapsed)
-			if elapsed > 50*time.Millisecond {
-				t.Fatalf("analysis took %s, want <50ms", elapsed)
+			// Runaway guard, not an SLO: steady-state is ~5ms, but 55ms p100
+			// noise spikes were observed even locally, so 250ms stays noise-safe
+			// while still tripping on non-convergence (which runs seconds+).
+			if elapsed > 250*time.Millisecond {
+				t.Fatalf("analysis took %s, want <250ms", elapsed)
 			}
 			if analysis.Verdict == VerdictProvenBroken || !mightBeType(analysis.Output, oas3.SchemaType(test.wantType)) {
 				t.Fatalf("verdict=%s output=%s causes=%v", analysis.Verdict, schemaTypeSummary(analysis.Output, 4), analysis.Causes)
