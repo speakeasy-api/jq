@@ -1247,21 +1247,30 @@ func objectUnionNeedsBranches(schema *oas3.Schema) bool {
 		(schema.DependentSchemas != nil && schema.DependentSchemas.Len() > 0) ||
 		schema.PropertyNames != nil || schema.UnevaluatedProperties != nil || schema.UnevaluatedItems != nil ||
 		schema.MinProperties != nil || schema.MaxProperties != nil ||
-		schema.Not != nil || schema.If != nil || schema.Then != nil || schema.Else != nil
+		schema.Not != nil || schema.If != nil || schema.Then != nil || schema.Else != nil ||
+		schema.Const != nil || len(schema.Enum) > 0 ||
+		len(schema.AllOf) > 0 || len(schema.AnyOf) > 0 || len(schema.OneOf) > 0
 }
 
-func schemaFacetValue(wrapper *oas3.JSONSchema[oas3.Referenceable], opts SchemaExecOptions) (*oas3.Schema, bool) {
+func schemaFacetValue(wrapper *oas3.JSONSchema[oas3.Referenceable], _ SchemaExecOptions) (*oas3.Schema, bool) {
 	if wrapper == nil {
 		return nil, false
 	}
-	value, ok := derefJSONSchema(collapseContextForOptions(opts), wrapper)
-	if !ok {
-		return Top(), true
-	}
-	if value == nil {
+	if value, ok := resolvedBooleanSchema(wrapper); ok {
+		if value {
+			return Top(), true
+		}
 		return nil, false
 	}
-	return value, true
+	// Executor-owned schemas use pointer identity to track array allocations.
+	// Normalizing an ordinary facet here would clone it and sever that identity.
+	// Combinators remain valid constraints when carried through their callers,
+	// so only resolve the wrapper and preserve the schema pointer itself.
+	left := resolvedLeft(wrapper)
+	if left == nil || left.IsReference() {
+		return Top(), true
+	}
+	return left, true
 }
 
 // deduplicateSchemas removes duplicate schemas from a list.
@@ -3106,6 +3115,34 @@ func refineForkVarRefs(st *execState, key string, old, nw *oas3.Schema) {
 	if st == nil || key == "" || old == nil || nw == nil || old == nw {
 		return
 	}
+	// Lazy rebase across state joins: pending eager fork alternatives resolve
+	// variable updates through pointer-keyed replacement chains, and a state
+	// join replaces the chain's endpoint with a fresh joined pointer. A write
+	// recorded only against the joined pointer would never reach a chain (or
+	// fork snapshot) that still ends at a pre-join pointer, silently dropping
+	// the update for that alternative. Deliver the write against the joined
+	// pointer AND, transitively, every source pointer the join replaced;
+	// replacements apply on exact key+pointer matches, so extra deliveries
+	// are no-ops wherever the source pointer is not referenced.
+	targets := []*oas3.Schema{old}
+	if len(st.joinedValueSources) > 0 {
+		seen := map[*oas3.Schema]bool{old: true}
+		for i := 0; i < len(targets); i++ {
+			for _, source := range st.joinedValueSources[targets[i]] {
+				if source == nil || seen[source] || source == nw {
+					continue
+				}
+				seen[source] = true
+				targets = append(targets, source)
+			}
+		}
+	}
+	for _, target := range targets {
+		refineForkVarRefsOne(st, key, target, nw)
+	}
+}
+
+func refineForkVarRefsOne(st *execState, key string, old, nw *oas3.Schema) {
 	for i := range st.stack {
 		if st.stack[i].rootVar == key && st.stack[i].Schema == old {
 			st.stack[i].Schema = nw

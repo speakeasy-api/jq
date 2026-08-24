@@ -412,6 +412,17 @@ func normalizeSchema(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, er
 	if err := normalizeSchemaChildren(ctx, result); err != nil {
 		return nil, err
 	}
+	if expandSchemaTypeArray(result) {
+		bottom, err := normalizeExpandedTypeBranches(ctx, result, nctx)
+		if err != nil {
+			return nil, err
+		}
+		if bottom {
+			nctx.memo[schema] = nil
+			return nil, nil
+		}
+		return result, nil
+	}
 	bottom, err := collapseNormalizedCombinators(ctx, result, nctx)
 	if err != nil {
 		return nil, err
@@ -421,6 +432,69 @@ func normalizeSchema(ctx context.Context, schema *oas3.Schema) (*oas3.Schema, er
 		return nil, nil
 	}
 	return result, nil
+}
+
+// expandSchemaTypeArray represents a JSON Schema type union using the same
+// disjunctive shape the executor already distributes over. Each branch keeps
+// the original facets: JSON Schema keywords only constrain instances of the
+// types to which they apply, so retaining (for example) items on the null
+// branch is semantically neutral while preserving it on the array branch.
+func expandSchemaTypeArray(schema *oas3.Schema) bool {
+	types := append([]oas3.SchemaType(nil), schema.GetType()...)
+	if len(types) <= 1 {
+		return false
+	}
+	sort.Slice(types, func(i, j int) bool { return types[i] < types[j] })
+	unique := types[:0]
+	for _, typ := range types {
+		if len(unique) == 0 || unique[len(unique)-1] != typ {
+			unique = append(unique, typ)
+		}
+	}
+	if len(unique) == 1 {
+		schema.Type = oas3.NewTypeFromString(unique[0])
+		return false
+	}
+
+	base := cloneSchema(schema)
+	branches := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(unique))
+	for _, typ := range unique {
+		branch := cloneSchema(base)
+		branch.Type = oas3.NewTypeFromString(typ)
+		branches = append(branches, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branch))
+	}
+	*schema = oas3.Schema{AnyOf: branches}
+	return true
+}
+
+// normalizeExpandedTypeBranches collapses the original schema's combinators
+// inside each single-type branch. The generated outer anyOf intentionally
+// remains intact: flattening it through primary-type helpers would turn mixed
+// types back into an unknown type and could drop a listed alternative.
+func normalizeExpandedTypeBranches(ctx context.Context, schema *oas3.Schema, nctx *normCtx) (bool, error) {
+	branches := make([]*oas3.JSONSchema[oas3.Referenceable], 0, len(schema.AnyOf))
+	for _, wrapper := range schema.AnyOf {
+		branch := resolvedLeft(wrapper)
+		if branch == nil {
+			continue
+		}
+		bottom, err := collapseNormalizedCombinators(ctx, branch, nctx)
+		if err != nil {
+			return false, err
+		}
+		if bottom {
+			continue
+		}
+		if err := markNormalizedGraph(ctx, branch, nctx, make(map[*oas3.Schema]bool)); err != nil {
+			return false, err
+		}
+		branches = append(branches, oas3.NewJSONSchemaFromSchema[oas3.Referenceable](branch))
+	}
+	if len(branches) == 0 {
+		return true, nil
+	}
+	schema.AnyOf = branches
+	return false, nil
 }
 
 func normalizeSchemaChildren(ctx context.Context, schema *oas3.Schema) error {
@@ -2351,9 +2425,9 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			if env.strict {
 				return nil, fmt.Errorf("strict mode: variable %s not found at pc=%d (state=%d)", key, state.pc, next.id)
 			}
-			env.addWarning("variable %s not found (scopeDepth=%d, state=%d, pc=%d) - discarding unreachable state",
+			next.push(Top())
+			env.addWarning("variable %s not found (scopeDepth=%d, state=%d, pc=%d) - pushing Top()",
 				key, len(next.scopes), next.id, next.pc)
-			return nil, nil
 		}
 		return []*execState{next}, nil
 
@@ -3429,9 +3503,6 @@ func (env *schemaEnv) execBacktrack(state *execState) ([]*execState, error) {
 	joined := Union([]*oas3.Schema{previous, current}, env.opts)
 	stable := schemaSubsumes(previous, current) || schemaFingerprint(joined) == schemaFingerprint(previous)
 	round := loop.fork.loopRound + 1
-	if loop.accumulator == "[12 4]" {
-		fmt.Printf("REDUCE round=%d stable=%v prev=%s current=%s joined=%s\n  prevfp=%s\n  currfp=%s\n  joinfp=%s\n", round, stable, schemaTypeSummary(previous, 4), schemaTypeSummary(current, 4), schemaTypeSummary(joined, 4), schemaFingerprint(previous), schemaFingerprint(current), schemaFingerprint(joined))
-	}
 	env.logger.Debugf("backtrack loop: accumulator=%s round=%d previous=%s current=%s joined=%s stable=%v",
 		loop.accumulator, round, schemaTypeSummary(previous, 2), schemaTypeSummary(current, 2),
 		schemaTypeSummary(joined, 2), stable)
@@ -4396,10 +4467,31 @@ func buildPathSchemaFromSegments(segments []PathSegment) *oas3.Schema {
 		return ArrayType(Bottom())
 	}
 
+	// An unknown-depth tail admits any number of further segments, so the
+	// path has no faithful tuple form. Emitting the known prefix as
+	// prefixItems would let setpath perform a strong write at the wrong
+	// depth; a homogeneous unknown-length key array routes every consumer to
+	// its conservative dynamic-path handling instead.
+	for _, seg := range segments {
+		if _, ok := seg.Key.(PathUnknownSubtree); ok {
+			result := ArrayType(Union([]*oas3.Schema{StringType(), IntegerType()}, SchemaExecOptions{}))
+			if known := int64(len(segments) - 1); known > 0 {
+				result.MinItems = &known
+			}
+			return result
+		}
+	}
+
 	prefixItems := make([]*oas3.Schema, len(segments))
 	for i, seg := range segments {
 		if _, ok := seg.Key.(PathAllElements); ok {
 			prefixItems[i] = allElementsPathSchema()
+		} else if _, ok := seg.Key.(PathUnknownStringKey); ok {
+			// Unknown single object key from a state join: non-const string.
+			prefixItems[i] = StringType()
+		} else if _, ok := seg.Key.(PathUnknownKey); ok {
+			// Unknown single key or index from a state join.
+			prefixItems[i] = Union([]*oas3.Schema{StringType(), IntegerType()}, SchemaExecOptions{})
 		} else if seg.IsSymbolic {
 			// Wildcard: represent as integer type (any index)
 			prefixItems[i] = IntegerType()
@@ -4840,30 +4932,6 @@ func (env *schemaEnv) mergeFrontierByPC(in []*execState) []*execState {
 	out := make([]*execState, 0, len(in))
 	for _, pc := range pcs {
 		group := byPC[pc]
-		if (pc == 413 || pc == 419 || pc == 427 || pc == 442) && len(group) > 0 {
-			fmt.Printf("PIPE pc=%d op=%s size=%d\n", pc, env.codes[pc].opName, len(group))
-			for _, candidate := range group {
-				top := candidate.top()
-				ap := resolvedLeft(top.AdditionalProperties)
-				fmt.Printf("  id=%d top=%s ap=%s entry=%s depth=%d\n", candidate.id, schemaTypeSummary(top, 3), schemaTypeSummary(ap, 3), traceEntryValueType(top), candidate.depth)
-			}
-		}
-		for _, candidate := range group {
-			configs, _ := candidate.loadVar("[1 15]")
-			if traceEntryValueType(configs) == "top" {
-				fmt.Printf("TOP-CONFIG pc=%d op=%s size=%d depth=%d top=%s\n", pc, env.codes[pc].opName, len(group), candidate.depth, schemaTypeSummary(candidate.top(), 2))
-				break
-			}
-		}
-		if pc == 493 && len(group) > 1 {
-			fmt.Printf("JOIN pc=493 size=%d\n", len(group))
-			for _, candidate := range group {
-				configs, _ := candidate.loadVar("[1 15]")
-				local, _ := candidate.loadVar("[1 6]")
-				remote, _ := candidate.loadVar("[1 8]")
-				fmt.Printf("  id=%d configs=%s local=%s remote=%s top=%s depth=%d forks=%d\n", candidate.id, traceEntryValueType(configs), schemaTypeSummary(local, 2), schemaTypeSummary(remote, 2), schemaTypeSummary(candidate.top(), 2), candidate.depth, candidate.forks.len())
-			}
-		}
 		// Only merge at hot PCs (opIter or high fan-in)
 		if !env.shouldMergeAtPC(pc, len(group)) {
 			out = append(out, group...)
@@ -4929,6 +4997,17 @@ func (env *schemaEnv) mergeFrontierByPC(in []*execState) []*execState {
 // subsumesState checks if state 'dom' subsumes state 'sub' (dom ⊒ sub).
 // This means dom's abstract values are at least as general as sub's.
 func subsumesState(dom, sub *execState) bool {
+	// Subsumption discards sub entirely, so dom must cover more than sub's
+	// abstract values: a state's collected write path and its pending update
+	// controls are obligations, not values. Discarding a state that collected
+	// a different path deletes that write; discarding one with different
+	// pending controls starves its eager fork alternatives of updates.
+	if dom.pathMode != sub.pathMode || !reflect.DeepEqual(dom.currentPath, sub.currentPath) {
+		return false
+	}
+	if !equalForkUpdates(dom.forkUpdates, sub.forkUpdates) {
+		return false
+	}
 	if dom.pc != sub.pc {
 		return false
 	}
@@ -5031,188 +5110,64 @@ func accumMapsEqualByIdentity(m1, m2 map[string]*oas3.Schema) bool {
 	return true
 }
 
-func traceEntryValueType(schema *oas3.Schema) string {
-	if schema == nil {
-		return "nil"
+// recordJoinedValueSources builds the merged state's join-provenance map:
+// every scope value the join replaced with a fresh joined pointer is recorded
+// as a source of that pointer, so a later write against the joined pointer
+// can be lazily rebased onto the pointer chains that pending eager fork
+// alternatives still resolve through (see refineForkVarRefs).
+func recordJoinedValueSources(merged, a, b *execState, aScope, bScope, mergedScope map[string]*oas3.Schema) {
+	if merged.joinedValueSources == nil {
+		// The merged state owns a fresh map (clones share maps, so appending
+		// into a parent's map would leak provenance across states).
+		combined := make(map[*oas3.Schema][]*oas3.Schema, len(a.joinedValueSources)+len(b.joinedValueSources))
+		for k, v := range a.joinedValueSources {
+			combined[k] = v
+		}
+		for k, v := range b.joinedValueSources {
+			combined[k] = append(append([]*oas3.Schema(nil), combined[k]...), v...)
+		}
+		merged.joinedValueSources = combined
 	}
-	if getType(schema) == "array" {
-		return traceEntryValueType(resolvedLeft(schema.Items))
+	record := func(source, joined *oas3.Schema) {
+		if source == nil || joined == nil || source == joined {
+			return
+		}
+		merged.joinedValueSources[joined] = append(merged.joinedValueSources[joined], source)
 	}
-	if schema.Properties != nil {
-		if value, ok := schema.Properties.Get("value"); ok {
-			child := resolvedLeft(value)
-			if isTopSchema(child) {
-				return "top"
+	for key, mergedValue := range mergedScope {
+		if aValue, ok := aScope[key]; ok {
+			record(aValue, mergedValue)
+		}
+		if bValue, ok := bScope[key]; ok {
+			record(bValue, mergedValue)
+		}
+	}
+}
+
+// unionForkUpdates merges the pending update controls of two joined states so
+// writes that happen after the merge reach the eager alternatives of both.
+func unionForkUpdates(a, b []*forkControl) []*forkControl {
+	if len(b) == 0 {
+		return a
+	}
+	if len(a) == 0 {
+		return b
+	}
+	seen := make(map[*forkControl]struct{}, len(a)+len(b))
+	out := make([]*forkControl, 0, len(a)+len(b))
+	for _, controls := range [2][]*forkControl{a, b} {
+		for _, control := range controls {
+			if control == nil {
+				continue
 			}
-			return getType(child)
-		}
-	}
-	for _, branch := range schema.AnyOf {
-		if kind := traceEntryValueType(resolvedLeft(branch)); kind != "nil" {
-			return kind
-		}
-	}
-	return "nil"
-}
-
-type allocReferenceScanner struct {
-	allocID       string
-	schemaToAlloc map[*oas3.Schema]string
-	seenSchemas   map[*oas3.Schema]bool
-	seenForks     map[*forkContinuationNode]bool
-	seenControls  map[*forkControl]bool
-}
-
-func stateReferencesAlloc(state *execState, allocID string) bool {
-	if state == nil || allocID == "" {
-		return false
-	}
-	scanner := allocReferenceScanner{
-		allocID:       allocID,
-		schemaToAlloc: state.schemaToAlloc,
-		seenSchemas:   make(map[*oas3.Schema]bool),
-		seenForks:     make(map[*forkContinuationNode]bool),
-		seenControls:  make(map[*forkControl]bool),
-	}
-	if scanner.values(state.stack) || scanner.scopes(state.scopes) || scanner.callstack(state.callstack) ||
-		scanner.forks(state.forks) {
-		return true
-	}
-	for _, loop := range state.foreachLoops {
-		if scanner.schema(loop.previous) || scanner.continuation(loop.continuation) || scanner.forks(loop.forks) {
-			return true
-		}
-		for _, control := range loop.forkUpdates {
-			if scanner.control(control) {
-				return true
+			if _, ok := seen[control]; ok {
+				continue
 			}
+			seen[control] = struct{}{}
+			out = append(out, control)
 		}
 	}
-	for _, control := range state.forkUpdates {
-		if scanner.control(control) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *allocReferenceScanner) values(values []SValue) bool {
-	for _, value := range values {
-		if s.schema(value.Schema) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *allocReferenceScanner) scopes(scopes []map[string]*oas3.Schema) bool {
-	for _, scope := range scopes {
-		for _, value := range scope {
-			if s.schema(value) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (s *allocReferenceScanner) callstack(stack callStack) bool {
-	for node := stack.tail; node != nil; node = node.prev {
-		if s.schema(node.input) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *allocReferenceScanner) forks(forks forkContinuations) bool {
-	for node := forks.tail; node != nil; node = node.prev {
-		if s.seenForks[node] {
-			return false
-		}
-		s.seenForks[node] = true
-		if s.continuation(node.value) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *allocReferenceScanner) continuation(continuation forkContinuation) bool {
-	if s.values(continuation.stack) || s.scopes(continuation.scopes) || s.callstack(continuation.callstack) {
-		return true
-	}
-	return s.control(continuation.control)
-}
-
-func (s *allocReferenceScanner) control(control *forkControl) bool {
-	if control == nil || s.seenControls[control] {
-		return false
-	}
-	s.seenControls[control] = true
-	for _, replacement := range control.replacements {
-		if s.schema(replacement.old) || s.schema(replacement.new) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *allocReferenceScanner) schema(schema *oas3.Schema) bool {
-	if schema == nil || s.seenSchemas[schema] {
-		return false
-	}
-	if s.schemaToAlloc[schema] == s.allocID {
-		return true
-	}
-	s.seenSchemas[schema] = true
-
-	visit := func(wrapper *oas3.JSONSchema[oas3.Referenceable]) bool {
-		if wrapper == nil {
-			return false
-		}
-		if resolved := wrapper.GetResolvedSchema(); resolved != nil && s.schema(resolved.GetLeft()) {
-			return true
-		}
-		return s.schema(wrapper.Left)
-	}
-	visitMap := func(values *sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]]) bool {
-		if values == nil {
-			return false
-		}
-		for _, wrapper := range values.All() {
-			if visit(wrapper) {
-				return true
-			}
-		}
-		return false
-	}
-	for _, values := range []*sequencedmap.Map[string, *oas3.JSONSchema[oas3.Referenceable]]{
-		schema.Properties, schema.PatternProperties, schema.DependentSchemas, schema.Defs,
-	} {
-		if visitMap(values) {
-			return true
-		}
-	}
-	for _, values := range [][]*oas3.JSONSchema[oas3.Referenceable]{
-		schema.PrefixItems, schema.AllOf, schema.AnyOf, schema.OneOf,
-	} {
-		for _, wrapper := range values {
-			if visit(wrapper) {
-				return true
-			}
-		}
-	}
-	for _, wrapper := range []*oas3.JSONSchema[oas3.Referenceable]{
-		schema.Items, schema.Contains, schema.AdditionalProperties, schema.PropertyNames,
-		schema.UnevaluatedItems, schema.UnevaluatedProperties, schema.ContentSchema,
-		schema.Not, schema.If, schema.Then, schema.Else,
-	} {
-		if visit(wrapper) {
-			return true
-		}
-	}
-	return false
+	return out
 }
 
 // joinState merges two states using lattice join (LUB).
@@ -5239,7 +5194,6 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 		// This handles the case where states from different forks have separate accumulators
 		mergedAccum := make(map[string]*oas3.Schema)
 		mergedSchemaToAlloc := make(map[*oas3.Schema]string)
-		preferredAccum := make(map[string]byte)
 
 		// Copy from a
 		for k, v := range a.accum {
@@ -5252,21 +5206,6 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 		// Merge from b
 		for k, v := range b.accum {
 			if existing, ok := mergedAccum[k]; ok {
-				aActive := stateReferencesAlloc(a, k)
-				bActive := stateReferencesAlloc(b, k)
-				aKind, bKind := traceEntryValueType(existing), traceEntryValueType(v)
-				if aKind != bKind && (aKind != "nil" || bKind != "nil") {
-					fmt.Printf("ACCUM pc=%d key=%s a=%s active=%v b=%s active=%v\n", a.pc, k, aKind, aActive, bKind, bActive)
-				}
-				switch {
-				case aActive && !bActive:
-					preferredAccum[k] = 1
-					continue
-				case bActive && !aActive:
-					preferredAccum[k] = 2
-					mergedAccum[k] = v
-					continue
-				}
 				// Both have this key - union the arrays
 				if getType(existing) == "array" && getType(v) == "array" {
 					// Union the items
@@ -5290,20 +5229,21 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 						bCard = b.allocCardinality[k]
 					}
 
-					// Determine if either is definitely non-empty (MinItems >= 1)
-					aNonEmpty := aCard != nil && aCard.MinItems != nil && *aCard.MinItems >= 1
-					bNonEmpty := bCard != nil && bCard.MinItems != nil && *bCard.MinItems >= 1
+					// Skipping a side's items is only sound when that side is
+					// PROVABLY empty (maxItems==0): a merely maybe-empty side
+					// can still contribute element values at runtime.
+					aDefEmpty := (aCard != nil && aCard.MaxItems != nil && *aCard.MaxItems == 0) ||
+						(existing.MaxItems != nil && *existing.MaxItems == 0)
+					bDefEmpty := (bCard != nil && bCard.MaxItems != nil && *bCard.MaxItems == 0) ||
+						(v.MaxItems != nil && *v.MaxItems == 0)
 
-					// If one is non-empty and other is empty, prefer the non-empty one's items
 					var unionedItems *oas3.Schema
-					if aNonEmpty && !bNonEmpty && existingItems != Bottom() {
-						// Prefer 'a' (existing) items since it's non-empty
+					switch {
+					case bDefEmpty && !aDefEmpty:
 						unionedItems = existingItems
-					} else if bNonEmpty && !aNonEmpty && vItems != Bottom() {
-						// Prefer 'b' (v) items since it's non-empty
+					case aDefEmpty && !bDefEmpty:
 						unionedItems = vItems
-					} else {
-						// Both non-empty or both maybe-empty - union them
+					default:
 						unionedItems = Union([]*oas3.Schema{existingItems, vItems}, SchemaExecOptions{})
 					}
 
@@ -5352,17 +5292,6 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 		}
 		if b.allocCardinality != nil {
 			for k, v := range b.allocCardinality {
-				if preferredAccum[k] == 1 {
-					continue
-				}
-				if preferredAccum[k] == 2 {
-					if v == nil {
-						delete(mergedCardinality, k)
-					} else {
-						mergedCardinality[k] = v
-					}
-					continue
-				}
 				if existing, ok := mergedCardinality[k]; ok {
 					// Use lattice join
 					if existing != nil && v != nil {
@@ -5372,13 +5301,6 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 					}
 				} else {
 					mergedCardinality[k] = v
-				}
-			}
-		}
-		for k, preferred := range preferredAccum {
-			if preferred == 2 {
-				if _, ok := b.allocCardinality[k]; !ok {
-					delete(mergedCardinality, k)
 				}
 			}
 		}
@@ -5395,7 +5317,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			foreachLoops:  joinForeachLoops(a.foreachLoops, b.foreachLoops, opts),
 			tryDepth:      a.tryDepth,
 			pathMode:      a.pathMode,
-			currentPath:   a.currentPath,
+			currentPath:   joinCurrentPaths(a.currentPath, b.currentPath),
 			pathEvalBases: append([]int(nil), a.pathEvalBases...),
 			depthWidenBlocked: a.depthWidenBlocked || b.depthWidenBlocked ||
 				!equalArrayGeneratorContexts(a.forks, b.forks),
@@ -5410,6 +5332,9 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			allocOrigin:      a.allocOrigin,     // SHARED (use from either)
 			allocCardinality: mergedCardinality, // Merged with lattice join
 			dsu:              a.dsu,             // SHARED (use from either)
+			// Post-merge writes must reach the eager alternatives of both
+			// joined states.
+			forkUpdates: unionForkUpdates(a.forkUpdates, b.forkUpdates),
 		}
 
 		// Merge var history and intent
@@ -5502,16 +5427,12 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 					if getType(aVal) == "array" && getType(bVal) == "array" {
 						aAlloc, aTagged := a.schemaToAlloc[aVal]
 						bAlloc, bTagged := b.schemaToAlloc[bVal]
-						aKind, bKind := traceEntryValueType(aVal), traceEntryValueType(bVal)
-						if aKind != bKind && (aKind != "nil" || bKind != "nil") {
-							fmt.Printf("SCOPE-DIFF pc=%d var=%s a=%s alloc=%s active=%v b=%s alloc=%s active=%v\n", a.pc, k, aKind, aAlloc, stateReferencesAlloc(a, aAlloc), bKind, bAlloc, stateReferencesAlloc(b, bAlloc))
-						}
 
 						// Theory 10: Cross-state DSU union - if both tagged and same origin, union them
 						if aTagged && bTagged {
 							oa := a.allocOrigin[aAlloc]
 							ob := b.allocOrigin[bAlloc]
-							if oa != nil && ob != nil && oa.PC == ob.PC && oa.Context == ob.Context {
+							if sameOrigin(oa, ob) {
 								// Same origin => union classes
 								opts.debugf("DSU joinState(diff-accum): var=%s union %s with %s (same origin PC=%d, ctx=%s)",
 									k, aAlloc, bAlloc, oa.PC, oa.Context)
@@ -5719,6 +5640,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 				}
 			}
 
+			recordJoinedValueSources(merged, a, b, aScope, bScope, mergedScope)
 			merged.scopes[i] = mergedScope
 		}
 
@@ -5738,7 +5660,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 		foreachLoops:  joinForeachLoops(a.foreachLoops, b.foreachLoops, opts),
 		tryDepth:      a.tryDepth,
 		pathMode:      a.pathMode,
-		currentPath:   a.currentPath,
+		currentPath:   joinCurrentPaths(a.currentPath, b.currentPath),
 		pathEvalBases: append([]int(nil), a.pathEvalBases...),
 		depthWidenBlocked: a.depthWidenBlocked || b.depthWidenBlocked ||
 			!equalArrayGeneratorContexts(a.forks, b.forks),
@@ -5753,6 +5675,9 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 		allocOrigin:      a.allocOrigin,
 		allocCardinality: a.allocCardinality,
 		dsu:              a.dsu,
+		// Post-merge writes must reach the eager alternatives of both
+		// joined states.
+		forkUpdates: unionForkUpdates(a.forkUpdates, b.forkUpdates),
 	}
 
 	// Merge var history and intent (same-accum branch)
@@ -5882,16 +5807,12 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 				if getType(aVal) == "array" && getType(bVal) == "array" {
 					aAlloc, aTagged := a.schemaToAlloc[aVal]
 					bAlloc, bTagged := b.schemaToAlloc[bVal]
-					aKind, bKind := traceEntryValueType(aVal), traceEntryValueType(bVal)
-					if aKind != bKind && (aKind != "nil" || bKind != "nil") {
-						fmt.Printf("SCOPE-SAME pc=%d var=%s a=%s alloc=%s active=%v desired=%q origin=%+v b=%s alloc=%s active=%v desired=%q origin=%+v varA=%q varB=%q forksA=%d forksB=%d\n", a.pc, k, aKind, aAlloc, stateReferencesAlloc(a, aAlloc), a.allocDesiredFP[aAlloc], a.allocOrigin[aAlloc], bKind, bAlloc, stateReferencesAlloc(b, bAlloc), b.allocDesiredFP[bAlloc], b.allocOrigin[bAlloc], a.varDesiredItemFP[k], b.varDesiredItemFP[k], a.forks.len(), b.forks.len())
-					}
 
 					// Theory 10: Cross-state DSU union - if both tagged and same origin, union them
 					if aTagged && bTagged {
 						oa := a.allocOrigin[aAlloc]
 						ob := b.allocOrigin[bAlloc]
-						if oa != nil && ob != nil && oa.PC == ob.PC && oa.Context == ob.Context {
+						if sameOrigin(oa, ob) {
 							// Same origin => union classes
 							opts.debugf("DSU joinState(same-accum): var=%s union %s with %s (same origin PC=%d, ctx=%s)",
 								k, aAlloc, bAlloc, oa.PC, oa.Context)
@@ -6086,6 +6007,7 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			}
 		}
 
+		recordJoinedValueSources(merged, a, b, aScope, bScope, mergedScope)
 		merged.scopes[i] = mergedScope
 	}
 
@@ -6236,6 +6158,14 @@ func compatibleStateShapes(a, b *execState, relaxScopeKeys bool) bool {
 		}
 	}
 	if !reflect.DeepEqual(a.pathEvalBases, b.pathEvalBases) {
+		return false
+	}
+	// Merged states must agree on path-collection mode: joinState joins the
+	// collected paths themselves (segmentwise weak symbolic segments, with an
+	// unknown-depth tail for cross-depth joins), so differing path contents
+	// are mergeable — and must stay mergeable, because path enumeration over
+	// recursive inputs relies on these joins for termination.
+	if a.pathMode != b.pathMode {
 		return false
 	}
 	labelForkDepth := 0

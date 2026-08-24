@@ -55,6 +55,45 @@ func anyOfSchemas(branches ...*oas3.Schema) *oas3.Schema {
 	return &oas3.Schema{AnyOf: wrappers}
 }
 
+func TestObjectMergesPreservePlainPropertyPointerIdentity(t *testing.T) {
+	property := ArrayType(StringType())
+	withProperty := BuildObject(map[string]*oas3.Schema{"configs": property}, []string{"configs"})
+
+	tests := []struct {
+		name  string
+		merge func() *oas3.Schema
+	}{
+		{
+			name: "MergeObjects",
+			merge: func() *oas3.Schema {
+				return MergeObjects(ObjectType(), withProperty, DefaultOptions())
+			},
+		},
+		{
+			name: "tryMergeObjects",
+			merge: func() *oas3.Schema {
+				return tryMergeObjects([]*oas3.Schema{withProperty, ObjectType()}, DefaultOptions())
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			merged := tt.merge()
+			if merged == nil || merged.Properties == nil {
+				t.Fatalf("merged schema has no properties: %s", schemaTypeSummary(merged, 3))
+			}
+			wrapper, ok := merged.Properties.Get("configs")
+			if !ok || wrapper == nil {
+				t.Fatal("merged schema has no configs property")
+			}
+			if wrapper.Left != property {
+				t.Fatalf("configs property pointer = %p, want original %p", wrapper.Left, property)
+			}
+		})
+	}
+}
+
 func TestDisjunctiveArrayItemsBooleanLatticeIsOrderIndependent(t *testing.T) {
 	closed := &oas3.Schema{
 		Type:  oas3.NewTypeFromString(oas3.SchemaTypeArray),

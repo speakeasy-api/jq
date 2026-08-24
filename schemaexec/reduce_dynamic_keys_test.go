@@ -31,15 +31,6 @@ func TestReduceDynamicKeys_ValueType(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to parse jq: %v", err)
 	}
-	code, err := gojq.Compile(query)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, operation := range code.GetCodes() {
-		if i >= 380 && i <= 412 {
-			fmt.Printf("CODE pc=%d op=%d name=%s value=%v\n", i, operation.GetOp(), operation.OpString(), operation.GetValue())
-		}
-	}
 
 	opts := DefaultOptions()
 	opts.EnableWarnings = true
@@ -800,15 +791,6 @@ func TestObjectMergeConfigs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to parse jq: %v", err)
 	}
-	code, err := gojq.Compile(query)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, operation := range code.GetCodes() {
-		if i >= 380 && i <= 412 {
-			fmt.Printf("FOUR-CODE pc=%d op=%d name=%s value=%v\n", i, operation.GetOp(), operation.OpString(), operation.GetValue())
-		}
-	}
 
 	opts := DefaultOptions()
 	opts.EnableWarnings = true
@@ -925,15 +907,6 @@ func TestFourBranchConcat(t *testing.T) {
 	query, err := gojq.Parse(jqExpr)
 	if err != nil {
 		t.Fatalf("Failed to parse jq: %v", err)
-	}
-	code, err := gojq.Compile(query)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, operation := range code.GetCodes() {
-		if i >= 380 && i <= 412 {
-			fmt.Printf("FOUR-CODE pc=%d op=%d name=%s value=%v\n", i, operation.GetOp(), operation.OpString(), operation.GetValue())
-		}
 	}
 
 	opts := DefaultOptions()
