@@ -35,7 +35,9 @@ jobs:
       - name: Lint
         run: |
           go vet ./...
-          go install honnef.co/go/tools/cmd/staticcheck@latest
+          # Pinned: staticcheck v0.8.x requires go >= 1.26, which the matrix
+          # (GOTOOLCHAIN=local) does not provide; @latest broke every branch.
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
           staticcheck -checks all -tags gojq_debug ./...
       - name: Check tools
         run: go run _tools/print_builtin.go
