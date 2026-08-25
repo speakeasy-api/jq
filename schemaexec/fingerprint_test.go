@@ -149,7 +149,7 @@ func TestFingerprintAllOfCollapsing(t *testing.T) {
 	}
 
 	// However, if we collapse the allOf schema first, they should match
-	collapsed, err := collapseAllOf(allOfSchema)
+	collapsed, err := normalizeSchema(newCollapseContext(), allOfSchema)
 	if err != nil {
 		t.Fatalf("Failed to collapse allOf: %v", err)
 	}

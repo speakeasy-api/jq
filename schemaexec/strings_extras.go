@@ -27,7 +27,7 @@ func init() {
 	// Array/string slicing and regex operations
 	builtinRegistry["_slice"] = builtinSlice
 	builtinRegistry["_capture"] = builtinCapture
-	builtinRegistry["_match"] = builtinMatchArray // override default to never return nil
+	builtinRegistry["_match"] = builtinMatchArray // always returns array of match objects, never nil
 }
 
 // ============================================================================

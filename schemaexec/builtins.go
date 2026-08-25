@@ -26,13 +26,11 @@ var builtinRegistry = map[string]builtinFunc{
 	"length":        builtinLength,
 	"keys":          builtinKeys,
 	"keys_unsorted": builtinKeys,
-	"values":        builtinValues,
 	"has":           builtinHas,
 
 	// Type conversions
 	"tonumber":   builtinToNumber,
 	"tostring":   builtinToString,
-	"toarray":    builtinToArray,
 	"explode":    builtinExplode,
 	"implode":    builtinImplode,
 	"tojson":     builtinToJSON,
@@ -58,7 +56,6 @@ var builtinRegistry = map[string]builtinFunc{
 	// Object operations
 	"to_entries":   builtinToEntries,
 	"from_entries": builtinFromEntries,
-	"with_entries": builtinWithEntries,
 
 	// Selection/filtering - these are inline-expanded by compiler
 	// NOT builtins - they expand to fork/backtrack patterns
@@ -126,12 +123,10 @@ var builtinRegistry = map[string]builtinFunc{
 	"index":    builtinIndex,
 	"rindex":   builtinRindex,
 	"contains": builtinContains,
-	"inside":   builtinInside,
 
-	// Regex
-	"test":   builtinTest,
-	"_match": builtinMatch,
-	"sub":    builtinSub,
+	// Regex ("_match" is registered by strings_extras.go's init as builtinMatchArray)
+	"test": builtinTest,
+	"sub":  builtinSub,
 
 	// Indexing
 	"_index": builtinIndexOp,
@@ -253,23 +248,6 @@ func keysBranch(input *oas3.Schema, env *schemaEnv) *oas3.Schema {
 	}
 
 	return ArrayType(itemSchema)
-}
-
-// builtinValues returns an array of all values.
-func builtinValues(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	result := distributeBuiltinInput(input, env, func(branch *oas3.Schema) *oas3.Schema {
-		switch getType(branch) {
-		case "object":
-			return ArrayType(unionAllObjectValues(branch, env.opts))
-		case "array":
-			return branch
-		case "":
-			return env.NewTopWithCause("values receiver type is unknown")
-		default:
-			return Bottom()
-		}
-	})
-	return []*oas3.Schema{result}, nil
 }
 
 // builtinHas checks if object has a property.
@@ -404,17 +382,6 @@ func builtinFromBase64(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) 
 		}
 	}
 	return []*oas3.Schema{StringType()}, nil
-}
-
-// builtinToArray converts to array.
-func builtinToArray(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	result := distributeBuiltinInput(input, env, func(branch *oas3.Schema) *oas3.Schema {
-		if getType(branch) == "array" {
-			return branch
-		}
-		return ArrayType(branch)
-	})
-	return []*oas3.Schema{result}, nil
 }
 
 func distributeBuiltinInput(input *oas3.Schema, env *schemaEnv, leaf func(*oas3.Schema) *oas3.Schema) *oas3.Schema {
@@ -756,19 +723,6 @@ func entryKeyValue(entry *oas3.Schema, opts SchemaExecOptions) (string, *oas3.Sc
 		return "", valueSchema, true
 	}
 	return key, valueSchema, true
-}
-
-// builtinWithEntries is a helper for object transformations.
-// with_entries(f) is equivalent to: to_entries | map(f) | from_entries
-func builtinWithEntries(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	// For now, conservative: preserve object structure but widen values
-	if !MightBeObject(input) {
-		return []*oas3.Schema{Bottom()}, nil
-	}
-
-	// TODO: Apply transformation to entry objects
-	// For now, return object with Top values
-	return []*oas3.Schema{OpenObjectType(Top())}, nil
 }
 
 // ============================================================================
@@ -1309,12 +1263,6 @@ func builtinContains(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([
 	return []*oas3.Schema{BoolType()}, nil
 }
 
-// builtinInside checks if input is contained in argument
-func builtinInside(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	// Conservative: return boolean
-	return []*oas3.Schema{BoolType()}, nil
-}
-
 // ============================================================================
 // REGEX OPERATION BUILTINS
 // ============================================================================
@@ -1343,29 +1291,6 @@ func builtinTest(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oa
 
 	// Conservative: can't evaluate regex on symbolic input
 	return []*oas3.Schema{BoolType()}, nil
-}
-
-// builtinMatch returns match object for regex
-func builtinMatch(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if !MightBeString(input) {
-		return []*oas3.Schema{Bottom()}, nil
-	}
-
-	// Build match object schema
-	matchObj := BuildObject(map[string]*oas3.Schema{
-		"offset": IntegerType(),
-		"length": IntegerType(),
-		"string": StringType(),
-		"captures": ArrayType(BuildObject(map[string]*oas3.Schema{
-			"offset": Union([]*oas3.Schema{IntegerType(), ConstNull()}, env.opts),
-			"length": Union([]*oas3.Schema{IntegerType(), ConstNull()}, env.opts),
-			"string": Union([]*oas3.Schema{StringType(), ConstNull()}, env.opts),
-			"name":   Union([]*oas3.Schema{StringType(), ConstNull()}, env.opts),
-		}, []string{})),
-	}, []string{"offset", "length", "string", "captures"})
-
-	// Return match object | null (conservative - can't evaluate regex)
-	return []*oas3.Schema{Union([]*oas3.Schema{matchObj, ConstNull()}, env.opts)}, nil
 }
 
 // builtinSub implements sub(pattern; replacement; flags?) - regex replacement (first match)
@@ -2216,11 +2141,6 @@ func builtinAddOp(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*o
 
 	result := addSchemasDistributed(lhs, rhs, opts)
 	return []*oas3.Schema{result}, nil
-}
-
-// AddSchemasForTest exposes "+" semantics for tests without requiring a VM env.
-func AddSchemasForTest(lhs, rhs *oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
-	return addSchemasDistributed(lhs, rhs, opts)
 }
 
 // addSchemasDistributed performs full union/nullable distribution for "+", unions all pairwise results.

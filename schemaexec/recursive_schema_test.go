@@ -97,35 +97,6 @@ func TestRecursiveNormalizationPreservesCycleAndMemoIdentity(t *testing.T) {
 	}
 }
 
-func TestCollapseCompatibilityWrappersUseNormalizer(t *testing.T) {
-	input := loadComponentSchema(t, recursiveNodeDoc, "Node")
-	tests := []struct {
-		name string
-		call func() (*oas3.Schema, error)
-	}{
-		{name: "allOf context", call: func() (*oas3.Schema, error) {
-			return collapseAllOfCtx(newCollapseContext(), input)
-		}},
-		{name: "anyOf", call: func() (*oas3.Schema, error) {
-			return collapseAnyOf(input)
-		}},
-		{name: "anyOf context", call: func() (*oas3.Schema, error) {
-			return collapseAnyOfCtx(newCollapseContext(), input)
-		}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := tt.call()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got == nil || getType(got) != "object" {
-				t.Fatalf("result = %s", schemaTypeSummary(got, 2))
-			}
-		})
-	}
-}
-
 func TestRecursiveSchemaWalkersTerminate(t *testing.T) {
 	input := loadComponentSchema(t, recursiveNodeDoc, "Node")
 	first, err := normalizeSchema(newCollapseContext(), input)

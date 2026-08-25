@@ -189,7 +189,7 @@ func TestBooleanSchemasRespectCombinatorIdentities(t *testing.T) {
 		oas3.NewJSONSchemaFromSchema[oas3.Referenceable](StringType()),
 		oas3.NewJSONSchemaFromBool(true),
 	}}
-	collapsed, err := collapseAllOf(allOfTrue)
+	collapsed, err := normalizeSchema(newCollapseContext(), allOfTrue)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func TestBooleanSchemasRespectCombinatorIdentities(t *testing.T) {
 		oas3.NewJSONSchemaFromSchema[oas3.Referenceable](StringType()),
 		oas3.NewJSONSchemaFromBool(false),
 	}}
-	collapsed, err = collapseAllOf(allOfFalse)
+	collapsed, err = normalizeSchema(newCollapseContext(), allOfFalse)
 	if err != nil {
 		t.Fatal(err)
 	}
