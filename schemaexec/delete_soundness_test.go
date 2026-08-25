@@ -173,7 +173,7 @@ func TestDefiniteDeletePathsApplyInDescendingOrder(t *testing.T) {
 // paths flow through the same shape); the fix needs must-occurrence
 // provenance (per-state must-cardinality), the tracked follow-up.
 func TestCollectShapedDelpathsStrongDeleteKnownUnsound(t *testing.T) {
-	t.Skip("known pre-existing unsoundness (equal with main): Items-shaped delpaths args from conditional collects are strong-deleted; needs must-occurrence provenance (per-state must-cardinality), tracked follow-up")
+	t.Skip("known pre-existing unsoundness (equal with main): Items-shaped delpaths args from conditional collects are strong-deleted; needs must-occurrence provenance. The old shared MAY-cardinality tracking (allocCardinality) was write-only and has been removed; per-state MUST-cardinality is the planned fix")
 	input := BuildObject(map[string]*oas3.Schema{"a": IntegerType(), "c": BoolType()}, []string{"a", "c"})
 	analysis := analyzeWithOptions(t, `delpaths([select(.c) | ["a"]])`, input, DefaultOptions())
 	if analysis.Verdict != VerdictProven {

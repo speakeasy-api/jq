@@ -148,29 +148,31 @@ func TestMultiPathDeleteDropsRequired(t *testing.T) {
 	assertMultiDelDropsRequired(t, []string{"a", "b", "c", "d", "e", "f"})
 }
 
-// KNOWN UNSOUNDNESS (pre-existing, reproduced and root-caused during the
-// round-3 review): with seven or more deleted paths, widening inside the
-// [path(f)] collect loop breaks the accumulator's pointer-identity chain; the
-// surviving exit lineage loads the original empty array, delpaths sees a
-// schema indistinguishable from a genuinely empty path list, and the deletes
-// silently no-op while the verdict stays Proven. The fix belongs in the
-// collect/backtrack machinery (per-state must-cardinality and join-aware
-// accumulator identity), not in the delpaths consumer.
-func TestMultiPathDeleteSevenPlusKnownUnsound(t *testing.T) {
-	t.Skip("known pre-existing unsoundness: collect-loop widening loses the paths accumulator for >=7 paths; see PR #3 follow-ups")
+// With seven or more deleted paths, widening inside the [path(f)] collect
+// loop still breaks the accumulator's pointer-identity chain (root-caused
+// during the round-3 review): the surviving exit lineage loads the original
+// empty array, and delpaths sees a bare empty-array schema. That shape used
+// to be trusted as a provably-empty path list and the deletes silently
+// no-opped while the verdict stayed Proven. It is now CONTAINED — not fixed
+// — by routing the bare shape through the weak unknown-delete fallback in
+// delpathsUnextracted, which drops requiredness as this test demands. The
+// real fix (recovering the exact paths) still belongs in the
+// collect/backtrack machinery: per-state must-cardinality and join-aware
+// accumulator identity.
+func TestMultiPathDeleteSevenPlusWeakContainment(t *testing.T) {
 	assertMultiDelDropsRequired(t, []string{"a", "b", "c", "d", "e", "f", "g"})
 	assertMultiDelDropsRequired(t, []string{"a", "b", "c", "d", "e", "f", "g", "h"})
 }
 
-// KNOWN UNSOUNDNESS (pre-existing, reproduced): when the RHS branches of a
-// multi-path update reconverge and merge mid-update, a post-merge write can
-// fail to reach the pending eager alternative's snapshot (its pointer-keyed
-// replacement chain was broken by the value join). A provenance-based lazy
-// rebase (joinedValueSources) was tried and removed for its quadratic cost
-// (see git history); an epoch-keyed redesign of update delivery is the
-// tracked follow-up.
-func TestPostMergeWriteReachesPendingAlternativeKnownUnsound(t *testing.T) {
-	t.Skip("known pre-existing unsoundness: post-merge writes can miss pending update alternatives; see PR #3 follow-ups")
+// When the RHS branches of a
+// multi-path update reconverge and merge mid-update, a post-merge write must
+// still reach the pending eager alternative's snapshot. This shape was once
+// a known unsoundness (the pointer-keyed replacement chain broke on the
+// value join; a provenance-based lazy rebase was tried and removed for its
+// quadratic cost — see git history). It became sound after the round-3
+// subsumption gates and the provenance removal: the verdict is Proven and
+// y=1 is tracked on every branch. This test pins the fixed behavior.
+func TestPostMergeWriteReachesPendingAlternative(t *testing.T) {
 	arm := func(v int64) *oas3.Schema {
 		return BuildObject(map[string]*oas3.Schema{"k": ConstInteger(v)}, []string{"k"})
 	}
@@ -184,7 +186,7 @@ func TestPostMergeWriteReachesPendingAlternativeKnownUnsound(t *testing.T) {
 	)`
 	analysis := analyzeWithOptions(t, expr, input, DefaultOptions())
 	if analysis.Verdict != VerdictProven {
-		return
+		t.Fatalf("verdict = %s, want proven (causes: %v)", analysis.Verdict, analysis.Causes)
 	}
 	for _, name := range []string{"a", "b"} {
 		wrapper, ok := analysis.Output.Properties.Get(name)

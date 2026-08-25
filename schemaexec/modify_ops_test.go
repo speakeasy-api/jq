@@ -21,8 +21,8 @@ func TestPropertyUpdatePreservesOtherProperties(t *testing.T) {
 }
 
 // The |= desugaring's trailing delete accumulator is populated per branch,
-// and its shared allocation cardinality cannot prove that EVERY represented
-// execution appended a path, so the executor applies these deletes weakly:
+// and the executor cannot prove that EVERY represented execution appended a
+// path (no must-cardinality tracking), so it applies these deletes weakly:
 // n must stop being required, but its value schema may survive as optional.
 // Asserting full removal would require an unsound strong delete (see
 // `.n |= if . then empty else 0 end`, where n survives on one branch).
