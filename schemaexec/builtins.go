@@ -1920,50 +1920,56 @@ func rawBuiltinOperandNeedsWidening(schema *oas3.Schema) bool {
 
 // builtinEqual implements == comparison.
 func builtinEqual(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
+	lhs, rhs, ok := binaryOperands(input, args)
+	if !ok {
 		return []*oas3.Schema{BoolType()}, nil
 	}
-	return compareSchemas(input, args[0], func(cmp int) bool { return cmp == 0 })
+	return compareSchemas(lhs, rhs, func(cmp int) bool { return cmp == 0 })
 }
 
 // builtinNotEqual implements != comparison.
 func builtinNotEqual(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
+	lhs, rhs, ok := binaryOperands(input, args)
+	if !ok {
 		return []*oas3.Schema{BoolType()}, nil
 	}
-	return compareSchemas(input, args[0], func(cmp int) bool { return cmp != 0 })
+	return compareSchemas(lhs, rhs, func(cmp int) bool { return cmp != 0 })
 }
 
 // builtinLess implements < comparison.
 func builtinLess(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
+	lhs, rhs, ok := binaryOperands(input, args)
+	if !ok {
 		return []*oas3.Schema{BoolType()}, nil
 	}
-	return compareSchemas(input, args[0], func(cmp int) bool { return cmp < 0 })
+	return compareSchemas(lhs, rhs, func(cmp int) bool { return cmp < 0 })
 }
 
 // builtinGreater implements > comparison.
 func builtinGreater(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
+	lhs, rhs, ok := binaryOperands(input, args)
+	if !ok {
 		return []*oas3.Schema{BoolType()}, nil
 	}
-	return compareSchemas(input, args[0], func(cmp int) bool { return cmp > 0 })
+	return compareSchemas(lhs, rhs, func(cmp int) bool { return cmp > 0 })
 }
 
 // builtinLessEq implements <= comparison.
 func builtinLessEq(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
+	lhs, rhs, ok := binaryOperands(input, args)
+	if !ok {
 		return []*oas3.Schema{BoolType()}, nil
 	}
-	return compareSchemas(input, args[0], func(cmp int) bool { return cmp <= 0 })
+	return compareSchemas(lhs, rhs, func(cmp int) bool { return cmp <= 0 })
 }
 
 // builtinGreaterEq implements >= comparison.
 func builtinGreaterEq(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([]*oas3.Schema, error) {
-	if len(args) != 1 {
+	lhs, rhs, ok := binaryOperands(input, args)
+	if !ok {
 		return []*oas3.Schema{BoolType()}, nil
 	}
-	return compareSchemas(input, args[0], func(cmp int) bool { return cmp >= 0 })
+	return compareSchemas(lhs, rhs, func(cmp int) bool { return cmp >= 0 })
 }
 
 // compareSchemas compares two schemas and returns a boolean schema.
