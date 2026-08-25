@@ -1513,7 +1513,7 @@ func builtinDelpathsWeak(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 	// per-state must-cardinality (follow-up).
 	result := input
 	for _, path := range paths {
-		result = weakDeletePathFromSchema(result, path, env.opts)
+		result = deletePathFromSchema(result, path, env.opts, true)
 	}
 	return []*oas3.Schema{result}, nil
 }
@@ -1571,10 +1571,10 @@ func builtinDelpaths(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) ([
 	sortDeletePathsDescending(paths)
 	result := input
 	for _, path := range paths {
-		result = deletePathFromSchema(result, path, env.opts)
+		result = deletePathFromSchema(result, path, env.opts, false)
 	}
 	for _, path := range possible {
-		result = weakDeletePathFromSchema(result, path, env.opts)
+		result = deletePathFromSchema(result, path, env.opts, true)
 	}
 
 	if env.opts.EnableWarnings {

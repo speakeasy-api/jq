@@ -208,56 +208,6 @@ func extractPathsFromSchema(pathSchema *oas3.Schema) [][]PathSegment {
 	return nil
 }
 
-// weakDeletePathFromSchema over-approximates a delete that only POSSIBLY
-// happens: the result must admit both the untouched and the deleted concrete
-// value. Rather than building Union(input, deleted) — which keeps two anyOf
-// branches alive per update round and grows exponentially through reduce
-// fixpoints — it weakens in place: member schemas survive, the targeted key
-// stops being required, and count/value facets the delete could invalidate
-// are dropped. The in-place form is a superset of both outcomes, hence sound.
-func weakDeletePathFromSchema(schema *oas3.Schema, path []PathSegment, opts SchemaExecOptions) *oas3.Schema {
-	if schema == nil || len(path) == 0 {
-		return schema
-	}
-	if len(path) == 1 {
-		return weakDeleteSegment(schema, path[0], opts)
-	}
-	// Intermediate navigation installs the weakened child, which is a
-	// superset of the untouched child, so the strong set stays sound.
-	return navigateAndModify(schema, path[0], path[1:], opts, false, func(child *oas3.Schema) *oas3.Schema {
-		return weakDeletePathFromSchema(child, path[1:], opts)
-	})
-}
-
-func weakDeleteSegment(schema *oas3.Schema, seg PathSegment, opts SchemaExecOptions) *oas3.Schema {
-	if seg.IsSymbolic {
-		// The symbolic delete is already weak: values survive, required and
-		// lower bounds are dropped.
-		return deleteSegment(schema, seg, opts)
-	}
-	if key, ok := seg.Key.(string); ok && getType(schema) == "object" {
-		result := cloneSchema(schema)
-		required := make([]string, 0, len(schema.Required))
-		for _, name := range schema.Required {
-			if name != key {
-				required = append(required, name)
-			}
-		}
-		result.Required = required
-		result.MinProperties = nil
-		result.Const = nil
-		result.Enum = nil
-		result.DependentSchemas = nil
-		return result
-	}
-	if _, ok := seg.Key.(int); ok && getType(schema) == "array" {
-		result := arrayWriteSurvivors(eraseArrayPositions(schema, opts))
-		result.MinItems = nil
-		return result
-	}
-	return schema
-}
-
 // maxExpandedDeletePaths bounds the cartesian expansion of enum-headed path
 // tuples; beyond it the caller falls back to weakDeleteUnknown.
 const maxExpandedDeletePaths = 64
@@ -310,6 +260,17 @@ func expandDeletePaths(pathsArg *oas3.Schema) (definite, possible [][]PathSegmen
 }
 
 func expandPathTuple(tuple *oas3.Schema) (paths [][]PathSegment, multi bool, ok bool) {
+	return expandPathTupleMode(tuple, false)
+}
+
+// expandPathTupleMode walks a tuple's prefixItems once, shared by the full
+// cartesian expansion (delete paths) and the first-candidate walk backing
+// extractSinglePath (setpath/getpath). firstCandidateOnly keeps exactly one
+// candidate per position — degrading a position whose candidates cannot be
+// decoded to extractSegmentFromSchema's best effort instead of failing the
+// whole tuple — and never trips the expansion bound because it builds a
+// single path.
+func expandPathTupleMode(tuple *oas3.Schema, firstCandidateOnly bool) (paths [][]PathSegment, multi bool, ok bool) {
 	if tuple == nil || tuple.PrefixItems == nil {
 		return nil, false, false
 	}
@@ -321,10 +282,16 @@ func expandPathTuple(tuple *oas3.Schema) (paths [][]PathSegment, multi bool, ok 
 		}
 		candidates, candidatesOK := pathSegmentCandidates(left)
 		if !candidatesOK {
-			return nil, false, false
+			if !firstCandidateOnly {
+				return nil, false, false
+			}
+			candidates = []PathSegment{extractSegmentFromSchema(left)}
 		}
 		if len(candidates) > 1 {
 			multi = true
+			if firstCandidateOnly {
+				candidates = candidates[:1]
+			}
 		}
 		if len(paths)*len(candidates) > maxExpandedDeletePaths {
 			return nil, false, false
@@ -427,28 +394,18 @@ func compareDeleteSegments(a, b PathSegment) int {
 	return 0
 }
 
-// extractSinglePath extracts path segments from a single path array schema
-// For unionized paths (e.g., del(.a, .b)), prefixItems[0] might have anyOf
-// In that case, we need to extract multiple paths
+// extractSinglePath extracts path segments from a single path tuple schema,
+// keeping the first candidate at each position (enum-headed positions from
+// unionized paths collapse to their first value; undecodable positions
+// degrade to a symbolic segment). Shares the tuple walk with
+// expandPathTuple; deliberately NOT full enum expansion — setpath/getpath
+// keep their historical single-path behavior.
 func extractSinglePath(pathSchema *oas3.Schema) []PathSegment {
-	if pathSchema.PrefixItems == nil {
+	paths, _, ok := expandPathTupleMode(pathSchema, true)
+	if !ok || len(paths) == 0 {
 		return nil
 	}
-
-	// For now, just extract the first path
-	// TODO: Handle unionized paths where prefixItems[0] has anyOf
-	segments := make([]PathSegment, 0, len(pathSchema.PrefixItems))
-	for _, itemSchema := range pathSchema.PrefixItems {
-		left := resolvedLeft(itemSchema)
-		if left == nil {
-			continue
-		}
-
-		seg := extractSegmentFromSchema(left)
-		segments = append(segments, seg)
-	}
-
-	return segments
+	return paths[0]
 }
 
 // extractSegmentFromSchema converts a schema to a path segment
@@ -496,8 +453,18 @@ func extractSegmentFromSchema(schema *oas3.Schema) PathSegment {
 	}
 }
 
-// deletePathFromSchema deletes a single path from the schema
-func deletePathFromSchema(schema *oas3.Schema, path []PathSegment, opts SchemaExecOptions) *oas3.Schema {
+// deletePathFromSchema deletes a single path from the schema.
+//
+// weak=true over-approximates a delete that only POSSIBLY happens: the
+// result must admit both the untouched and the deleted concrete value.
+// Rather than building Union(input, deleted) — which keeps two anyOf
+// branches alive per update round and grows exponentially through reduce
+// fixpoints — it weakens in place: member schemas survive, the targeted key
+// stops being required, and count/value facets the delete could invalidate
+// are dropped. The in-place form is a superset of both outcomes, hence
+// sound. Intermediate navigation installs the weakened child, which is a
+// superset of the untouched child, so the strong set stays sound.
+func deletePathFromSchema(schema *oas3.Schema, path []PathSegment, opts SchemaExecOptions, weak bool) *oas3.Schema {
 	if schema == nil || len(path) == 0 {
 		return schema
 	}
@@ -506,18 +473,23 @@ func deletePathFromSchema(schema *oas3.Schema, path []PathSegment, opts SchemaEx
 
 	// Last segment: perform deletion
 	if len(path) == 1 {
-		return deleteSegment(schema, seg, opts)
+		return deleteSegment(schema, seg, opts, weak)
 	}
 
 	// Recursive: navigate to parent and delete child
 	return navigateAndModify(schema, seg, path[1:], opts, false, func(child *oas3.Schema) *oas3.Schema {
-		return deletePathFromSchema(child, path[1:], opts)
+		return deletePathFromSchema(child, path[1:], opts, weak)
 	})
 }
 
-// deleteSegment deletes a single segment (property or array element)
-func deleteSegment(schema *oas3.Schema, seg PathSegment, opts SchemaExecOptions) *oas3.Schema {
+// deleteSegment deletes a single segment (property or array element).
+// weak=true routes concrete segments to the soft arms (survivors kept,
+// requiredness and count facets dropped); symbolic deletes are already weak
+// by construction and shared between both modes.
+func deleteSegment(schema *oas3.Schema, seg PathSegment, opts SchemaExecOptions, weak bool) *oas3.Schema {
 	if seg.IsSymbolic {
+		// The symbolic delete is already weak: values survive, required and
+		// lower bounds are dropped.
 		if getType(schema) == "array" {
 			if isAllElementsSegment(seg) {
 				return ArrayType(Bottom())
@@ -541,6 +513,32 @@ func deleteSegment(schema *oas3.Schema, seg PathSegment, opts SchemaExecOptions)
 				MaxProperties:        schema.MaxProperties,
 				Nullable:             schema.Nullable,
 			}
+		}
+		return schema
+	}
+
+	if weak {
+		// Soft arms: the delete only possibly happened, so member schemas
+		// survive; only requiredness and count/value facets weaken.
+		if key, ok := seg.Key.(string); ok && getType(schema) == "object" {
+			result := cloneSchema(schema)
+			required := make([]string, 0, len(schema.Required))
+			for _, name := range schema.Required {
+				if name != key {
+					required = append(required, name)
+				}
+			}
+			result.Required = required
+			result.MinProperties = nil
+			result.Const = nil
+			result.Enum = nil
+			result.DependentSchemas = nil
+			return result
+		}
+		if _, ok := seg.Key.(int); ok && getType(schema) == "array" {
+			result := arrayWriteSurvivors(eraseArrayPositions(schema, opts))
+			result.MinItems = nil
+			return result
 		}
 		return schema
 	}
