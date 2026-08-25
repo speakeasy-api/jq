@@ -1469,17 +1469,15 @@ func builtinAllocator(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv) (
 // builtinDelpaths implements delpaths(paths) - delete multiple paths from input
 // Used by del() which compiles to delpaths
 // delpathsUnextracted handles a paths argument no concrete path could be
-// extracted from. A provably empty path set deletes nothing; anything else
-// may delete some member at some depth, so returning the input unchanged
-// would be unsound — widen with the weak unknown-delete transform instead.
+// extracted from. Anything that might be a non-empty path list may delete
+// some member at some depth, so returning the input unchanged would be
+// unsound — widen with the weak unknown-delete transform instead. A bare
+// empty-array shape ({array, maxItems: 0}, no items/prefixItems) is NOT
+// trusted as provably empty: the >=7-path collect-loop bug delivers exactly
+// that shape after the accumulator's identity chain is lost, and a no-op
+// there silently drops real deletes.
 func delpathsUnextracted(input, pathsArg *oas3.Schema, env *schemaEnv) *oas3.Schema {
-	// "Provably empty" must be internally consistent: joins can leave a stale
-	// maxItems=0 on an accumulator that also records appended items, and
-	// trusting it would turn real deletes into no-ops.
-	provablyEmpty := pathsArg != nil && pathsArg.MaxItems != nil && *pathsArg.MaxItems == 0 &&
-		(pathsArg.MinItems == nil || *pathsArg.MinItems == 0) &&
-		pathsArg.Items == nil && len(pathsArg.PrefixItems) == 0
-	if pathsArg == nil || !MightBeArray(pathsArg) || provablyEmpty {
+	if pathsArg == nil || !MightBeArray(pathsArg) {
 		return input
 	}
 	if env.opts.EnableWarnings {

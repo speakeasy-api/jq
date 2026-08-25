@@ -148,16 +148,18 @@ func TestMultiPathDeleteDropsRequired(t *testing.T) {
 	assertMultiDelDropsRequired(t, []string{"a", "b", "c", "d", "e", "f"})
 }
 
-// KNOWN UNSOUNDNESS (pre-existing, reproduced and root-caused during the
-// round-3 review): with seven or more deleted paths, widening inside the
-// [path(f)] collect loop breaks the accumulator's pointer-identity chain; the
-// surviving exit lineage loads the original empty array, delpaths sees a
-// schema indistinguishable from a genuinely empty path list, and the deletes
-// silently no-op while the verdict stays Proven. The fix belongs in the
-// collect/backtrack machinery (per-state must-cardinality and join-aware
-// accumulator identity), not in the delpaths consumer.
-func TestMultiPathDeleteSevenPlusKnownUnsound(t *testing.T) {
-	t.Skip("known pre-existing unsoundness: collect-loop widening loses the paths accumulator for >=7 paths; see PR #3 follow-ups. The old shared MAY-cardinality tracking (allocCardinality) was write-only and has been removed; per-state MUST-cardinality is the planned fix")
+// With seven or more deleted paths, widening inside the [path(f)] collect
+// loop still breaks the accumulator's pointer-identity chain (root-caused
+// during the round-3 review): the surviving exit lineage loads the original
+// empty array, and delpaths sees a bare empty-array schema. That shape used
+// to be trusted as a provably-empty path list and the deletes silently
+// no-opped while the verdict stayed Proven. It is now CONTAINED — not fixed
+// — by routing the bare shape through the weak unknown-delete fallback in
+// delpathsUnextracted, which drops requiredness as this test demands. The
+// real fix (recovering the exact paths) still belongs in the
+// collect/backtrack machinery: per-state must-cardinality and join-aware
+// accumulator identity.
+func TestMultiPathDeleteSevenPlusWeakContainment(t *testing.T) {
 	assertMultiDelDropsRequired(t, []string{"a", "b", "c", "d", "e", "f", "g"})
 	assertMultiDelDropsRequired(t, []string{"a", "b", "c", "d", "e", "f", "g", "h"})
 }
