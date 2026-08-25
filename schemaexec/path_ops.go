@@ -156,6 +156,16 @@ func extractPathsFromSchema(pathSchema *oas3.Schema) [][]PathSegment {
 		return nil
 	}
 
+	// An exact empty tuple ({type: array, maxItems: 0} with no items and no
+	// prefixItems) is the EMPTY path, not "no paths": jq's setpath([]; v)
+	// replaces the whole input with v and getpath([]) is identity. Both are
+	// realized by returning one zero-length path (setPathInSchema and
+	// navigatePathInSchema already map an empty path to the value/input).
+	if pathSchema.MaxItems != nil && *pathSchema.MaxItems == 0 &&
+		pathSchema.Items == nil && len(pathSchema.PrefixItems) == 0 {
+		return [][]PathSegment{{}}
+	}
+
 	// Handle case where path is a single path (array with prefixItems)
 	if len(pathSchema.PrefixItems) > 0 {
 		// Single path represented as tuple

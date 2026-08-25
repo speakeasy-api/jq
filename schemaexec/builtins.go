@@ -1702,21 +1702,6 @@ func builtinSetpathInner(input *oas3.Schema, args []*oas3.Schema, env *schemaEnv
 			}
 		}
 
-		// HANDLE EMPTY-PATH SENTINEL: Some upstream builders collapse non-const segments to an "empty array" (maxItems=0).
-		// Treat this as a dynamic string-key update on objects so reduce .[] as $c ({}; .[$c.name] = $c.value) can proceed.
-		if MightBeArray(pathArg) && pathArg.MaxItems != nil && *pathArg.MaxItems == 0 && MightBeObject(input) {
-			if env.opts.EnableWarnings {
-				env.logger.Debugf("builtinSetpath: empty path tuple treated as dynamic string key; updating additionalProperties")
-				env.logger.Debugf("builtinSetpath: calling setDynamicProperty now...")
-			}
-			result := setDynamicProperty(input, valueArg, env.opts)
-			if env.opts.EnableWarnings {
-				env.logger.Debugf("builtinSetpath: setDynamicProperty returned, hasAP=%v",
-					result.AdditionalProperties != nil && result.AdditionalProperties.Left != nil)
-			}
-			return []*oas3.Schema{result}, nil
-		}
-
 		// HANDLE WILDCARD CASE: If pathArg is an array with non-const string items,
 		// treat it as setting a dynamic object key by updating additionalProperties.
 		if MightBeArray(pathArg) && pathArg.Items != nil && pathArg.Items.Left != nil {
