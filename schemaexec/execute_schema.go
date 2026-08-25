@@ -35,6 +35,10 @@ type schemaEnv struct {
 	norm         *normCtx
 	loopHeads    map[string]*loopHeadState
 	foreachSeeds map[int][]foreachMarkerLocation
+
+	// closures maps closure schema pointers (created by opPushPC) to their
+	// entry PC. Per-execution: never share this across goroutines.
+	closures map[*oas3.Schema]int
 }
 
 type loopHeadState struct {
@@ -2366,7 +2370,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 	case opPushPC:
 		// Capture closure - create a schema that represents the closure
 		if pc, ok := c.value.(int); ok {
-			closureSchema := newClosureSchema(pc)
+			closureSchema := env.newClosureSchema(pc)
 			next.push(closureSchema)
 		} else {
 			next.push(Top())
@@ -2383,7 +2387,7 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 			next.push(Top())
 			return []*execState{next}, nil
 		}
-		if pc, ok := getClosurePC(clos); ok {
+		if pc, ok := env.getClosurePC(clos); ok {
 			input := next.top()
 			if env.shouldWidenRecursiveCall(next.callstack, pc, input) {
 				next.pop()
@@ -3653,7 +3657,7 @@ func (env *schemaEnv) widenRecursiveLoopState(state *execState) *execState {
 		}
 	}
 	for i := range widened.stack {
-		if _, ok := getClosurePC(widened.stack[i].Schema); ok {
+		if _, ok := env.getClosurePC(widened.stack[i].Schema); ok {
 			continue
 		}
 		widened.stack[i] = SValue{Schema: env.NewTopWithCause("recursive loop fixpoint exceeded widening budget")}
@@ -3665,7 +3669,7 @@ func (env *schemaEnv) widenRecursiveLoopState(state *execState) *execState {
 				frame[key] = value
 				continue
 			}
-			if _, ok := getClosurePC(value); ok {
+			if _, ok := env.getClosurePC(value); ok {
 				frame[key] = value
 				continue
 			}
@@ -4315,17 +4319,22 @@ func buildPathSchemaFromSegments(segments []PathSegment) *oas3.Schema {
 	return BuildArray(Top(), prefixItems)
 }
 
-// Simple closure tracking (maps schema pointer to PC)
-var closureRegistry = make(map[*oas3.Schema]int)
-
-func newClosureSchema(pc int) *oas3.Schema {
+// newClosureSchema records a closure's entry PC keyed by a fresh schema
+// pointer. The registry lives on the env (one per execution, single
+// goroutine): a package-global map here was an unsynchronized write/write
+// data race under concurrent RunSchema calls, and retained every closure
+// schema forever.
+func (env *schemaEnv) newClosureSchema(pc int) *oas3.Schema {
 	s := Top()
-	closureRegistry[s] = pc
+	if env.closures == nil {
+		env.closures = make(map[*oas3.Schema]int)
+	}
+	env.closures[s] = pc
 	return s
 }
 
-func getClosurePC(s *oas3.Schema) (int, bool) {
-	pc, ok := closureRegistry[s]
+func (env *schemaEnv) getClosurePC(s *oas3.Schema) (int, bool) {
+	pc, ok := env.closures[s]
 	return pc, ok
 }
 
