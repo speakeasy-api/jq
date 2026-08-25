@@ -410,90 +410,6 @@ func GetProperty(obj *oas3.Schema, key string, opts SchemaExecOptions) *oas3.Sch
 // Union creates a schema that matches any of the input schemas (anyOf).
 // Implements proper flattening, deduplication, and widening when limits exceeded.
 func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
-	// DEBUG: Track AdditionalProperties in input schemas
-	if opts.EnableWarnings {
-		apCount := 0
-		for i, s := range schemas {
-			if s != nil && getType(s) == "object" && s.AdditionalProperties != nil && s.AdditionalProperties.Left != nil {
-				apCount++
-				if i < 3 {
-					opts.debugf("Union: schema[%d] (ptr=%p) has AP.Left type=%s", i, s, getType(s.AdditionalProperties.Left))
-				}
-			}
-		}
-		if apCount > 0 {
-			opts.debugf("Union: %d/%d objects have AP.Left set", apCount, len(schemas))
-		}
-	}
-	// DEBUG: Track large unions and inspect configs property
-	if opts.EnableWarnings && len(schemas) > 100 {
-		opts.debugf("Union: processing %d input schemas", len(schemas))
-
-		// Count how many have configs property and what it looks like
-		objectCount := 0
-		configsEmptyCount := 0
-		configsNonEmptyCount := 0
-		configsMissingCount := 0
-
-		for _, s := range schemas {
-			if s != nil && getType(s) == "object" {
-				objectCount++
-				if s.Properties != nil {
-					if configsProp, ok := s.Properties.Get("configs"); ok && configsProp.GetLeft() != nil {
-						configs := configsProp.GetLeft()
-						if getType(configs) == "array" {
-							isEmpty := configs.MaxItems != nil && *configs.MaxItems == 0
-							if isEmpty {
-								configsEmptyCount++
-							} else {
-								configsNonEmptyCount++
-							}
-						}
-					} else {
-						configsMissingCount++
-					}
-				} else {
-					configsMissingCount++
-				}
-			}
-		}
-
-		if objectCount > 0 {
-			opts.debugf("Union: of %d objects, configs: %d empty, %d non-empty, %d missing",
-				objectCount, configsEmptyCount, configsNonEmptyCount, configsMissingCount)
-		}
-	}
-	// DEBUG: Trace Union calls on arrays to understand empty array handling
-	if opts.EnableWarnings && len(schemas) > 0 {
-		allArrays := true
-		hasArray := false
-		for _, s := range schemas {
-			if s != nil {
-				if getType(s) == "array" {
-					hasArray = true
-				} else {
-					allArrays = false
-				}
-			}
-		}
-		if hasArray && allArrays {
-			opts.debugf("Union: merging %d arrays", len(schemas))
-			for i, s := range schemas {
-				if s == nil {
-					opts.debugf("  [%d] nil schema", i)
-				} else {
-					isEmpty := s.MaxItems != nil && *s.MaxItems == 0
-					hasItems := s.Items != nil && s.Items.Left != nil
-					var itemType string
-					if hasItems {
-						itemType = getType(s.Items.Left)
-					}
-					opts.debugf("  [%d] array: empty=%v, hasItems=%v, itemType=%s", i, isEmpty, hasItems, itemType)
-				}
-			}
-		}
-	}
-
 	// First pass: filter out nil/Bottom. Top branches are NOT decided here:
 	// they flow through dedup (whose fingerprint distinguishes Top from
 	// structured schemas) and subsumption (everything ⊆ Top collapses the
@@ -576,132 +492,20 @@ func Union(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schema {
 		}
 	}
 
-	// DEBUG: Count configs arrays before dedup
-	if opts.EnableWarnings && len(schemas) > 100 {
-		emptyConfigsCount := 0
-		nonEmptyConfigsCount := 0
-		fingerprints := make(map[string]int) // Track unique fingerprints
-		for idx, s := range flattened {
-			if s != nil && getType(s) == "object" && s.Properties != nil {
-				if configsProp, ok := s.Properties.Get("configs"); ok && configsProp.GetLeft() != nil {
-					configs := configsProp.GetLeft()
-					if getType(configs) == "array" {
-						isEmpty := configs.MaxItems != nil && *configs.MaxItems == 0
-						hasItems := configs.Items != nil && configs.Items.Left != nil
-
-						// Get fingerprint for this configs array
-						fp := schemaFingerprint(configs)
-						fingerprints[fp]++
-
-						if isEmpty {
-							emptyConfigsCount++
-							if idx < 2 {
-								opts.debugf("Union: flattened[%d] EMPTY configs: fp=%s, hasItems=%v",
-									idx, fp[:16], hasItems)
-							}
-						} else {
-							nonEmptyConfigsCount++
-							if idx < 2 {
-								var itemType string
-								if hasItems {
-									itemType = getType(configs.Items.Left)
-								}
-								opts.debugf("Union: flattened[%d] NON-EMPTY configs: fp=%s, hasItems=%v, itemType=%s",
-									idx, fp[:16], hasItems, itemType)
-							}
-						}
-					}
-				}
-			}
-		}
-		if emptyConfigsCount > 0 || nonEmptyConfigsCount > 0 {
-			opts.debugf("Union: BEFORE dedup - empty configs: %d, non-empty configs: %d, unique fingerprints: %d",
-				emptyConfigsCount, nonEmptyConfigsCount, len(fingerprints))
-		}
-	}
-
 	// Deduplicate
 	deduped := deduplicateSchemas(flattened)
-
-	// DEBUG: Track deduplication and check configs arrays AFTER dedup
-	if opts.EnableWarnings && len(schemas) > 100 {
-		opts.debugf("Union: after dedup, have %d schemas (from %d flattened)", len(deduped), len(flattened))
-
-		emptyConfigsCount := 0
-		nonEmptyConfigsCount := 0
-		for idx, s := range deduped {
-			if s != nil && getType(s) == "object" && s.Properties != nil {
-				if configsProp, ok := s.Properties.Get("configs"); ok && configsProp.GetLeft() != nil {
-					configs := configsProp.GetLeft()
-					if getType(configs) == "array" {
-						isEmpty := configs.MaxItems != nil && *configs.MaxItems == 0
-						hasItems := configs.Items != nil && configs.Items.Left != nil
-						var itemType string
-						if hasItems {
-							itemType = getType(configs.Items.Left)
-						}
-						if isEmpty {
-							emptyConfigsCount++
-							if idx < 3 {
-								opts.debugf("Union: deduped[%d] has EMPTY configs (maxItems=0, hasItems=%v, itemType=%s)",
-									idx, hasItems, itemType)
-							}
-						} else {
-							nonEmptyConfigsCount++
-							if idx < 3 {
-								opts.debugf("Union: deduped[%d] has NON-EMPTY configs (maxItems=nil, hasItems=%v, itemType=%s)",
-									idx, hasItems, itemType)
-							}
-						}
-					}
-				}
-			}
-		}
-		if emptyConfigsCount > 0 || nonEmptyConfigsCount > 0 {
-			opts.debugf("Union: AFTER dedup - empty configs: %d, non-empty configs: %d",
-				emptyConfigsCount, nonEmptyConfigsCount)
-		}
-	}
 
 	// EARLY MERGE: preserve shape/AP info before subsumption removes specifics
 	// Try merging objects first to preserve AdditionalProperties
 	if merged := tryMergeObjects(deduped, opts); merged != nil {
-		if opts.EnableWarnings {
-			opts.debugf("Union: early object merge succeeded, returning merged object")
-		}
 		return merged
 	}
 
 	// Remove subsumed schemas (e.g., {type: number, enum: [0]} ⊆ {type: number})
 	collapsed := removeSubsumedSchemas(deduped, opts)
 
-	// DEBUG: Track progression through Union stages
-	if opts.EnableWarnings && len(schemas) > 100 {
-		opts.debugf("Union: after collapse, have %d schemas (from %d initial)", len(collapsed), len(schemas))
-	}
-
 	// If only one unique schema after dedup and collapse, return it directly
 	if len(collapsed) == 1 {
-		// DEBUG: Show what the final collapsed schema looks like
-		if opts.EnableWarnings && len(schemas) > 100 {
-			finalSchema := collapsed[0]
-			opts.debugf("Union: collapsed to single schema of type=%s", getType(finalSchema))
-			if getType(finalSchema) == "object" && finalSchema.Properties != nil {
-				if configsProp, ok := finalSchema.Properties.Get("configs"); ok && configsProp.GetLeft() != nil {
-					configs := configsProp.GetLeft()
-					if getType(configs) == "array" {
-						isEmpty := configs.MaxItems != nil && *configs.MaxItems == 0
-						hasItems := configs.Items != nil && configs.Items.Left != nil
-						var itemType string
-						if hasItems {
-							itemType = getType(configs.Items.Left)
-						}
-						opts.debugf("Union: final 'configs' property: empty=%v, hasItems=%v, itemType=%s",
-							isEmpty, hasItems, itemType)
-					}
-				}
-			}
-		}
 		return collapsed[0]
 	}
 
@@ -1024,22 +828,6 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 		}
 	}
 
-	// DEBUG: Track tryMergeObjects calls
-	if opts.EnableWarnings {
-		hasConfigs := false
-		for _, s := range schemas {
-			if s.Properties != nil {
-				if _, ok := s.Properties.Get("configs"); ok {
-					hasConfigs = true
-					break
-				}
-			}
-		}
-		if hasConfigs {
-			opts.debugf("tryMergeObjects: merging %d objects with 'configs' property", len(schemas))
-		}
-	}
-
 	// CRITICAL FIX: Instead of requiring identical required sets, compute the intersection
 	// A property is required in the merged schema only if it's required in ALL input schemas
 	// This correctly models conditional object construction in symbolic execution
@@ -1117,32 +905,6 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 			}
 		}
 
-		// DEBUG: Track what's happening with "configs" property
-		if propName == "configs" && opts.EnableWarnings && len(propSchemas) > 0 {
-			opts.debugf("tryMergeObjects: merging 'configs' property from %d object schemas", len(propSchemas))
-			emptyCount := 0
-			nonEmptyCount := 0
-			for i, ps := range propSchemas {
-				if getType(ps) == "array" {
-					isEmpty := ps.MaxItems != nil && *ps.MaxItems == 0
-					hasItems := ps.Items != nil && ps.Items.Left != nil
-					var itemType string
-					if hasItems {
-						itemType = getType(ps.Items.Left)
-					}
-					if isEmpty {
-						emptyCount++
-					} else {
-						nonEmptyCount++
-					}
-					opts.debugf("  [%d] array: empty=%v, hasItems=%v, itemType=%s", i, isEmpty, hasItems, itemType)
-				} else {
-					opts.debugf("  [%d] not array: type=%s", i, getType(ps))
-				}
-			}
-			opts.debugf("  Summary: %d empty, %d non-empty arrays", emptyCount, nonEmptyCount)
-		}
-
 		if len(propSchemas) > 0 {
 			// SOUNDNESS: do NOT filter out unconstrained (Top) branches here.
 			// If any execution path leaves this property unconstrained, the
@@ -1158,28 +920,6 @@ func tryMergeObjects(schemas []*oas3.Schema, opts SchemaExecOptions) *oas3.Schem
 				unionSchema = unionSchema.AnyOf[0].GetLeft()
 			}
 			mergedProps[propName] = unionSchema
-
-			// DEBUG: Show final result for configs property
-			if propName == "configs" && opts.EnableWarnings {
-				if getType(unionSchema) == "array" {
-					isEmpty := unionSchema.MaxItems != nil && *unionSchema.MaxItems == 0
-					hasItems := unionSchema.Items != nil && unionSchema.Items.Left != nil
-					var itemType string
-					if hasItems {
-						itemType = getType(unionSchema.Items.Left)
-					}
-					opts.debugf("tryMergeObjects: 'configs' final result: empty=%v, hasItems=%v, itemType=%s",
-						isEmpty, hasItems, itemType)
-				} else {
-					opts.debugf("tryMergeObjects: 'configs' final result: type=%s (not array!)", getType(unionSchema))
-				}
-			}
-
-			// DEBUG: Log final schema for "value" property
-			if opts.EnableWarnings && propName == "value" {
-				opts.debugf("tryMergeObjects: property=%s final type=%s, unconstrained=%v",
-					propName, getType(unionSchema), isUnconstrainedSchema(unionSchema))
-			}
 		}
 	}
 
@@ -1375,12 +1115,6 @@ func removeSubsumedSchemas(schemas []*oas3.Schema, opts SchemaExecOptions) []*oa
 				if isSubschemaOf(b, a) {
 					removed[j] = true
 					changed = true
-					// DEBUG: Show subsumption for objects with configs
-					if n == initialCount && getType(b) == "object" && b.Properties != nil {
-						if _, ok := b.Properties.Get("configs"); ok {
-							opts.debugf("subsumption iter=%d: schema[%d] subsumed by schema[%d]", iteration, j, i)
-						}
-					}
 				}
 			}
 		}

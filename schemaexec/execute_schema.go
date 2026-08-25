@@ -1489,30 +1489,6 @@ func (env *schemaEnv) execute(c *gojq.Code, input *oas3.Schema) (*SchemaExecResu
 		// Compute allocID redirects to resolve multi-allocID fragmentation
 		redirect := env.computeAllocRedirect(terminalStates, mergedAccum)
 
-		// Diagnostics for allocator/map coverage
-		if env.opts.EnableWarnings {
-			distinctMaps := make(map[string]int)
-			for _, s := range terminalStates {
-				distinctMaps[fmt.Sprintf("%p", s.accum)]++
-			}
-			env.addWarning("terminal states=%d, distinct accum maps=%d", len(terminalStates), len(distinctMaps))
-
-			nonEmptyAlloc := 0
-			for k, arr := range mergedAccum {
-				if arr != nil && getType(arr) == "array" {
-					isEmpty := arr.MaxItems != nil && *arr.MaxItems == 0
-					hasItems := arr.Items != nil && arr.Items.Left != nil
-					if !isEmpty && hasItems {
-						nonEmptyAlloc++
-					}
-					if k == "[44 0]" { // will never match; alloc keys are "allocN", but keep a breadcrumb
-						env.addWarning("merged accum has literal key [44 0] (unexpected); hasItems=%v", hasItems)
-					}
-				}
-			}
-			env.addWarning("merged accum allocs=%d, non-empty allocs=%d", len(mergedAccum), nonEmptyAlloc)
-		}
-
 		result = env.materializeArrays(result, mergedAccum, mergedTags, redirect)
 	}
 	result = stripInternalSchemaMarkers(result)
@@ -1749,31 +1725,6 @@ func mergeTwoAccumulatorSets(
 func (env *schemaEnv) mergeTerminalAccumulators(states []*execState) (map[string]*oas3.Schema, map[*oas3.Schema]string) {
 	var mergedAccum map[string]*oas3.Schema
 	var mergedTags map[*oas3.Schema]string
-
-	// Optional diagnostics for a specific var key across terminals: "[44 0]"
-	if env.opts.EnableWarnings {
-		for _, s := range states {
-			// Search all frames for this variable (from top to bottom)
-			var val *oas3.Schema
-			for i := len(s.scopes) - 1; i >= 0; i-- {
-				if v, ok := s.scopes[i]["[44 0]"]; ok {
-					val = v
-					break
-				}
-			}
-			if val != nil && getType(val) == "array" {
-				isEmpty := val.MaxItems != nil && *val.MaxItems == 0
-				hasItems := val.Items != nil && val.Items.Left != nil
-				var itemType string
-				if hasItems {
-					itemType = getType(val.Items.Left)
-				}
-				tag, tagged := s.schemaToAlloc[val]
-				env.addWarning("mergeTermAcc: state s%d var='[44 0]' array empty=%v hasItems=%v itemType=%s tagged=%v allocTag=%s",
-					s.id, isEmpty, hasItems, itemType, tagged, tag)
-			}
-		}
-	}
 
 	for i, s := range states {
 		if i == 0 {
@@ -2997,19 +2948,6 @@ func (env *schemaEnv) execObjectMulti(state *execState, c *codeOp) ([]*execState
 				keyStr = key.Enum[0].Value
 			}
 			env.addWarning("opObject: pair %d: key=%s, valType=%s", i, keyStr, getType(val))
-
-			// DEBUG: For configs key, log detailed array info including pointer
-			if keyStr == "configs" && getType(val) == "array" {
-				isEmpty := val.MaxItems != nil && *val.MaxItems == 0
-				hasItems := val.Items != nil && val.Items.Left != nil
-				var itemType string
-				if hasItems {
-					itemType = getType(val.Items.Left)
-				}
-				valPtr := fmt.Sprintf("%p", val)
-				env.logger.Debugf("opObject: configs POPPED - empty=%v, hasItems=%v, itemType=%s, ptr=%s",
-					isEmpty, hasItems, itemType, valPtr)
-			}
 		}
 
 		if getType(key) == "string" && len(key.Enum) > 0 {
@@ -3149,11 +3087,6 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 		key = fmt.Sprintf("%v", c.value)
 	}
 
-	// DEBUG: Log append key
-	if env.opts.EnableWarnings {
-		env.addWarning("APPEND key=%q (nil=%v)", key, c.value == nil)
-	}
-
 	// Get the array from the variable
 	var targetArray *oas3.Schema
 	fromVar := false
@@ -3198,11 +3131,6 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 			// Not an array; push it back
 			state.push(candidate)
 		}
-	}
-
-	// DEBUG: Log target decision
-	if env.opts.EnableWarnings {
-		env.addWarning("APPEND target fromVar=%v (has target=%v)", fromVar, targetArray != nil)
 	}
 
 	// Look up or assign allocID for this array
@@ -5220,14 +5148,6 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 			aVal, aHas := aScope[k]
 			bVal, bHas := bScope[k]
 
-			// DEBUG: Log merging of map accumulator variables (added "[44 0]", "[9 1]", "[10 0]")
-			if k == "[18 0]" || k == "[20 0]" || k == "[22 0]" || k == "[32 0]" || k == "[44 0]" || k == "[9 1]" || k == "[10 0]" {
-				aEmpty := getType(aVal) == "array" && aVal.MaxItems != nil && *aVal.MaxItems == 0
-				bEmpty := getType(bVal) == "array" && bVal.MaxItems != nil && *bVal.MaxItems == 0
-				opts.debugf("scope-merge (same-accum): var=%s aHas=%v bHas=%v aType=%s bType=%s aEmpty=%v bEmpty=%v",
-					k, aHas, bHas, getType(aVal), getType(bVal), aEmpty, bEmpty)
-			}
-
 			if aHas && bHas {
 				// CRITICAL FIX: Preserve canonical pointer for arrays in scope (same-accum branch)
 				if getType(aVal) == "array" && getType(bVal) == "array" {
@@ -5290,11 +5210,6 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 
 					isEmpty := func(s *oas3.Schema) bool {
 						return s != nil && getType(s) == "array" && s.MaxItems != nil && *s.MaxItems == 0
-					}
-
-					// DEBUG: Check isEmpty for tracked vars
-					if k == "[9 1]" || k == "[10 0]" || k == "[10 2]" {
-						opts.debugf("scope-merge: var=%s isEmpty(a)=%v isEmpty(b)=%v", k, isEmpty(aVal), isEmpty(bVal))
 					}
 
 					// Prefer non-empty over empty, regardless of tagging
