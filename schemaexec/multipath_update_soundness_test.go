@@ -162,15 +162,15 @@ func TestMultiPathDeleteSevenPlusKnownUnsound(t *testing.T) {
 	assertMultiDelDropsRequired(t, []string{"a", "b", "c", "d", "e", "f", "g", "h"})
 }
 
-// KNOWN UNSOUNDNESS (pre-existing, reproduced): when the RHS branches of a
-// multi-path update reconverge and merge mid-update, a post-merge write can
-// fail to reach the pending eager alternative's snapshot (its pointer-keyed
-// replacement chain was broken by the value join). A provenance-based lazy
-// rebase (joinedValueSources) was tried and removed for its quadratic cost
-// (see git history); an epoch-keyed redesign of update delivery is the
-// tracked follow-up.
-func TestPostMergeWriteReachesPendingAlternativeKnownUnsound(t *testing.T) {
-	t.Skip("known pre-existing unsoundness: post-merge writes can miss pending update alternatives; see PR #3 follow-ups")
+// When the RHS branches of a
+// multi-path update reconverge and merge mid-update, a post-merge write must
+// still reach the pending eager alternative's snapshot. This shape was once
+// a known unsoundness (the pointer-keyed replacement chain broke on the
+// value join; a provenance-based lazy rebase was tried and removed for its
+// quadratic cost — see git history). It became sound after the round-3
+// subsumption gates and the provenance removal: the verdict is Proven and
+// y=1 is tracked on every branch. This test pins the fixed behavior.
+func TestPostMergeWriteReachesPendingAlternative(t *testing.T) {
 	arm := func(v int64) *oas3.Schema {
 		return BuildObject(map[string]*oas3.Schema{"k": ConstInteger(v)}, []string{"k"})
 	}
@@ -184,7 +184,7 @@ func TestPostMergeWriteReachesPendingAlternativeKnownUnsound(t *testing.T) {
 	)`
 	analysis := analyzeWithOptions(t, expr, input, DefaultOptions())
 	if analysis.Verdict != VerdictProven {
-		return
+		t.Fatalf("verdict = %s, want proven (causes: %v)", analysis.Verdict, analysis.Causes)
 	}
 	for _, name := range []string{"a", "b"} {
 		wrapper, ok := analysis.Output.Properties.Get(name)

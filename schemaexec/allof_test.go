@@ -167,7 +167,6 @@ func TestAllOf_DisjointProperties(t *testing.T) {
 
 // TestAllOf_OverlappingProperties_Compatible tests merging same property with compatible types
 func TestAllOf_OverlappingProperties_Compatible(t *testing.T) {
-	t.Skip("TODO: Implement property-level type intersection merging")
 
 	query, err := gojq.Parse(".foo.name")
 	if err != nil {
@@ -537,30 +536,6 @@ func TestAllOf_TypeIntersection_Incompatible(t *testing.T) {
 }
 
 // ============================================================================
-// ENUM AND CONST MERGING TESTS
-// ============================================================================
-
-// TestAllOf_EnumIntersection tests that enum values are intersected
-func TestAllOf_EnumIntersection(t *testing.T) {
-	t.Skip("TODO: Implement enum intersection with proper value types")
-}
-
-// TestAllOf_EnumEmpty tests error when enum intersection is empty
-func TestAllOf_EnumEmpty(t *testing.T) {
-	t.Skip("TODO: Implement enum intersection with empty check and proper value types")
-}
-
-// TestAllOf_ConstMatching tests that matching const values merge
-func TestAllOf_ConstMatching(t *testing.T) {
-	t.Skip("TODO: Implement const merging with proper value types")
-}
-
-// TestAllOf_ConstMismatch tests error on mismatched const values
-func TestAllOf_ConstMismatch(t *testing.T) {
-	t.Skip("TODO: Implement const conflict detection with proper value types")
-}
-
-// ============================================================================
 // NUMERIC/STRING CONSTRAINT MERGING TESTS
 // ============================================================================
 
@@ -698,15 +673,6 @@ func TestAllOf_NumericRangeIntersection(t *testing.T) {
 	if result.Schema.Maximum == nil || *result.Schema.Maximum != 75 {
 		t.Errorf("expected maximum 75, got %v", result.Schema.Maximum)
 	}
-}
-
-// ============================================================================
-// ADDITIONAL PROPERTIES MERGING TESTS
-// ============================================================================
-
-// TestAllOf_AdditionalPropertiesBoolean tests that false dominates true
-func TestAllOf_AdditionalPropertiesBoolean(t *testing.T) {
-	t.Skip("TODO: Implement additionalProperties merging with proper schema structure")
 }
 
 // ============================================================================

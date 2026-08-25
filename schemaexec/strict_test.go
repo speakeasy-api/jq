@@ -35,14 +35,6 @@ func TestStrictMode_MaxDepthExceeded(t *testing.T) {
 	}
 }
 
-// TestStrictMode_VariableNotFound tests that strict mode fails when a variable is not found
-func TestStrictMode_VariableNotFound(t *testing.T) {
-	// The compile-time check for undefined variables happens at parse/compile time,
-	// not at runtime. This is actually the correct behavior - jq itself catches
-	// undefined variables at compile time. Skip this test as it's not a runtime concern.
-	t.Skip("Undefined variables are caught at compile time, not runtime")
-}
-
 // TestStrictMode_DynamicObjectKeys tests that strict mode fails when dynamic object keys are used
 func TestStrictMode_DynamicObjectKeys(t *testing.T) {
 	t.Skip("Dynamic object key detection needs improvement - the key might be resolved at compile time")
@@ -129,12 +121,7 @@ func TestStrictMode_ResultContainsBottom(t *testing.T) {
 	// empty produces no output, which is represented as Bottom
 	// This should fail in strict mode
 	if err == nil {
-		// Debug: let's see what we actually got
-		t.Logf("Result type: %s, is Bottom: %v", getType(result.Schema), isBottomSchema(result.Schema))
-		if !isBottomSchema(result.Schema) {
-			t.Skip("empty doesn't produce Bottom in the expected way - skipping this test")
-		}
-		t.Fatal("expected error for result containing Bottom in strict mode")
+		t.Fatalf("expected error for result containing Bottom in strict mode; got result type %s", getType(result.Schema))
 	}
 	if !strings.Contains(err.Error(), "strict mode: result contains Bottom") && !strings.Contains(err.Error(), "strict mode: result contains") {
 		t.Errorf("unexpected error: %v", err)

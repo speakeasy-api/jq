@@ -540,8 +540,7 @@ func TestClusterLinkCreateActual(t *testing.T) {
 	// Load the actual input schema from the playground testdata
 	yamlData, err := os.ReadFile("../pkg/playground/testdata/ClusterLinkCreate.in.yaml")
 	if err != nil {
-		t.Skip("ClusterLinkCreate.in.yaml not found - skipping")
-		return
+		t.Fatalf("read ClusterLinkCreate.in.yaml fixture: %v", err)
 	}
 
 	var inputSchema map[string]any
