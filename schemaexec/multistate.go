@@ -51,9 +51,8 @@ type execState struct {
 	schemaFPIntent   map[*oas3.Schema]string        // Per-state: schema pointer → items fingerprint
 
 	// Theory 10: Hybrid Origin-Lattice
-	allocOrigin      map[string]*AllocOrigin      // SHARED: allocID -> origin (where it was created)
-	allocCardinality map[string]*ArrayCardinality // SHARED: allocID -> cardinality bounds
-	dsu              *DSU                         // SHARED: Disjoint Set Union for allocID equivalence
+	allocOrigin map[string]*AllocOrigin // SHARED: allocID -> origin (where it was created)
+	dsu         *DSU                    // SHARED: Disjoint Set Union for allocID equivalence
 }
 
 // AllocOrigin tracks where an allocID was created in the AST/execution
@@ -72,60 +71,6 @@ type AllocOrigin struct {
 // within one call share the callsite and still merge, as intended.
 func sameOrigin(a, b *AllocOrigin) bool {
 	return a != nil && b != nil && a.PC == b.PC && a.Context == b.Context && a.CallSite == b.CallSite
-}
-
-// ArrayCardinality tracks bounds on array size for lattice-based merging
-type ArrayCardinality struct {
-	MinItems *int // Lower bound: 0 = maybe-empty, 1+ = must-be-non-empty
-	MaxItems *int // Upper bound: nil = unbounded
-}
-
-// Join performs lattice join (LUB) on two cardinality bounds
-// This is the mathematically sound merge operation for the cardinality lattice
-func (a *ArrayCardinality) Join(other *ArrayCardinality) *ArrayCardinality {
-	if a == nil && other == nil {
-		return nil
-	}
-	if a == nil {
-		return other
-	}
-	if other == nil {
-		return a
-	}
-
-	// Join MinItems: take minimum (most permissive lower bound)
-	var minItems *int
-	if a.MinItems == nil && other.MinItems == nil {
-		minItems = nil
-	} else if a.MinItems == nil {
-		minItems = other.MinItems
-	} else if other.MinItems == nil {
-		minItems = a.MinItems
-	} else {
-		min := *a.MinItems
-		if *other.MinItems < min {
-			min = *other.MinItems
-		}
-		minItems = &min
-	}
-
-	// Join MaxItems: take maximum (most permissive upper bound)
-	var maxItems *int
-	if a.MaxItems == nil || other.MaxItems == nil {
-		// nil means unbounded, which dominates any finite bound
-		maxItems = nil
-	} else {
-		max := *a.MaxItems
-		if *other.MaxItems > max {
-			max = *other.MaxItems
-		}
-		maxItems = &max
-	}
-
-	return &ArrayCardinality{
-		MinItems: minItems,
-		MaxItems: maxItems,
-	}
 }
 
 // DSU implements Disjoint Set Union (Union-Find) for allocID equivalence classes
@@ -851,9 +796,8 @@ func (s *execState) clone() *execState {
 		allocDesiredFP:       s.allocDesiredFP, // SHARED
 		schemaFPIntent:       schemaFPCopy,
 		// Theory 10: Hybrid Origin-Lattice (SHARED)
-		allocOrigin:      s.allocOrigin,      // SHARED
-		allocCardinality: s.allocCardinality, // SHARED
-		dsu:              s.dsu,              // SHARED
+		allocOrigin: s.allocOrigin, // SHARED
+		dsu:         s.dsu,         // SHARED
 	}
 }
 
@@ -1132,9 +1076,8 @@ func newExecState(input *oas3.Schema) *execState {
 		allocDesiredFP:   make(map[string]string), // Shared
 		schemaFPIntent:   make(map[*oas3.Schema]string),
 		// Theory 10: Hybrid Origin-Lattice
-		allocOrigin:      make(map[string]*AllocOrigin),
-		allocCardinality: make(map[string]*ArrayCardinality),
-		dsu:              NewDSU(),
+		allocOrigin: make(map[string]*AllocOrigin),
+		dsu:         NewDSU(),
 	}
 	state.pushFrame() // Initial global frame
 	state.push(input) // Push input onto stack

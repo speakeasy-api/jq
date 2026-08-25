@@ -157,7 +157,7 @@ func TestMultiPathDeleteDropsRequired(t *testing.T) {
 // collect/backtrack machinery (per-state must-cardinality and join-aware
 // accumulator identity), not in the delpaths consumer.
 func TestMultiPathDeleteSevenPlusKnownUnsound(t *testing.T) {
-	t.Skip("known pre-existing unsoundness: collect-loop widening loses the paths accumulator for >=7 paths; see PR #3 follow-ups")
+	t.Skip("known pre-existing unsoundness: collect-loop widening loses the paths accumulator for >=7 paths; see PR #3 follow-ups. The old shared MAY-cardinality tracking (allocCardinality) was write-only and has been removed; per-state MUST-cardinality is the planned fix")
 	assertMultiDelDropsRequired(t, []string{"a", "b", "c", "d", "e", "f", "g"})
 	assertMultiDelDropsRequired(t, []string{"a", "b", "c", "d", "e", "f", "g", "h"})
 }

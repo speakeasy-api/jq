@@ -2232,26 +2232,6 @@ func (env *schemaEnv) executeOpMultiState(state *execState, c *codeOp) ([]*execS
 									env.logger.Debugf("DSU opStore: merged arrays to root=%s", root)
 								}
 
-								// Lattice-join cardinality into the root key
-								if next.allocCardinality != nil {
-									c1 := next.allocCardinality[priorID]
-									c2 := next.allocCardinality[currID]
-									var joined *ArrayCardinality
-									switch {
-									case c1 == nil:
-										joined = c2
-									case c2 == nil:
-										joined = c1
-									default:
-										joined = c1.Join(c2)
-									}
-									next.allocCardinality[root] = joined
-									if joined != nil && joined.MinItems != nil {
-										env.logger.Debugf("DSU opStore: joined cardinality to root=%s MinItems=%d",
-											root, *joined.MinItems)
-									}
-								}
-
 								// Record variable now points to the root ID
 								next.recordVarAlloc(key, root)
 							}
@@ -3025,16 +3005,6 @@ func (s *execState) allocateArrayWithOrigin(pc int, context string) string {
 		CallSite: callSite,
 	}
 
-	// Initialize cardinality as empty (MinItems=0, MaxItems=0)
-	if s.allocCardinality == nil {
-		s.allocCardinality = make(map[string]*ArrayCardinality)
-	}
-	zero := 0
-	s.allocCardinality[allocID] = &ArrayCardinality{
-		MinItems: &zero,
-		MaxItems: &zero,
-	}
-
 	// Theory 10: Initialize DSU parent for this new allocID
 	if s.dsu == nil {
 		s.dsu = NewDSU()
@@ -3042,31 +3012,6 @@ func (s *execState) allocateArrayWithOrigin(pc int, context string) string {
 	s.dsu.Find(allocID) // seeds parent[allocID] = allocID
 
 	return allocID
-}
-
-// setArrayNonEmpty marks an array as non-empty (MinItems=1)
-func (s *execState) setArrayNonEmpty(allocID string) {
-	if allocID == "" {
-		return
-	}
-	if s.allocCardinality == nil {
-		s.allocCardinality = make(map[string]*ArrayCardinality)
-	}
-
-	// Get or create cardinality
-	card := s.allocCardinality[allocID]
-	if card == nil {
-		card = &ArrayCardinality{}
-		s.allocCardinality[allocID] = card
-	}
-
-	// Set MinItems=1 (array must be non-empty)
-	one := 1
-	card.MinItems = &one
-	// Remove MaxItems=0 constraint if present
-	if card.MaxItems != nil && *card.MaxItems == 0 {
-		card.MaxItems = nil
-	}
 }
 
 func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState, error) {
@@ -3234,11 +3179,6 @@ func (env *schemaEnv) execAppendMulti(state *execState, c *codeOp) ([]*execState
 		}
 
 		canonicalArr.Items = oas3.NewJSONSchemaFromSchema[oas3.Referenceable](unionedItems)
-
-		// Theory 10: Mark array as non-empty (MinItems=1) after appending
-		if accumKey != "" {
-			state.setArrayNonEmpty(accumKey)
-		}
 
 		// Record var and alloc intent when items become known
 		if fromVar && key != "" && unionedItems != nil {
@@ -5026,9 +4966,8 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 		schemaToAlloc: a.schemaToAlloc,
 		allocCounter:  a.allocCounter,
 		// Theory 10: Hybrid Origin-Lattice (SHARED since accum is same)
-		allocOrigin:      a.allocOrigin,
-		allocCardinality: a.allocCardinality,
-		dsu:              a.dsu,
+		allocOrigin: a.allocOrigin,
+		dsu:         a.dsu,
 		// Post-merge writes must reach the eager alternatives of both
 		// joined states.
 		forkUpdates: unionForkUpdates(a.forkUpdates, b.forkUpdates),
@@ -5172,31 +5111,6 @@ func joinState(a, b *execState, opts SchemaExecOptions) *execState {
 								merged.schemaToAlloc[joined] = root
 								mergedScope[k] = joined
 								opts.debugf("DSU joinState(same-accum): merged to root=%s", root)
-							}
-
-							// Lattice-join cardinality under root
-							var c1, c2 *ArrayCardinality
-							if a.allocCardinality != nil {
-								c1 = a.allocCardinality[aAlloc]
-							}
-							if b.allocCardinality != nil {
-								c2 = b.allocCardinality[bAlloc]
-							}
-							var joinedCard *ArrayCardinality
-							switch {
-							case c1 == nil:
-								joinedCard = c2
-							case c2 == nil:
-								joinedCard = c1
-							default:
-								joinedCard = c1.Join(c2)
-							}
-							if joinedCard != nil {
-								merged.allocCardinality[root] = joinedCard
-								if joinedCard.MinItems != nil {
-									opts.debugf("DSU joinState(same-accum): cardinality root=%s MinItems=%d",
-										root, *joinedCard.MinItems)
-								}
 							}
 
 							// Alias old IDs to the root's canonical for robustness
