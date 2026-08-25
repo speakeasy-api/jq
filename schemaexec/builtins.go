@@ -1979,9 +1979,9 @@ func compareSchemas(lhs, rhs *oas3.Schema, pred func(int) bool) ([]*oas3.Schema,
 	rhsVal, rhsIsConst := extractConstValue(rhs)
 
 	if lhsIsConst && rhsIsConst {
-		// Both are const - can compute result
-		cmp := compareValues(lhsVal, rhsVal)
-		return []*oas3.Schema{ConstBool(pred(cmp))}, nil
+		if cmp, ok := compareValues(lhsVal, rhsVal); ok {
+			return []*oas3.Schema{ConstBool(pred(cmp))}, nil
+		}
 	}
 
 	// Can't determine statically - return generic boolean
@@ -1992,6 +1992,12 @@ func compareSchemas(lhs, rhs *oas3.Schema, pred func(int) bool) ([]*oas3.Schema,
 func extractConstValue(schema *oas3.Schema) (any, bool) {
 	if schema == nil {
 		return nil, false
+	}
+
+	// A bare null-typed schema needs no const facet: the null type has a
+	// single inhabitant.
+	if types := schema.GetType(); len(types) == 1 && types[0] == oas3.SchemaTypeNull {
+		return nil, true
 	}
 
 	var node *yaml.Node
@@ -2013,6 +2019,12 @@ func extractConstValue(schema *oas3.Schema) (any, bool) {
 	var t string
 	if len(types) > 0 {
 		t = string(types[0])
+	}
+
+	// An explicit null constant must decode as nil, not fall through to the
+	// string default: comparison folding orders null below every other value.
+	if t == "null" || node.Tag == "!!null" {
+		return nil, true
 	}
 
 	// Try type-specific parsing
@@ -2043,53 +2055,61 @@ func extractConstValue(schema *oas3.Schema) (any, bool) {
 	return node.Value, true
 }
 
-// compareValues compares two values similar to jq's Compare function.
-// Returns -1 if l < r, 0 if l == r, 1 if l > r.
-func compareValues(l, r any) int {
-	// Handle nils
-	if l == nil && r == nil {
-		return 0
+// compareValues orders two folded constants by jq's total value order:
+// null < false < true < numbers < strings. ok is false for value kinds this
+// scalar folding does not model (arrays, objects); callers must fall back to
+// an unknown boolean then — folding cross-type comparisons as "equal" would
+// prove wrong constants (jq: 1 == "1" is false, 1 < "1" is true).
+func compareValues(l, r any) (int, bool) {
+	lRank, lOK := scalarOrderRank(l)
+	rRank, rOK := scalarOrderRank(r)
+	if !lOK || !rOK {
+		return 0, false
 	}
-	if l == nil {
-		return -1
+	if lRank != rRank {
+		if lRank < rRank {
+			return -1, true
+		}
+		return 1, true
 	}
-	if r == nil {
-		return 1
-	}
-
-	// Type-based comparison
 	switch lv := l.(type) {
 	case float64:
-		if rv, ok := r.(float64); ok {
-			if lv < rv {
-				return -1
-			} else if lv > rv {
-				return 1
-			}
-			return 0
+		rv := r.(float64)
+		switch {
+		case lv < rv:
+			return -1, true
+		case lv > rv:
+			return 1, true
 		}
 	case string:
-		if rv, ok := r.(string); ok {
-			if lv < rv {
-				return -1
-			} else if lv > rv {
-				return 1
-			}
-			return 0
-		}
-	case bool:
-		if rv, ok := r.(bool); ok {
-			if !lv && rv {
-				return -1
-			} else if lv && !rv {
-				return 1
-			}
-			return 0
+		rv := r.(string)
+		switch {
+		case lv < rv:
+			return -1, true
+		case lv > rv:
+			return 1, true
 		}
 	}
+	// Same rank and not less/greater: null==null, false==false, true==true,
+	// or equal scalars.
+	return 0, true
+}
 
-	// Different types or unsupported - return 0 (conservative)
-	return 0
+func scalarOrderRank(v any) (int, bool) {
+	switch value := v.(type) {
+	case nil:
+		return 0, true
+	case bool:
+		if value {
+			return 2, true
+		}
+		return 1, true
+	case float64:
+		return 3, true
+	case string:
+		return 4, true
+	}
+	return 0, false
 }
 
 // parseFloat parses a string to float64.

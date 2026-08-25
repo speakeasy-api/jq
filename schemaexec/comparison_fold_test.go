@@ -70,3 +70,33 @@ func TestComparisonUnknownOperandsStayBoolean(t *testing.T) {
 		t.Fatalf("unknown == unknown must not fold to a const: %s", schemaTypeSummary(out, 3))
 	}
 }
+
+// Cross-type comparisons fold by jq's total value order
+// (null < false < true < numbers < strings), never by naive equality.
+func TestComparisonCrossTypeTotalOrder(t *testing.T) {
+	for _, tc := range []struct {
+		expr string
+		want bool
+	}{
+		{`1 == "1"`, false},
+		{`1 != "1"`, true},
+		{`1 < "1"`, true},
+		{`"1" > 1`, true},
+		{`null == false`, false},
+		{`null < false`, true},
+		{`null < 0`, true},
+		{`false < true`, true},
+		{`true < 0`, true},
+		{`"a" >= 100`, true},
+	} {
+		analysis := analyzeExpr(t, tc.expr, ObjectType())
+		value, ok := extractConstValue(analysis.Output)
+		if !ok {
+			t.Errorf("%s: not folded to a constant (output %s)", tc.expr, schemaTypeSummary(analysis.Output, 3))
+			continue
+		}
+		if got, isBool := value.(bool); !isBool || got != tc.want {
+			t.Errorf("%s folded to %v, concrete jq gives %v", tc.expr, value, tc.want)
+		}
+	}
+}
